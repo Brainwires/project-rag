@@ -143,23 +143,25 @@ impl RagMcpServer {
     async fn index_codebase(
         &self,
         Parameters(req): Parameters<IndexRequest>,
-    ) -> Result<IndexResponse, String> {
-
-        self.do_index(
+    ) -> Result<String, String> {
+        let response = self.do_index(
             req.path,
             req.include_patterns,
             req.exclude_patterns,
             req.max_file_size,
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| format!("Serialization failed: {}", e))
     }
 
     #[tool(description = "Query the indexed codebase using semantic search")]
     async fn query_codebase(
         &self,
         Parameters(req): Parameters<QueryRequest>,
-    ) -> Result<QueryResponse, String> {
+    ) -> Result<String, String> {
         let start = Instant::now();
 
         // Generate query embedding
@@ -178,17 +180,20 @@ impl RagMcpServer {
             .await
             .map_err(|e| format!("Failed to search: {}", e))?;
 
-        Ok(QueryResponse {
+        let response = QueryResponse {
             results,
             duration_ms: start.elapsed().as_millis() as u64,
-        })
+        };
+
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| format!("Serialization failed: {}", e))
     }
 
     #[tool(description = "Get statistics about the indexed codebase")]
     async fn get_statistics(
         &self,
         Parameters(_req): Parameters<StatisticsRequest>,
-    ) -> Result<StatisticsResponse, String> {
+    ) -> Result<String, String> {
         let stats = self
             .vector_db
             .get_statistics()
@@ -205,18 +210,21 @@ impl RagMcpServer {
             })
             .collect();
 
-        Ok(StatisticsResponse {
+        let response = StatisticsResponse {
             total_files: stats.total_points,
             total_chunks: stats.total_vectors,
             total_embeddings: stats.total_vectors,
             database_size_bytes: 0, // Would need to query Qdrant storage
             language_breakdown,
-        })
+        };
+
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| format!("Serialization failed: {}", e))
     }
 
     #[tool(description = "Clear all indexed data from the vector database")]
-    async fn clear_index(&self, Parameters(_req): Parameters<ClearRequest>) -> Result<ClearResponse, String> {
-        match self.vector_db.clear().await {
+    async fn clear_index(&self, Parameters(_req): Parameters<ClearRequest>) -> Result<String, String> {
+        let response = match self.vector_db.clear().await {
             Ok(_) => {
                 // Clear the indexed roots cache
                 let mut indexed_roots = self.indexed_roots.write().await;
@@ -228,29 +236,32 @@ impl RagMcpServer {
                     .initialize(self.embedding_provider.dimension())
                     .await
                 {
-                    return Ok(ClearResponse {
+                    ClearResponse {
                         success: false,
                         message: format!("Cleared but failed to reinitialize: {}", e),
-                    });
+                    }
+                } else {
+                    ClearResponse {
+                        success: true,
+                        message: "Successfully cleared all indexed data".to_string(),
+                    }
                 }
-
-                Ok(ClearResponse {
-                    success: true,
-                    message: "Successfully cleared all indexed data".to_string(),
-                })
             }
-            Err(e) => Ok(ClearResponse {
+            Err(e) => ClearResponse {
                 success: false,
                 message: format!("Failed to clear index: {}", e),
-            }),
-        }
+            },
+        };
+
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| format!("Serialization failed: {}", e))
     }
 
     #[tool(description = "Incrementally update the index by processing only changed files")]
     async fn incremental_update(
         &self,
         Parameters(req): Parameters<IncrementalUpdateRequest>,
-    ) -> Result<IncrementalUpdateResponse, String> {
+    ) -> Result<String, String> {
         let start = Instant::now();
 
         // Get existing file hashes
@@ -345,20 +356,23 @@ impl RagMcpServer {
         let mut indexed_roots = self.indexed_roots.write().await;
         indexed_roots.insert(req.path, new_hashes);
 
-        Ok(IncrementalUpdateResponse {
+        let response = IncrementalUpdateResponse {
             files_added,
             files_updated,
             files_removed,
             chunks_modified,
             duration_ms: start.elapsed().as_millis() as u64,
-        })
+        };
+
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| format!("Serialization failed: {}", e))
     }
 
     #[tool(description = "Advanced search with filters for file type, language, and path patterns")]
     async fn search_by_filters(
         &self,
         Parameters(req): Parameters<AdvancedSearchRequest>,
-    ) -> Result<QueryResponse, String> {
+    ) -> Result<String, String> {
         let start = Instant::now();
 
         // Generate query embedding
@@ -384,10 +398,13 @@ impl RagMcpServer {
             .await
             .map_err(|e| format!("Failed to search: {}", e))?;
 
-        Ok(QueryResponse {
+        let response = QueryResponse {
             results,
             duration_ms: start.elapsed().as_millis() as u64,
-        })
+        };
+
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| format!("Serialization failed: {}", e))
     }
 }
 
