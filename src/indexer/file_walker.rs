@@ -45,11 +45,23 @@ impl FileWalker {
 
     /// Walk the directory and collect all eligible files
     pub fn walk(&self) -> Result<Vec<FileInfo>> {
+        // Verify root directory exists
+        if !self.root.exists() {
+            anyhow::bail!("Root directory does not exist: {:?}", self.root);
+        }
+        if !self.root.is_dir() {
+            anyhow::bail!("Root path is not a directory: {:?}", self.root);
+        }
+
         let mut files = Vec::new();
 
         let walker = WalkBuilder::new(&self.root)
             .standard_filters(true) // Respect .gitignore, .ignore, etc.
             .hidden(false) // Don't skip hidden files by default
+            .git_ignore(true) // Respect .gitignore files
+            .git_exclude(true) // Respect .git/info/exclude
+            .git_global(true) // Respect global gitignore
+            .require_git(false) // Don't require a .git directory
             .build();
 
         for entry in walker {
@@ -80,9 +92,14 @@ impl FileWalker {
                 continue;
             }
 
-            // Read file content
-            let content = fs::read_to_string(path)
-                .with_context(|| format!("Failed to read file: {:?}", path))?;
+            // Read file content (skip files that can't be read as UTF-8)
+            let content = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!("Skipping file that can't be read as UTF-8: {:?}: {}", path, e);
+                    continue;
+                }
+            };
 
             // Calculate hash
             let hash = self.calculate_hash(&content);

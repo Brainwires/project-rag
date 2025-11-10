@@ -67,11 +67,14 @@ impl RagMcpServer {
         let start = Instant::now();
         let mut errors = Vec::new();
 
-        // Walk the directory
+        // Walk the directory (on a blocking thread since it's CPU-intensive)
         let walker = FileWalker::new(&path, max_file_size)
             .with_patterns(include_patterns.clone(), exclude_patterns.clone());
 
-        let files = walker.walk().context("Failed to walk directory")?;
+        let files = tokio::task::spawn_blocking(move || walker.walk())
+            .await
+            .context("Failed to spawn file walker task")?
+            .context("Failed to walk directory")?;
         let files_indexed = files.len();
 
         // Chunk all files
@@ -154,7 +157,7 @@ impl RagMcpServer {
             req.max_file_size,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{:#}", e))?;  // Use alternate display to show full error chain
 
         serde_json::to_string_pretty(&response)
             .map_err(|e| format!("Serialization failed: {}", e))
@@ -275,12 +278,13 @@ impl RagMcpServer {
             .unwrap_or_default();
         drop(indexed_roots);
 
-        // Walk directory to find current files
+        // Walk directory to find current files (on a blocking thread)
         let walker = FileWalker::new(&req.path, 1_048_576)
             .with_patterns(req.include_patterns.clone(), req.exclude_patterns.clone());
 
-        let current_files = walker
-            .walk()
+        let current_files = tokio::task::spawn_blocking(move || walker.walk())
+            .await
+            .map_err(|e| format!("Failed to spawn file walker task: {}", e))?
             .map_err(|e| format!("Failed to walk directory: {}", e))?;
 
         let mut files_added = 0;
