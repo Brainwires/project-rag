@@ -4,10 +4,11 @@ use crate::types::*;
 use crate::vector_db::{QdrantVectorDB, VectorDatabase};
 use anyhow::{Context, Result};
 use rmcp::{
-    handler::server::{ServerHandler, tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
-    service::ServiceExt,
-    tool, tool_handler, tool_router,
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
+    handler::server::{router::prompt::PromptRouter, tool::ToolRouter, wrapper::Parameters},
+    model::*,
+    prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router,
+    service::RequestContext,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ pub struct RagMcpServer {
     // Track indexed roots for incremental updates
     indexed_roots: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
     tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
 }
 
 impl RagMcpServer {
@@ -50,6 +52,7 @@ impl RagMcpServer {
             chunker,
             indexed_roots: Arc::new(RwLock::new(HashMap::new())),
             tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
         })
     }
 
@@ -408,12 +411,113 @@ impl RagMcpServer {
     }
 }
 
+// Prompts for slash commands
+#[prompt_router]
+impl RagMcpServer {
+    #[prompt(name = "index", description = "Index a codebase directory to enable semantic search")]
+    async fn index_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<GetPromptResult, McpError> {
+        let path = args.get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+
+        let messages = vec![
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!("Please index the codebase at path: {}", path),
+            ),
+        ];
+
+        Ok(GetPromptResult {
+            description: Some(format!("Index codebase at {}", path)),
+            messages,
+        })
+    }
+
+    #[prompt(name = "query", description = "Search the indexed codebase using semantic search")]
+    async fn query_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let query = args.get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        Ok(vec![
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!("Please search the codebase for: {}", query),
+            ),
+        ])
+    }
+
+    #[prompt(name = "stats", description = "Get statistics about the indexed codebase")]
+    async fn stats_prompt(&self) -> Vec<PromptMessage> {
+        vec![
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                "Please get statistics about the indexed codebase.",
+            ),
+        ]
+    }
+
+    #[prompt(name = "clear", description = "Clear all indexed data from the vector database")]
+    async fn clear_prompt(&self) -> Vec<PromptMessage> {
+        vec![
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                "Please clear all indexed data from the vector database.",
+            ),
+        ]
+    }
+
+    #[prompt(name = "update", description = "Incrementally update the index with only changed files")]
+    async fn update_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let path = args.get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+
+        Ok(vec![
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!("Please incrementally update the index for path: {}", path),
+            ),
+        ])
+    }
+
+    #[prompt(name = "search", description = "Advanced search with filters (file type, language, path)")]
+    async fn search_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let query = args.get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        Ok(vec![
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!("Please perform an advanced search for: {}", query),
+            ),
+        ])
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
+#[prompt_handler]
 impl ServerHandler for RagMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::default(),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
             server_info: Implementation {
                 name: "project-rag".into(),
                 title: Some("Project RAG - Code Understanding with Semantic Search".into()),
