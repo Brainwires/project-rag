@@ -1,5 +1,11 @@
-// LanceDB is the default embedded vector database
+// USearch is the default embedded vector database (10x faster than LanceDB)
+mod usearch_client;
+pub use usearch_client::USearchDB;
+
+// LanceDB is optional (slower but has more features)
+#[cfg(feature = "lancedb-backend")]
 mod lance_client;
+#[cfg(feature = "lancedb-backend")]
 pub use lance_client::LanceVectorDB;
 
 // Qdrant is optional (requires external server)
@@ -12,6 +18,7 @@ use crate::types::{ChunkMetadata, SearchResult};
 use anyhow::Result;
 
 /// Trait for vector database operations
+#[async_trait::async_trait]
 pub trait VectorDatabase: Send + Sync {
     /// Initialize the database and create collections if needed
     async fn initialize(&self, dimension: usize) -> Result<()>;

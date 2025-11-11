@@ -2,7 +2,7 @@ use crate::cache::HashCache;
 use crate::embedding::{EmbeddingProvider, FastEmbedManager};
 use crate::indexer::{CodeChunker, FileWalker};
 use crate::types::*;
-use crate::vector_db::{LanceVectorDB, VectorDatabase};
+use crate::vector_db::{USearchDB, VectorDatabase};
 use anyhow::{Context, Result};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
@@ -20,7 +20,7 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub struct RagMcpServer {
     embedding_provider: Arc<FastEmbedManager>,
-    vector_db: Arc<LanceVectorDB>,
+    vector_db: Arc<USearchDB>,
     chunker: Arc<CodeChunker>,
     // Persistent hash cache for incremental updates
     hash_cache: Arc<RwLock<HashCache>>,
@@ -36,8 +36,7 @@ impl RagMcpServer {
         );
 
         let vector_db = Arc::new(
-            LanceVectorDB::new()
-                .await
+            USearchDB::new("./usearch_data", "code_embeddings")
                 .context("Failed to initialize vector database")?,
         );
 
