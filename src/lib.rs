@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod embedding;
 pub mod indexer;
 pub mod mcp_server;

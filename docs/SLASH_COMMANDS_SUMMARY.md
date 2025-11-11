@@ -8,12 +8,12 @@ Project RAG now has **6 slash commands** available in Claude Code via MCP Prompt
 
 | Command | Description |
 |---------|-------------|
-| `/mcp__project-rag__index` | Index a codebase directory |
-| `/mcp__project-rag__query` | Search indexed code semantically |
-| `/mcp__project-rag__stats` | Get index statistics |
-| `/mcp__project-rag__clear` | Clear all indexed data |
-| `/mcp__project-rag__update` | Incremental update (changed files only) |
-| `/mcp__project-rag__search` | Advanced search with filters |
+| `/project:index` | Index a codebase directory |
+| `/project:query` | Search indexed code semantically |
+| `/project:stats` | Get index statistics |
+| `/project:clear` | Clear all indexed data |
+| `/project:update` | Incremental update (changed files only) |
+| `/project:search` | Advanced search with filters |
 
 ## How to Use
 
@@ -25,16 +25,16 @@ Project RAG now has **6 slash commands** available in Claude Code via MCP Prompt
 
 ```bash
 # 1. Index your codebase
-/mcp__project-rag__index
+/project:index
 
 # 2. Search for something
-/mcp__project-rag__query
+/project:query
 
 # 3. Get statistics
-/mcp__project-rag__stats
+/project:stats
 
 # 4. Update after making changes
-/mcp__project-rag__update
+/project:update
 ```
 
 ## What Changed

@@ -1,16 +1,18 @@
+use crate::cache::HashCache;
 use crate::embedding::{EmbeddingProvider, FastEmbedManager};
 use crate::indexer::{CodeChunker, FileWalker};
 use crate::types::*;
-use crate::vector_db::{QdrantVectorDB, VectorDatabase};
+use crate::vector_db::{LanceVectorDB, VectorDatabase};
 use anyhow::{Context, Result};
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
+    ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::prompt::PromptRouter, tool::ToolRouter, wrapper::Parameters},
     model::*,
     prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router,
     service::RequestContext,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -18,10 +20,11 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub struct RagMcpServer {
     embedding_provider: Arc<FastEmbedManager>,
-    vector_db: Arc<QdrantVectorDB>,
+    vector_db: Arc<LanceVectorDB>,
     chunker: Arc<CodeChunker>,
-    // Track indexed roots for incremental updates
-    indexed_roots: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
+    // Persistent hash cache for incremental updates
+    hash_cache: Arc<RwLock<HashCache>>,
+    cache_path: PathBuf,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -33,7 +36,7 @@ impl RagMcpServer {
         );
 
         let vector_db = Arc::new(
-            QdrantVectorDB::new()
+            LanceVectorDB::new()
                 .await
                 .context("Failed to initialize vector database")?,
         );
@@ -46,11 +49,22 @@ impl RagMcpServer {
 
         let chunker = Arc::new(CodeChunker::default_strategy());
 
+        // Load persistent hash cache
+        let cache_path = HashCache::default_path();
+        let hash_cache = HashCache::load(&cache_path)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to load hash cache: {}, starting fresh", e);
+                HashCache::default()
+            });
+
+        tracing::info!("Using cache file: {:?}", cache_path);
+
         Ok(Self {
             embedding_provider,
             vector_db,
             chunker,
-            indexed_roots: Arc::new(RwLock::new(HashMap::new())),
+            hash_cache: Arc::new(RwLock::new(hash_cache)),
+            cache_path,
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         })
@@ -60,15 +74,29 @@ impl RagMcpServer {
     async fn do_index(
         &self,
         path: String,
+        project: Option<String>,
         include_patterns: Vec<String>,
         exclude_patterns: Vec<String>,
         max_file_size: usize,
+        peer: Option<Peer<RoleServer>>,
+        progress_token: Option<ProgressToken>,
     ) -> Result<IndexResponse> {
         let start = Instant::now();
         let mut errors = Vec::new();
 
+        // Send initial progress
+        if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+            let _ = peer.notify_progress(ProgressNotificationParam {
+                progress_token: token.clone(),
+                progress: 0.0,
+                total: Some(100.0),
+                message: Some("Starting file walk...".into()),
+            }).await;
+        }
+
         // Walk the directory (on a blocking thread since it's CPU-intensive)
         let walker = FileWalker::new(&path, max_file_size)
+            .with_project(project.clone())
             .with_patterns(include_patterns.clone(), exclude_patterns.clone());
 
         let files = tokio::task::spawn_blocking(move || walker.walk())
@@ -77,6 +105,16 @@ impl RagMcpServer {
             .context("Failed to walk directory")?;
         let files_indexed = files.len();
 
+        // Send progress after file walk
+        if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+            let _ = peer.notify_progress(ProgressNotificationParam {
+                progress_token: token.clone(),
+                progress: 20.0,
+                total: Some(100.0),
+                message: Some(format!("Found {} files, chunking...", files_indexed)),
+            }).await;
+        }
+
         // Chunk all files
         let mut all_chunks = Vec::new();
         for file in &files {
@@ -84,6 +122,16 @@ impl RagMcpServer {
         }
 
         let chunks_created = all_chunks.len();
+
+        // Send progress after chunking
+        if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+            let _ = peer.notify_progress(ProgressNotificationParam {
+                progress_token: token.clone(),
+                progress: 40.0,
+                total: Some(100.0),
+                message: Some(format!("Created {} chunks, generating embeddings...", chunks_created)),
+            }).await;
+        }
 
         if all_chunks.is_empty() {
             return Ok(IndexResponse {
@@ -98,8 +146,9 @@ impl RagMcpServer {
         // Generate embeddings in batches
         let batch_size = 32;
         let mut all_embeddings = Vec::new();
+        let total_batches = (all_chunks.len() + batch_size - 1) / batch_size;
 
-        for chunk_batch in all_chunks.chunks(batch_size) {
+        for (batch_idx, chunk_batch) in all_chunks.chunks(batch_size).enumerate() {
             let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
 
             match self.embedding_provider.embed_batch(texts) {
@@ -109,9 +158,30 @@ impl RagMcpServer {
                     continue;
                 }
             }
+
+            // Send progress during embedding (40% to 80%)
+            if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+                let progress = 40.0 + ((batch_idx + 1) as f64 / total_batches as f64) * 40.0;
+                let _ = peer.notify_progress(ProgressNotificationParam {
+                    progress_token: token.clone(),
+                    progress,
+                    total: Some(100.0),
+                    message: Some(format!("Generating embeddings... {}/{} batches", batch_idx + 1, total_batches)),
+                }).await;
+            }
         }
 
         let embeddings_generated = all_embeddings.len();
+
+        // Send progress before storing
+        if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+            let _ = peer.notify_progress(ProgressNotificationParam {
+                progress_token: token.clone(),
+                progress: 85.0,
+                total: Some(100.0),
+                message: Some(format!("Storing {} embeddings in database...", embeddings_generated)),
+            }).await;
+        }
 
         // Store in vector database
         let metadata: Vec<ChunkMetadata> = all_chunks
@@ -125,13 +195,39 @@ impl RagMcpServer {
             .await
             .context("Failed to store embeddings")?;
 
-        // Save file hashes for incremental updates
-        let mut indexed_roots = self.indexed_roots.write().await;
+        // Send progress before saving cache
+        if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+            let _ = peer.notify_progress(ProgressNotificationParam {
+                progress_token: token.clone(),
+                progress: 95.0,
+                total: Some(100.0),
+                message: Some("Saving cache...".into()),
+            }).await;
+        }
+
+        // Save file hashes to persistent cache
         let file_hashes: HashMap<String, String> = files
             .iter()
             .map(|f| (f.relative_path.clone(), f.hash.clone()))
             .collect();
-        indexed_roots.insert(path, file_hashes);
+
+        let mut cache = self.hash_cache.write().await;
+        cache.update_root(path, file_hashes);
+
+        // Persist to disk
+        if let Err(e) = cache.save(&self.cache_path) {
+            tracing::warn!("Failed to save hash cache: {}", e);
+        }
+
+        // Send completion progress
+        if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+            let _ = peer.notify_progress(ProgressNotificationParam {
+                progress_token: token.clone(),
+                progress: 100.0,
+                total: Some(100.0),
+                message: Some("Indexing complete!".into()),
+            }).await;
+        }
 
         Ok(IndexResponse {
             files_indexed,
@@ -148,13 +244,21 @@ impl RagMcpServer {
     #[tool(description = "Index a codebase directory, creating embeddings for semantic search")]
     async fn index_codebase(
         &self,
+        meta: Meta,
+        peer: Peer<RoleServer>,
         Parameters(req): Parameters<IndexRequest>,
     ) -> Result<String, String> {
+        // Get progress token if provided
+        let progress_token = meta.get_progress_token();
+
         let response = self.do_index(
             req.path,
+            req.project,
             req.include_patterns,
             req.exclude_patterns,
             req.max_file_size,
+            Some(peer),
+            progress_token,
         )
         .await
         .map_err(|e| format!("{:#}", e))?;  // Use alternate display to show full error chain
@@ -173,7 +277,7 @@ impl RagMcpServer {
         // Generate query embedding
         let query_embedding = self
             .embedding_provider
-            .embed_batch(vec![req.query])
+            .embed_batch(vec![req.query.clone()])
             .map_err(|e| format!("Failed to generate query embedding: {}", e))?
             .into_iter()
             .next()
@@ -182,7 +286,7 @@ impl RagMcpServer {
         // Search vector database
         let results = self
             .vector_db
-            .search(query_embedding, req.limit, req.min_score)
+            .search(query_embedding, &req.query, req.limit, req.min_score, req.project, req.hybrid)
             .await
             .map_err(|e| format!("Failed to search: {}", e))?;
 
@@ -232,9 +336,14 @@ impl RagMcpServer {
     async fn clear_index(&self, Parameters(_req): Parameters<ClearRequest>) -> Result<String, String> {
         let response = match self.vector_db.clear().await {
             Ok(_) => {
-                // Clear the indexed roots cache
-                let mut indexed_roots = self.indexed_roots.write().await;
-                indexed_roots.clear();
+                // Clear the persistent cache
+                let mut cache = self.hash_cache.write().await;
+                cache.roots.clear();
+
+                // Persist to disk
+                if let Err(e) = cache.save(&self.cache_path) {
+                    tracing::warn!("Failed to save cleared cache: {}", e);
+                }
 
                 // Re-initialize the collection
                 if let Err(e) = self
@@ -249,7 +358,7 @@ impl RagMcpServer {
                 } else {
                     ClearResponse {
                         success: true,
-                        message: "Successfully cleared all indexed data".to_string(),
+                        message: "Successfully cleared all indexed data and cache".to_string(),
                     }
                 }
             }
@@ -270,16 +379,17 @@ impl RagMcpServer {
     ) -> Result<String, String> {
         let start = Instant::now();
 
-        // Get existing file hashes
-        let indexed_roots = self.indexed_roots.read().await;
-        let existing_hashes = indexed_roots
-            .get(&req.path)
+        // Get existing file hashes from persistent cache
+        let cache = self.hash_cache.read().await;
+        let existing_hashes = cache
+            .get_root(&req.path)
             .cloned()
             .unwrap_or_default();
-        drop(indexed_roots);
+        drop(cache);
 
         // Walk directory to find current files (on a blocking thread)
         let walker = FileWalker::new(&req.path, 1_048_576)
+            .with_project(req.project.clone())
             .with_patterns(req.include_patterns.clone(), req.exclude_patterns.clone());
 
         let current_files = tokio::task::spawn_blocking(move || walker.walk())
@@ -359,9 +469,14 @@ impl RagMcpServer {
             }
         }
 
-        // Update cached hashes
-        let mut indexed_roots = self.indexed_roots.write().await;
-        indexed_roots.insert(req.path, new_hashes);
+        // Update persistent cache
+        let mut cache = self.hash_cache.write().await;
+        cache.update_root(req.path, new_hashes);
+
+        // Persist to disk
+        if let Err(e) = cache.save(&self.cache_path) {
+            tracing::warn!("Failed to save hash cache: {}", e);
+        }
 
         let response = IncrementalUpdateResponse {
             files_added,
@@ -385,7 +500,7 @@ impl RagMcpServer {
         // Generate query embedding
         let query_embedding = self
             .embedding_provider
-            .embed_batch(vec![req.query])
+            .embed_batch(vec![req.query.clone()])
             .map_err(|e| format!("Failed to generate query embedding: {}", e))?
             .into_iter()
             .next()
@@ -396,8 +511,11 @@ impl RagMcpServer {
             .vector_db
             .search_filtered(
                 query_embedding,
+                &req.query,
                 req.limit,
                 req.min_score,
+                req.project,
+                true, // Always use hybrid for advanced search
                 req.file_extensions,
                 req.languages,
                 req.path_patterns,
@@ -523,7 +641,7 @@ impl ServerHandler for RagMcpServer {
                 .enable_prompts()
                 .build(),
             server_info: Implementation {
-                name: "project-rag".into(),
+                name: "project".into(),
                 title: Some("Project RAG - Code Understanding with Semantic Search".into()),
                 version: env!("CARGO_PKG_VERSION").into(),
                 icons: None,

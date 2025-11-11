@@ -8,12 +8,12 @@ Project RAG now exposes **6 slash commands** via MCP Prompts that make it easy t
 
 When you restart Claude Code, these commands will be available:
 
-### `/mcp__project-rag__index`
+### `/project:index`
 Index a codebase directory to enable semantic search.
 
 **Usage**:
 ```
-/mcp__project-rag__index
+/project:index
 ```
 
 **Optional Arguments**:
@@ -23,12 +23,12 @@ Index a codebase directory to enable semantic search.
 
 ---
 
-### `/mcp__project-rag__query`
+### `/project:query`
 Search the indexed codebase using semantic search.
 
 **Usage**:
 ```
-/mcp__project-rag__query
+/project:query
 ```
 
 **Required Arguments**:
@@ -38,36 +38,36 @@ Search the indexed codebase using semantic search.
 
 ---
 
-### `/mcp__project-rag__stats`
+### `/project:stats`
 Get statistics about the indexed codebase.
 
 **Usage**:
 ```
-/mcp__project-rag__stats
+/project:stats
 ```
 
 **What it does**: Triggers the `get_statistics` tool to show index statistics including file counts, chunk counts, and language breakdown.
 
 ---
 
-### `/mcp__project-rag__clear`
+### `/project:clear`
 Clear all indexed data from the vector database.
 
 **Usage**:
 ```
-/mcp__project-rag__clear
+/project:clear
 ```
 
 **What it does**: Triggers the `clear_index` tool to delete all indexed data from Qdrant.
 
 ---
 
-### `/mcp__project-rag__update`
+### `/project:update`
 Incrementally update the index with only changed files.
 
 **Usage**:
 ```
-/mcp__project-rag__update
+/project:update
 ```
 
 **Optional Arguments**:
@@ -77,12 +77,12 @@ Incrementally update the index with only changed files.
 
 ---
 
-### `/mcp__project-rag__search`
+### `/project:search`
 Advanced search with filters (file type, language, path).
 
 **Usage**:
 ```
-/mcp__project-rag__search
+/project:search
 ```
 
 **Required Arguments**:
@@ -108,7 +108,7 @@ Please use the index_codebase tool to index ~/dev/my-project
 
 You can just type:
 ```
-/mcp__project-rag__index
+/project:index
 ```
 
 ## Direct Tool Usage

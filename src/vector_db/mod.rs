@@ -1,5 +1,11 @@
-mod qdrant_client;
+// LanceDB is the default embedded vector database
+mod lance_client;
+pub use lance_client::LanceVectorDB;
 
+// Qdrant is optional (requires external server)
+#[cfg(feature = "qdrant-backend")]
+mod qdrant_client;
+#[cfg(feature = "qdrant-backend")]
 pub use qdrant_client::QdrantVectorDB;
 
 use crate::types::{ChunkMetadata, SearchResult};
@@ -22,16 +28,22 @@ pub trait VectorDatabase: Send + Sync {
     async fn search(
         &self,
         query_vector: Vec<f32>,
+        query_text: &str,
         limit: usize,
         min_score: f32,
+        project: Option<String>,
+        hybrid: bool,
     ) -> Result<Vec<SearchResult>>;
 
     /// Search with filters
     async fn search_filtered(
         &self,
         query_vector: Vec<f32>,
+        query_text: &str,
         limit: usize,
         min_score: f32,
+        project: Option<String>,
+        hybrid: bool,
         file_extensions: Vec<String>,
         languages: Vec<String>,
         path_patterns: Vec<String>,

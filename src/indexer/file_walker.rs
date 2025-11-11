@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 pub struct FileInfo {
     pub path: PathBuf,
     pub relative_path: String,
+    pub project: Option<String>,
     pub extension: Option<String>,
     pub language: Option<String>,
     pub content: String,
@@ -18,6 +19,7 @@ pub struct FileInfo {
 
 pub struct FileWalker {
     root: PathBuf,
+    project: Option<String>,
     max_file_size: usize,
     include_patterns: Vec<String>,
     exclude_patterns: Vec<String>,
@@ -27,10 +29,16 @@ impl FileWalker {
     pub fn new(root: impl AsRef<Path>, max_file_size: usize) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
+            project: None,
             max_file_size,
             include_patterns: vec![],
             exclude_patterns: vec![],
         }
+    }
+
+    pub fn with_project(mut self, project: Option<String>) -> Self {
+        self.project = project;
+        self
     }
 
     pub fn with_patterns(
@@ -118,6 +126,7 @@ impl FileWalker {
             files.push(FileInfo {
                 path: path.to_path_buf(),
                 relative_path,
+                project: self.project.clone(),
                 extension,
                 language,
                 content,

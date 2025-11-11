@@ -1,5 +1,6 @@
 use super::CodeChunk;
 use crate::indexer::file_walker::FileInfo;
+use crate::indexer::ast_parser::AstParser;
 use crate::types::ChunkMetadata;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,6 +10,10 @@ pub enum ChunkStrategy {
     FixedLines(usize),
     /// Sliding window with overlap
     SlidingWindow { size: usize, overlap: usize },
+    /// AST-based chunking (functions, classes, methods)
+    AstBased,
+    /// Hybrid: AST-based with fallback to fixed lines
+    Hybrid { fallback_lines: usize },
 }
 
 pub struct CodeChunker {
@@ -20,9 +25,9 @@ impl CodeChunker {
         Self { strategy }
     }
 
-    /// Create a chunker with default strategy (50 lines per chunk)
+    /// Create a chunker with default strategy (Hybrid AST with 50 line fallback)
     pub fn default_strategy() -> Self {
-        Self::new(ChunkStrategy::FixedLines(50))
+        Self::new(ChunkStrategy::Hybrid { fallback_lines: 50 })
     }
 
     /// Chunk a file into multiple code chunks
@@ -33,6 +38,18 @@ impl CodeChunker {
             }
             ChunkStrategy::SlidingWindow { size, overlap } => {
                 self.chunk_sliding_window(file_info, *size, *overlap)
+            }
+            ChunkStrategy::AstBased => {
+                self.chunk_ast_based(file_info)
+            }
+            ChunkStrategy::Hybrid { fallback_lines } => {
+                // Try AST-based first, fallback to fixed lines if it fails
+                let ast_chunks = self.chunk_ast_based(file_info);
+                if ast_chunks.is_empty() {
+                    self.chunk_fixed_lines(file_info, *fallback_lines)
+                } else {
+                    ast_chunks
+                }
             }
         }
     }
@@ -63,6 +80,7 @@ impl CodeChunker {
 
             let metadata = ChunkMetadata {
                 file_path: file_info.relative_path.clone(),
+                project: file_info.project.clone(),
                 start_line,
                 end_line,
                 language: file_info.language.clone(),
@@ -115,6 +133,7 @@ impl CodeChunker {
 
             let metadata = ChunkMetadata {
                 file_path: file_info.relative_path.clone(),
+                project: file_info.project.clone(),
                 start_line,
                 end_line,
                 language: file_info.language.clone(),
@@ -131,6 +150,82 @@ impl CodeChunker {
             }
 
             start_idx += step;
+        }
+
+        chunks
+    }
+
+    /// Chunk using AST-based parsing (functions, classes, methods)
+    fn chunk_ast_based(&self, file_info: &FileInfo) -> Vec<CodeChunk> {
+        // Check if we have an extension and can parse it
+        let extension = match &file_info.extension {
+            Some(ext) => ext,
+            None => {
+                tracing::debug!("No extension for AST parsing: {:?}", file_info.path);
+                return Vec::new();
+            }
+        };
+
+        // Try to create parser for this language
+        let mut parser = match AstParser::new(extension) {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::debug!("Unsupported language for AST parsing: {}", extension);
+                return Vec::new();
+            }
+        };
+
+        // Parse the file
+        let ast_nodes = match parser.parse(&file_info.content) {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                tracing::warn!("Failed to parse file {:?}: {}", file_info.path, e);
+                return Vec::new();
+            }
+        };
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let mut chunks = Vec::new();
+        let lines: Vec<&str> = file_info.content.lines().collect();
+
+        for ast_node in ast_nodes {
+            // Extract the content for this node
+            let start_idx = ast_node.start_line.saturating_sub(1);
+            let end_idx = ast_node.end_line.min(lines.len());
+
+            if start_idx >= end_idx {
+                continue;
+            }
+
+            let chunk_lines = &lines[start_idx..end_idx];
+            let content = chunk_lines.join("\n");
+
+            // Skip empty chunks
+            if content.trim().is_empty() {
+                continue;
+            }
+
+            let metadata = ChunkMetadata {
+                file_path: file_info.relative_path.clone(),
+                project: file_info.project.clone(),
+                start_line: ast_node.start_line,
+                end_line: ast_node.end_line,
+                language: file_info.language.clone(),
+                extension: file_info.extension.clone(),
+                file_hash: file_info.hash.clone(),
+                indexed_at: timestamp,
+            };
+
+            chunks.push(CodeChunk { content, metadata });
+        }
+
+        // If no chunks were created, log it
+        if chunks.is_empty() {
+            tracing::debug!("No AST chunks created for {:?}", file_info.path);
         }
 
         chunks
@@ -152,6 +247,7 @@ mod tests {
         FileInfo {
             path: PathBuf::from("test.rs"),
             relative_path: "test.rs".to_string(),
+            project: None,
             extension: Some("rs".to_string()),
             language: Some("Rust".to_string()),
             content: content.to_string(),

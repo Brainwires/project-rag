@@ -13,9 +13,11 @@ This MCP server enables AI assistants to efficiently search and understand large
 ## Features
 
 - **Local-First**: All processing happens locally using fastembed-rs (no API keys required)
-- **Fast Semantic Search**: Powered by Qdrant vector database with HNSW indexing
-- **Incremental Updates**: Only re-index changed files based on SHA256 hashes
-- **Smart Chunking**: Intelligent code chunking strategies (fixed-lines and sliding-window)
+- **Hybrid Search**: Combines vector similarity (70%) with BM25 keyword matching (30%) for optimal results
+- **AST-Based Chunking**: Uses Tree-sitter to extract semantic units (functions, classes, methods) for 12 languages
+- **Multi-Project Support**: Index and query multiple codebases simultaneously with project filtering
+- **Incremental Updates**: Only re-index changed files with persistent hash cache
+- **Fast Semantic Search**: Embedded LanceDB vector database (default) with optional Qdrant support
 - **Language Detection**: Automatic detection of 30+ programming languages
 - **Advanced Filtering**: Search by file type, language, or path patterns
 - **Respects .gitignore**: Automatically excludes ignored files during indexing
@@ -25,12 +27,12 @@ This MCP server enables AI assistants to efficiently search and understand large
 
 The server provides 6 slash commands for quick access in Claude Code:
 
-1. **`/mcp__project-rag__index`** - Index a codebase directory
-2. **`/mcp__project-rag__query`** - Search the indexed codebase
-3. **`/mcp__project-rag__stats`** - Get index statistics
-4. **`/mcp__project-rag__clear`** - Clear all indexed data
-5. **`/mcp__project-rag__update`** - Incremental update for changed files
-6. **`/mcp__project-rag__search`** - Advanced search with filters
+1. **`/project:index`** - Index a codebase directory
+2. **`/project:query`** - Search the indexed codebase
+3. **`/project:stats`** - Get index statistics
+4. **`/project:clear`** - Clear all indexed data
+5. **`/project:update`** - Incremental update for changed files
+6. **`/project:search`** - Advanced search with filters
 
 See [SLASH_COMMANDS.md](SLASH_COMMANDS.md) for detailed usage.
 
@@ -43,33 +45,58 @@ The server also provides 6 tools that can be used directly:
    - Respects .gitignore and exclude patterns
    - Tracks file hashes for incremental updates
 
-2. **query_codebase** - Semantic search across the indexed code
-   - Returns relevant code chunks with similarity scores
+2. **query_codebase** - Hybrid semantic + keyword search across the indexed code
+   - Combines vector similarity with BM25 keyword matching (enabled by default)
+   - Returns relevant code chunks with both vector and keyword scores
    - Configurable result limit and score threshold
+   - Optional project filtering for multi-project setups
 
 3. **get_statistics** - Get statistics about the indexed codebase
    - File counts, chunk counts, embedding counts
    - Language breakdown
 
 4. **clear_index** - Clear all indexed data
-   - Deletes the entire Qdrant collection
+   - Deletes the entire vector database collection
    - Prepares for fresh indexing
 
 5. **incremental_update** - Update only changed files
    - Detects new, modified, and deleted files
    - Only re-processes changes since last index
 
-6. **search_by_filters** - Advanced search with filters
+6. **search_by_filters** - Advanced hybrid search with filters
+   - Always uses hybrid search for best results
    - Filter by file extensions (e.g., ["rs", "toml"])
    - Filter by programming languages
    - Filter by path patterns
+   - Optional project filtering
 
 ## Prerequisites
 
 - **Rust**: 1.83+ with Rust 2024 edition support
-- **Qdrant**: Running instance (default: `http://localhost:6334`)
+- **protobuf-compiler**: Required for building (install via `sudo apt-get install protobuf-compiler` on Ubuntu/Debian)
 
-### Installing Qdrant
+### Vector Database Options
+
+**LanceDB (Default - Embedded)**
+
+No additional setup needed! LanceDB is an embedded database that runs directly in the application. It stores data in `./lancedb` directory by default.
+
+Benefits:
+- No external dependencies or services to manage
+- Pure Rust implementation
+- SIMD-optimized for fast CPU operations
+- Optional GPU acceleration support via CUDA
+- Handles billions of vectors efficiently
+
+**Qdrant (Optional - Server-Based)**
+
+To use Qdrant instead of LanceDB, build with the `qdrant-backend` feature:
+
+```bash
+cargo build --release --no-default-features --features qdrant-backend
+```
+
+Then start a Qdrant instance:
 
 **Using Docker (Recommended):**
 ```bash
@@ -99,8 +126,14 @@ services:
 # Navigate to the project
 cd project-rag
 
-# Build the release binary
+# Install protobuf compiler (Ubuntu/Debian)
+sudo apt-get install protobuf-compiler
+
+# Build the release binary (with default LanceDB backend)
 cargo build --release
+
+# Or build with Qdrant backend
+cargo build --release --no-default-features --features qdrant-backend
 
 # The binary will be at target/release/project-rag
 ```
@@ -186,9 +219,10 @@ project-rag/
 │   ├── embedding/          # FastEmbed integration for local embeddings
 │   │   ├── mod.rs          # EmbeddingProvider trait
 │   │   └── fastembed_manager.rs  # all-MiniLM-L6-v2 implementation
-│   ├── vector_db/          # Qdrant client wrapper
+│   ├── vector_db/          # Vector database implementations
 │   │   ├── mod.rs          # VectorDatabase trait
-│   │   └── qdrant_client.rs  # Qdrant implementation with builders
+│   │   ├── lance_client.rs # LanceDB implementation (default)
+│   │   └── qdrant_client.rs  # Qdrant implementation (optional)
 │   ├── indexer/            # File walking and code chunking
 │   │   ├── mod.rs          # Module exports
 │   │   ├── file_walker.rs  # Directory traversal with .gitignore
@@ -220,9 +254,10 @@ project-rag/
 - First run downloads model (~50MB) to cache
 
 ### Chunking Strategy
-- Default: Fixed 50 lines per chunk
-- Alternative: Sliding window with configurable overlap
-- Future: Semantic chunking, AST-based chunking
+- **Default**: Hybrid AST-based with fallback to fixed-lines
+- **AST Parsing**: Extracts semantic units (functions, classes, methods) for Rust, Python, JavaScript, TypeScript, Go, Java, Swift, C, C++, C#, Ruby, PHP
+- **Fallback**: 50 lines per chunk for unsupported languages
+- **Alternative**: Sliding window with configurable overlap
 
 ## Technical Details
 
@@ -236,12 +271,21 @@ project-rag/
 - **Engine**: Qdrant
 - **Distance Metric**: Cosine similarity
 - **Index**: HNSW for fast approximate nearest neighbor search
-- **Payload**: Stores file path, line numbers, language, hash, timestamp
+- **Payload**: Stores file path, project, line numbers, language, hash, timestamp, content
+
+### Hybrid Search
+- **Vector Similarity**: 70% weight - semantic understanding via embeddings
+- **Keyword Matching**: 30% weight - Full BM25 algorithm with IDF calculation
+- **IDF Statistics**: Computed from entire corpus, refreshed after indexing
+- **Parameters**: k1=1.5, b=0.75 (standard BM25 values)
+- **Tokenization**: Simple whitespace splitting with case-insensitive matching
+- **Ranking**: Results re-sorted by combined score
 
 ### Code Chunking
-- **Default**: 50 lines per chunk
-- **Rationale**: Balance between context and granularity
-- **Metadata**: Tracks start/end lines, language, file hash
+- **Default**: Hybrid AST-based chunking
+- **AST Support**: Rust, Python, JavaScript, TypeScript, Go, Java, Swift, C, C++, C#, Ruby, PHP
+- **Fallback**: 50 lines per chunk for unsupported languages
+- **Metadata**: Tracks start/end lines, language, file hash, project
 
 ### File Processing
 - **Binary Detection**: 30% non-printable byte threshold
@@ -336,13 +380,16 @@ RUST_LOG=trace cargo run
 - Core architecture with modular design
 - All 6 MCP tools implemented and working
 - **All 6 MCP slash commands implemented**
+- **Hybrid search** - Vector similarity + Full BM25 with IDF
+- **AST-based chunking** - Semantic code extraction for 12 languages
+- **Multi-project support** - Index and query multiple codebases
+- **Persistent hash cache** - Fast incremental updates across restarts
 - FastEmbed integration for local embeddings
 - Qdrant vector database integration
 - File walking with .gitignore support
 - Language detection (30+ languages)
-- Code chunking (fixed-lines and sliding-window)
 - SHA256-based change detection
-- 10 unit tests passing
+- 24 unit tests passing
 - Comprehensive documentation
 - **Full MCP prompts support enabled**
 
@@ -421,16 +468,15 @@ export HF_ENDPOINT=https://hf-mirror.com
 ## Future Enhancements
 
 ### High Priority
-- [ ] Resolve MCP macro compatibility
 - [ ] Add comprehensive integration tests
 - [ ] Configuration file support (TOML)
-- [ ] Persistent hash cache for incremental updates
+- [ ] Cache IDF statistics to disk for faster startup
 
 ### Medium Priority
 - [ ] Embedded vector DB option (no external dependencies)
-- [ ] AST-based code chunking
 - [ ] Support for more embedding models
 - [ ] Performance benchmarks and profiling
+- [ ] AST support for more languages (Kotlin, Perl, Scala, etc.)
 
 ### Low Priority
 - [ ] Web UI for testing/debugging

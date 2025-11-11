@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 pub struct IndexRequest {
     /// Path to the codebase directory to index
     pub path: String,
+    /// Optional project name (for multi-project support)
+    #[serde(default)]
+    pub project: Option<String>,
     /// Optional glob patterns to include (e.g., ["**/*.rs", "**/*.toml"])
     #[serde(default)]
     pub include_patterns: Vec<String>,
@@ -42,12 +45,22 @@ pub struct IndexResponse {
 pub struct QueryRequest {
     /// The question or search query
     pub query: String,
+    /// Optional project name to filter by
+    #[serde(default)]
+    pub project: Option<String>,
     /// Number of results to return (default: 10)
     #[serde(default = "default_limit")]
     pub limit: usize,
     /// Minimum similarity score (0.0 to 1.0, default: 0.7)
     #[serde(default = "default_min_score")]
     pub min_score: f32,
+    /// Enable hybrid search (vector + keyword) - default: true
+    #[serde(default = "default_hybrid")]
+    pub hybrid: bool,
+}
+
+fn default_hybrid() -> bool {
+    true
 }
 
 fn default_limit() -> usize {
@@ -65,14 +78,20 @@ pub struct SearchResult {
     pub file_path: String,
     /// The code chunk content
     pub content: String,
-    /// Similarity score (0.0 to 1.0)
+    /// Combined similarity score (0.0 to 1.0)
     pub score: f32,
+    /// Vector similarity score (0.0 to 1.0)
+    pub vector_score: f32,
+    /// Keyword match score (0.0 to 1.0) - only present in hybrid search
+    pub keyword_score: Option<f32>,
     /// Starting line number in the file
     pub start_line: usize,
     /// Ending line number in the file
     pub end_line: usize,
     /// Programming language detected
-    pub language: Option<String>,
+    pub language: String,
+    /// Optional project name for multi-project support
+    pub project: Option<String>,
 }
 
 /// Response from query operation
@@ -128,6 +147,9 @@ pub struct ClearResponse {
 pub struct IncrementalUpdateRequest {
     /// Path to the codebase directory
     pub path: String,
+    /// Optional project name
+    #[serde(default)]
+    pub project: Option<String>,
     /// Optional glob patterns to include
     #[serde(default)]
     pub include_patterns: Vec<String>,
@@ -156,6 +178,9 @@ pub struct IncrementalUpdateResponse {
 pub struct AdvancedSearchRequest {
     /// The search query
     pub query: String,
+    /// Optional project name to filter by
+    #[serde(default)]
+    pub project: Option<String>,
     /// Number of results to return
     #[serde(default = "default_limit")]
     pub limit: usize,
@@ -178,6 +203,8 @@ pub struct AdvancedSearchRequest {
 pub struct ChunkMetadata {
     /// File path relative to indexed root
     pub file_path: String,
+    /// Project name (for multi-project support)
+    pub project: Option<String>,
     /// Starting line number
     pub start_line: usize,
     /// Ending line number
@@ -200,6 +227,7 @@ mod tests {
     fn test_index_request_defaults() {
         let req = IndexRequest {
             path: "/test".to_string(),
+            project: None,
             include_patterns: vec![],
             exclude_patterns: vec![],
             max_file_size: default_max_file_size(),
@@ -214,18 +242,22 @@ mod tests {
     fn test_query_request_defaults() {
         let req = QueryRequest {
             query: "test".to_string(),
+            project: None,
             limit: default_limit(),
             min_score: default_min_score(),
+            hybrid: default_hybrid(),
         };
 
         assert_eq!(req.limit, 10);
         assert_eq!(req.min_score, 0.7);
+        assert!(req.hybrid);
     }
 
     #[test]
     fn test_serialization_roundtrip() {
         let req = IndexRequest {
             path: "/test/path".to_string(),
+            project: Some("my-project".to_string()),
             include_patterns: vec!["**/*.rs".to_string()],
             exclude_patterns: vec!["**/target/**".to_string()],
             max_file_size: 2_000_000,
@@ -246,12 +278,17 @@ mod tests {
             file_path: "src/main.rs".to_string(),
             content: "fn main() {}".to_string(),
             score: 0.95,
+            vector_score: 0.92,
+            keyword_score: Some(0.85),
             start_line: 1,
             end_line: 10,
-            language: Some("Rust".to_string()),
+            language: "Rust".to_string(),
+            project: None,
         };
 
         assert_eq!(result.score, 0.95);
+        assert_eq!(result.vector_score, 0.92);
+        assert_eq!(result.keyword_score, Some(0.85));
         assert!(result.language.is_some());
     }
 
@@ -259,6 +296,7 @@ mod tests {
     fn test_chunk_metadata_creation() {
         let metadata = ChunkMetadata {
             file_path: "src/lib.rs".to_string(),
+            project: Some("test-project".to_string()),
             start_line: 1,
             end_line: 50,
             language: Some("Rust".to_string()),
@@ -270,6 +308,7 @@ mod tests {
         assert_eq!(metadata.start_line, 1);
         assert_eq!(metadata.end_line, 50);
         assert_eq!(metadata.file_hash, "abc123");
+        assert_eq!(metadata.project, Some("test-project".to_string()));
     }
 
     #[test]
