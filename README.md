@@ -13,7 +13,7 @@ This MCP server enables AI assistants to efficiently search and understand large
 ## Features
 
 - **Local-First**: All processing happens locally using fastembed-rs (no API keys required)
-- **Hybrid Search**: Combines vector similarity (70%) with BM25 keyword matching (30%) for optimal results
+- **Hybrid Search**: Combines vector similarity with BM25 keyword matching using Reciprocal Rank Fusion (RRF) for optimal results
 - **AST-Based Chunking**: Uses Tree-sitter to extract semantic units (functions, classes, methods) for 12 languages
 - **Multi-Project Support**: Index and query multiple codebases simultaneously with project filtering
 - **Incremental Updates**: Only re-index changed files with persistent hash cache
@@ -87,6 +87,7 @@ No additional setup needed! USearch is an embedded HNSW vector database that run
 - **SIMD-optimized** for 119x speedup on distance calculations
 - **No training phase** - immediate indexing without expensive clustering
 - **Production-proven** - used by YugabyteDB
+- **Hybrid search built-in** - Tantivy BM25 + USearch vector with Reciprocal Rank Fusion
 - Excellent memory efficiency with fast query performance (20-30ms)
 
 **Performance Comparison:**
@@ -236,20 +237,20 @@ Add to your Claude Desktop config:
 ```
 project-rag/
 ├── src/
+│   ├── bm25_search.rs      # Tantivy BM25 keyword search with RRF fusion
 │   ├── embedding/          # FastEmbed integration for local embeddings
 │   │   ├── mod.rs          # EmbeddingProvider trait
 │   │   └── fastembed_manager.rs  # all-MiniLM-L6-v2 implementation
 │   ├── vector_db/          # Vector database implementations
 │   │   ├── mod.rs          # VectorDatabase trait
-│   │   ├── usearch_client.rs # USearch implementation (default, fastest)
+│   │   ├── usearch_client.rs # USearch + Tantivy hybrid search (default)
 │   │   ├── lance_client.rs # LanceDB implementation (optional)
 │   │   └── qdrant_client.rs  # Qdrant implementation (optional)
 │   ├── indexer/            # File walking and code chunking
 │   │   ├── mod.rs          # Module exports
 │   │   ├── file_walker.rs  # Directory traversal with .gitignore
 │   │   └── chunker.rs      # Chunking strategies
-│   ├── mcp_server.rs       # MCP server with 6 tools (in progress)
-│   ├── mcp_test_minimal.rs # Working minimal MCP server example
+│   ├── mcp_server.rs       # MCP server with 6 tools
 │   ├── types.rs            # Request/Response types with JSON schema
 │   ├── main.rs             # Binary entry point with stdio transport
 │   └── lib.rs              # Library root
@@ -295,12 +296,12 @@ project-rag/
 - **Payload**: Stores file path, project, line numbers, language, hash, timestamp, content
 
 ### Hybrid Search
-- **Vector Similarity**: 70% weight - semantic understanding via embeddings
-- **Keyword Matching**: 30% weight - Full BM25 algorithm with IDF calculation
-- **IDF Statistics**: Computed from entire corpus, refreshed after indexing
-- **Parameters**: k1=1.5, b=0.75 (standard BM25 values)
-- **Tokenization**: Simple whitespace splitting with case-insensitive matching
-- **Ranking**: Results re-sorted by combined score
+- **Vector Similarity**: Semantic understanding via embeddings (USearch HNSW)
+- **Keyword Matching**: Full-text BM25 search via Tantivy inverted index
+- **Fusion Algorithm**: Reciprocal Rank Fusion (RRF) with k=60 constant
+- **BM25 Parameters**: Uses Tantivy's optimized BM25 implementation
+- **Ranking**: RRF combines both rankings using 1/(k+rank) formula
+- **Performance**: Both indexes queried in parallel for fast results
 
 ### Code Chunking
 - **Default**: Hybrid AST-based chunking
@@ -410,9 +411,10 @@ RUST_LOG=trace cargo run
 - File walking with .gitignore support
 - Language detection (30+ languages)
 - SHA256-based change detection
-- 24 unit tests passing
+- 26 unit tests passing (including BM25 hybrid search tests)
 - Comprehensive documentation
 - **Full MCP prompts support enabled**
+- **Hybrid search with Tantivy BM25 + USearch vector using RRF**
 
 ### 📋 Known Limitations
 

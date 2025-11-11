@@ -1,3 +1,4 @@
+pub mod bm25_search;
 pub mod cache;
 pub mod embedding;
 pub mod indexer;

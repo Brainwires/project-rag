@@ -5,16 +5,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
+use crate::bm25_search::BM25Search;
 use crate::types::{ChunkMetadata, SearchResult};
 use crate::vector_db::{DatabaseStats, VectorDatabase};
 
-/// USearch-based vector database implementation
+/// USearch-based vector database implementation with BM25 hybrid search
 ///
 /// USearch provides 10x faster indexing than LanceDB using HNSW algorithm
 /// with excellent memory efficiency (16x better than standard hnswlib).
+/// Tantivy provides BM25 keyword search for hybrid retrieval.
 pub struct USearchDB {
     /// The USearch index (thread-safe)
     index: Arc<RwLock<Option<Index>>>,
+    /// BM25 search index for keyword matching
+    bm25_index: Arc<RwLock<Option<BM25Search>>>,
     /// Database path for persistence
     db_path: PathBuf,
     /// Embedding dimension (uses AtomicUsize for thread-safe interior mutability)
@@ -33,8 +37,14 @@ impl USearchDB {
     pub fn new<P: AsRef<Path>>(db_path: P, collection_name: &str) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
 
+        // Initialize BM25 index
+        let bm25_path = db_path.join(format!("{}_bm25", collection_name));
+        let bm25_index = BM25Search::new(&bm25_path)
+            .context("Failed to initialize BM25 index")?;
+
         Ok(Self {
             index: Arc::new(RwLock::new(None)),
+            bm25_index: Arc::new(RwLock::new(Some(bm25_index))),
             db_path,
             dimension: AtomicUsize::new(0),
             metadata: Arc::new(RwLock::new(HashMap::new())),
@@ -184,6 +194,9 @@ impl VectorDatabase for USearchDB {
 
         let count = embeddings.len();
 
+        // Prepare documents for BM25 indexing
+        let mut bm25_docs = Vec::new();
+
         for (i, embedding) in embeddings.iter().enumerate() {
             let id = *next_id_lock;
 
@@ -195,6 +208,9 @@ impl VectorDatabase for USearchDB {
             metadata_lock.insert(id, metadata[i].clone());
             contents_lock.insert(id, contents[i].clone());
 
+            // Prepare for BM25 index
+            bm25_docs.push((id, contents[i].clone()));
+
             *next_id_lock += 1;
         }
 
@@ -202,6 +218,12 @@ impl VectorDatabase for USearchDB {
         drop(metadata_lock);
         drop(contents_lock);
         drop(next_id_lock);
+
+        // Add documents to BM25 index
+        if let Some(bm25) = self.bm25_index.read().unwrap().as_ref() {
+            bm25.add_documents(bm25_docs)
+                .context("Failed to add documents to BM25 index")?;
+        }
 
         // Save to disk after batch insert
         self.save().context("Failed to save index after insertion")?;
@@ -212,59 +234,128 @@ impl VectorDatabase for USearchDB {
     async fn search(
         &self,
         query_vector: Vec<f32>,
-        _query_text: &str,
+        query_text: &str,
         limit: usize,
         min_score: f32,
         project: Option<String>,
-        _hybrid: bool,
+        hybrid: bool,
     ) -> Result<Vec<SearchResult>> {
         let index_lock = self.index.read().unwrap();
         let index = index_lock.as_ref()
             .context("Index not initialized")?;
 
-        // Search in USearch
-        let matches = index.search(&query_vector, limit)
-            .context("Failed to search index")?;
+        if hybrid {
+            // Hybrid search: combine vector and BM25 results with RRF
+            // Get more results from each source for RRF to combine
+            let search_limit = limit * 3;
 
-        let metadata_lock = self.metadata.read().unwrap();
-        let contents_lock = self.contents.read().unwrap();
-        let mut results = Vec::new();
+            // Vector search
+            let matches = index.search(&query_vector, search_limit)
+                .context("Failed to search vector index")?;
 
-        for match_result in matches.keys.iter().zip(matches.distances.iter()) {
-            let (key, distance) = match_result;
-            let score = self.distance_to_similarity(*distance);
-
-            // Filter by min_score
-            if score < min_score {
-                continue;
+            let mut vector_results = Vec::new();
+            for (key, distance) in matches.keys.iter().zip(matches.distances.iter()) {
+                let score = self.distance_to_similarity(*distance);
+                vector_results.push((*key, score));
             }
 
-            // Get metadata
-            if let Some(meta) = metadata_lock.get(key) {
-                // Filter by project if specified
-                if let Some(ref project_filter) = project {
-                    if meta.project.as_ref() != Some(project_filter) {
-                        continue;
-                    }
+            // BM25 keyword search
+            let bm25_results = if let Some(bm25) = self.bm25_index.read().unwrap().as_ref() {
+                bm25.search(query_text, search_limit)
+                    .context("Failed to search BM25 index")?
+            } else {
+                Vec::new()
+            };
+
+            // Combine results with Reciprocal Rank Fusion
+            let combined = crate::bm25_search::reciprocal_rank_fusion(
+                vector_results,
+                bm25_results,
+                limit,
+            );
+
+            // Build final results
+            let metadata_lock = self.metadata.read().unwrap();
+            let contents_lock = self.contents.read().unwrap();
+            let mut results = Vec::new();
+
+            for (key, score) in combined {
+                // Filter by min_score
+                if score < min_score {
+                    continue;
                 }
 
-                let content = contents_lock.get(key).cloned().unwrap_or_default();
+                // Get metadata
+                if let Some(meta) = metadata_lock.get(&key) {
+                    // Filter by project if specified
+                    if let Some(ref project_filter) = project {
+                        if meta.project.as_ref() != Some(project_filter) {
+                            continue;
+                        }
+                    }
 
-                results.push(SearchResult {
-                    file_path: meta.file_path.clone(),
-                    content,
-                    score,
-                    vector_score: score,
-                    keyword_score: None,
-                    start_line: meta.start_line,
-                    end_line: meta.end_line,
-                    language: meta.language.clone().unwrap_or_else(|| "Unknown".to_string()),
-                    project: meta.project.clone(),
-                });
+                    let content = contents_lock.get(&key).cloned().unwrap_or_default();
+
+                    results.push(SearchResult {
+                        file_path: meta.file_path.clone(),
+                        content,
+                        score,
+                        vector_score: score,
+                        keyword_score: Some(score), // RRF combines both
+                        start_line: meta.start_line,
+                        end_line: meta.end_line,
+                        language: meta.language.clone().unwrap_or_else(|| "Unknown".to_string()),
+                        project: meta.project.clone(),
+                    });
+                }
             }
-        }
 
-        Ok(results)
+            Ok(results)
+        } else {
+            // Pure vector search
+            let matches = index.search(&query_vector, limit)
+                .context("Failed to search index")?;
+
+            let metadata_lock = self.metadata.read().unwrap();
+            let contents_lock = self.contents.read().unwrap();
+            let mut results = Vec::new();
+
+            for match_result in matches.keys.iter().zip(matches.distances.iter()) {
+                let (key, distance) = match_result;
+                let score = self.distance_to_similarity(*distance);
+
+                // Filter by min_score
+                if score < min_score {
+                    continue;
+                }
+
+                // Get metadata
+                if let Some(meta) = metadata_lock.get(key) {
+                    // Filter by project if specified
+                    if let Some(ref project_filter) = project {
+                        if meta.project.as_ref() != Some(project_filter) {
+                            continue;
+                        }
+                    }
+
+                    let content = contents_lock.get(key).cloned().unwrap_or_default();
+
+                    results.push(SearchResult {
+                        file_path: meta.file_path.clone(),
+                        content,
+                        score,
+                        vector_score: score,
+                        keyword_score: None,
+                        start_line: meta.start_line,
+                        end_line: meta.end_line,
+                        language: meta.language.clone().unwrap_or_else(|| "Unknown".to_string()),
+                        project: meta.project.clone(),
+                    });
+                }
+            }
+
+            Ok(results)
+        }
     }
 
     async fn search_filtered(
@@ -345,15 +436,23 @@ impl VectorDatabase for USearchDB {
 
         let count = ids_to_delete.len();
 
-        // Remove from index
+        // Remove from vector index
         for id in &ids_to_delete {
             index.remove(*id)
                 .context("Failed to remove vector from index")?;
         }
 
-        // Remove from metadata
-        for id in ids_to_delete {
-            metadata_lock.remove(&id);
+        // Remove from BM25 index
+        if let Some(bm25) = self.bm25_index.read().unwrap().as_ref() {
+            for id in &ids_to_delete {
+                let _ = bm25.delete_by_id(*id); // Ignore errors for missing documents
+            }
+        }
+
+        // Remove from metadata and contents
+        for id in &ids_to_delete {
+            metadata_lock.remove(id);
+            self.contents.write().unwrap().remove(id);
         }
 
         drop(index_lock);
@@ -366,7 +465,7 @@ impl VectorDatabase for USearchDB {
     }
 
     async fn clear(&self) -> Result<()> {
-        // Clear the index by creating a new one
+        // Clear the vector index by creating a new one
         let mut options = IndexOptions::default();
         options.dimensions = self.dimension.load(Ordering::Relaxed);
         options.metric = MetricKind::Cos;
@@ -376,6 +475,11 @@ impl VectorDatabase for USearchDB {
             .context("Failed to create new USearch index")?;
 
         *self.index.write().unwrap() = Some(new_index);
+
+        // Clear BM25 index
+        if let Some(bm25) = self.bm25_index.read().unwrap().as_ref() {
+            bm25.clear().context("Failed to clear BM25 index")?;
+        }
 
         // Clear metadata and contents
         self.metadata.write().unwrap().clear();
@@ -387,10 +491,12 @@ impl VectorDatabase for USearchDB {
         // Delete saved files
         let index_path = self.db_path.join(format!("{}.usearch", self.collection_name));
         let metadata_path = self.db_path.join(format!("{}.meta", self.collection_name));
+        let contents_path = self.db_path.join(format!("{}.contents", self.collection_name));
         let id_path = self.db_path.join(format!("{}.nextid", self.collection_name));
 
         let _ = std::fs::remove_file(index_path);
         let _ = std::fs::remove_file(metadata_path);
+        let _ = std::fs::remove_file(contents_path);
         let _ = std::fs::remove_file(id_path);
 
         Ok(())

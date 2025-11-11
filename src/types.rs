@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(result.score, 0.95);
         assert_eq!(result.vector_score, 0.92);
         assert_eq!(result.keyword_score, Some(0.85));
-        assert!(result.language.is_some());
+        assert_eq!(result.language, "Rust");
     }
 
     #[test]
