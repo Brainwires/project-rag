@@ -181,6 +181,7 @@ impl QdrantVectorDB {
     }
 }
 
+#[async_trait::async_trait]
 impl VectorDatabase for QdrantVectorDB {
     async fn initialize(&self, dimension: usize) -> Result<()> {
         if self.collection_exists().await? {

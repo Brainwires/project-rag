@@ -2,7 +2,18 @@ use crate::cache::HashCache;
 use crate::embedding::{EmbeddingProvider, FastEmbedManager};
 use crate::indexer::{CodeChunker, FileWalker};
 use crate::types::*;
-use crate::vector_db::{USearchDB, VectorDatabase};
+use crate::vector_db::VectorDatabase;
+
+// Conditionally import the appropriate vector database backend
+#[cfg(feature = "qdrant-backend")]
+use crate::vector_db::QdrantVectorDB;
+
+#[cfg(feature = "lancedb-backend")]
+use crate::vector_db::LanceVectorDB;
+
+#[cfg(not(any(feature = "qdrant-backend", feature = "lancedb-backend")))]
+use crate::vector_db::USearchDB;
+
 use anyhow::{Context, Result};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
@@ -20,6 +31,11 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub struct RagMcpServer {
     embedding_provider: Arc<FastEmbedManager>,
+    #[cfg(feature = "qdrant-backend")]
+    vector_db: Arc<QdrantVectorDB>,
+    #[cfg(feature = "lancedb-backend")]
+    vector_db: Arc<LanceVectorDB>,
+    #[cfg(not(any(feature = "qdrant-backend", feature = "lancedb-backend")))]
     vector_db: Arc<USearchDB>,
     chunker: Arc<CodeChunker>,
     // Persistent hash cache for incremental updates
@@ -35,10 +51,35 @@ impl RagMcpServer {
             FastEmbedManager::new().context("Failed to initialize embedding provider")?,
         );
 
-        let vector_db = Arc::new(
-            USearchDB::new("./usearch_data", "code_embeddings")
-                .context("Failed to initialize vector database")?,
-        );
+        // Initialize the appropriate vector database backend
+        #[cfg(feature = "qdrant-backend")]
+        let vector_db = {
+            tracing::info!("Using Qdrant vector database backend");
+            Arc::new(
+                QdrantVectorDB::new()
+                    .await
+                    .context("Failed to initialize Qdrant vector database")?,
+            )
+        };
+
+        #[cfg(feature = "lancedb-backend")]
+        let vector_db = {
+            tracing::info!("Using LanceDB vector database backend");
+            Arc::new(
+                LanceVectorDB::new("./.lancedb_data", "code_embeddings")
+                    .await
+                    .context("Failed to initialize LanceDB vector database")?,
+            )
+        };
+
+        #[cfg(not(any(feature = "qdrant-backend", feature = "lancedb-backend")))]
+        let vector_db = {
+            tracing::info!("Using USearch vector database backend (default)");
+            Arc::new(
+                USearchDB::new("./.usearch_data", "code_embeddings")
+                    .context("Failed to initialize USearch vector database")?,
+            )
+        };
 
         // Initialize the database with the embedding dimension
         vector_db
@@ -447,8 +488,10 @@ impl RagMcpServer {
 
             chunks_modified = all_chunks.len();
 
-            // Generate embeddings and store
+            // Generate embeddings in batches, then store all at once to reduce disk I/O
             let batch_size = 32;
+            let mut all_embeddings = Vec::new();
+
             for chunk_batch in all_chunks.chunks(batch_size) {
                 let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
 
@@ -457,15 +500,17 @@ impl RagMcpServer {
                     .embed_batch(texts)
                     .map_err(|e| format!("Failed to generate embeddings: {}", e))?;
 
-                let metadata: Vec<ChunkMetadata> =
-                    chunk_batch.iter().map(|c| c.metadata.clone()).collect();
-                let contents: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
-
-                self.vector_db
-                    .store_embeddings(embeddings, metadata, contents)
-                    .await
-                    .map_err(|e| format!("Failed to store embeddings: {}", e))?;
+                all_embeddings.extend(embeddings);
             }
+
+            // Store all embeddings in a single operation (reduces disk I/O)
+            let metadata: Vec<ChunkMetadata> = all_chunks.iter().map(|c| c.metadata.clone()).collect();
+            let contents: Vec<String> = all_chunks.iter().map(|c| c.content.clone()).collect();
+
+            self.vector_db
+                .store_embeddings(all_embeddings, metadata, contents)
+                .await
+                .map_err(|e| format!("Failed to store embeddings: {}", e))?;
         }
 
         // Update persistent cache

@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -221,16 +220,5 @@ fn detect_language(extension: &str) -> Option<String> {
     Some(lang.to_string())
 }
 
-/// Load file hashes from a previous index (for incremental updates)
-pub fn load_file_hashes(_root: &Path) -> Result<HashMap<String, String>> {
-    // This would read from a cache file in a real implementation
-    // For now, return empty HashMap
-    Ok(HashMap::new())
-}
-
-/// Save file hashes for future incremental updates
-pub fn save_file_hashes(_root: &Path, _hashes: HashMap<String, String>) -> Result<()> {
-    // This would write to a cache file in a real implementation
-    // For now, do nothing
-    Ok(())
-}
+// Note: File hash persistence is now handled by HashCache (src/cache.rs)
+// These stub functions were removed as they were replaced by the HashCache implementation.

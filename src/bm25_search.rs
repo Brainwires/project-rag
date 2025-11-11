@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Mutex;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
@@ -9,10 +10,10 @@ use tantivy::{doc, Index, IndexWriter, ReloadPolicy, TantivyDocument};
 /// BM25-based keyword search using Tantivy
 pub struct BM25Search {
     index: Index,
-    schema: Schema,
-    index_path: PathBuf,
     id_field: Field,
     content_field: Field,
+    /// Mutex to ensure only one IndexWriter is created at a time
+    writer_lock: Mutex<()>,
 }
 
 /// Search result from BM25
@@ -47,15 +48,18 @@ impl BM25Search {
 
         Ok(Self {
             index,
-            schema,
-            index_path,
             id_field,
             content_field,
+            writer_lock: Mutex::new(()),
         })
     }
 
     /// Add documents to the index
     pub fn add_documents(&self, documents: Vec<(u64, String)>) -> Result<()> {
+        // Lock to ensure only one writer at a time
+        let _guard = self.writer_lock.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire writer lock: {}", e))?;
+
         let mut index_writer: IndexWriter<TantivyDocument> = self.index.writer(50_000_000)
             .context("Failed to create index writer")?;
 
@@ -113,6 +117,10 @@ impl BM25Search {
 
     /// Delete all documents for a specific ID
     pub fn delete_by_id(&self, id: u64) -> Result<()> {
+        // Lock to ensure only one writer at a time
+        let _guard = self.writer_lock.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire writer lock: {}", e))?;
+
         let mut index_writer: IndexWriter<TantivyDocument> = self.index.writer(50_000_000)
             .context("Failed to create index writer")?;
 
@@ -127,6 +135,10 @@ impl BM25Search {
 
     /// Clear the entire index
     pub fn clear(&self) -> Result<()> {
+        // Lock to ensure only one writer at a time
+        let _guard = self.writer_lock.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire writer lock: {}", e))?;
+
         let mut index_writer: IndexWriter<TantivyDocument> = self.index.writer(50_000_000)
             .context("Failed to create index writer")?;
 
@@ -237,5 +249,135 @@ mod tests {
         assert!(!combined.is_empty());
         assert!(combined.iter().any(|r| r.0 == 1));
         assert!(combined.iter().any(|r| r.0 == 3));
+    }
+
+    #[test]
+    fn test_bm25_delete_by_id() {
+        let temp_dir = tempdir().unwrap();
+        let bm25 = BM25Search::new(temp_dir.path()).unwrap();
+
+        // Add documents
+        let docs = vec![
+            (1, "test document one".to_string()),
+            (2, "test document two".to_string()),
+            (3, "test document three".to_string()),
+        ];
+        bm25.add_documents(docs).unwrap();
+
+        // Search should find all documents with "test"
+        let results = bm25.search("test", 10).unwrap();
+        assert_eq!(results.len(), 3);
+
+        // Delete document 2
+        bm25.delete_by_id(2).unwrap();
+
+        // Search again - should only find 2 documents now
+        let results = bm25.search("test", 10).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|r| r.id == 1));
+        assert!(results.iter().any(|r| r.id == 3));
+        assert!(!results.iter().any(|r| r.id == 2));
+    }
+
+    #[test]
+    fn test_bm25_clear() {
+        let temp_dir = tempdir().unwrap();
+        let bm25 = BM25Search::new(temp_dir.path()).unwrap();
+
+        // Add documents
+        let docs = vec![
+            (1, "content one".to_string()),
+            (2, "content two".to_string()),
+        ];
+        bm25.add_documents(docs).unwrap();
+
+        // Verify documents exist
+        let results = bm25.search("content", 10).unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Clear the index
+        bm25.clear().unwrap();
+
+        // Search should return no results
+        let results = bm25.search("content", 10).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_bm25_statistics() {
+        let temp_dir = tempdir().unwrap();
+        let bm25 = BM25Search::new(temp_dir.path()).unwrap();
+
+        // Initially empty
+        let stats = bm25.get_stats().unwrap();
+        assert_eq!(stats.total_documents, 0);
+
+        // Add documents
+        let docs = vec![
+            (1, "document one".to_string()),
+            (2, "document two".to_string()),
+            (3, "document three".to_string()),
+        ];
+        bm25.add_documents(docs).unwrap();
+
+        // Check statistics
+        let stats = bm25.get_stats().unwrap();
+        assert_eq!(stats.total_documents, 3);
+    }
+
+    #[test]
+    fn test_bm25_empty_query() {
+        let temp_dir = tempdir().unwrap();
+        let bm25 = BM25Search::new(temp_dir.path()).unwrap();
+
+        let docs = vec![
+            (1, "test content".to_string()),
+        ];
+        bm25.add_documents(docs).unwrap();
+
+        // Empty query should not crash
+        let results = bm25.search("", 10);
+        assert!(results.is_ok());
+    }
+
+    #[test]
+    fn test_reciprocal_rank_fusion_edge_cases() {
+        // Test with empty vector results
+        let vector_results = vec![];
+        let bm25_results = vec![
+            BM25Result { id: 1, score: 10.0 },
+            BM25Result { id: 2, score: 8.0 },
+        ];
+        let combined = reciprocal_rank_fusion(vector_results, bm25_results, 5);
+        assert_eq!(combined.len(), 2);
+
+        // Test with empty BM25 results
+        let vector_results = vec![(1, 0.9), (2, 0.8)];
+        let bm25_results = vec![];
+        let combined = reciprocal_rank_fusion(vector_results, bm25_results, 5);
+        assert_eq!(combined.len(), 2);
+
+        // Test with both empty
+        let vector_results = vec![];
+        let bm25_results = vec![];
+        let combined = reciprocal_rank_fusion(vector_results, bm25_results, 5);
+        assert_eq!(combined.len(), 0);
+    }
+
+    #[test]
+    fn test_reciprocal_rank_fusion_scoring() {
+        // Test that items appearing in both lists get higher scores
+        let vector_results = vec![(1, 0.9), (2, 0.5)];
+        let bm25_results = vec![
+            BM25Result { id: 1, score: 10.0 },
+            BM25Result { id: 3, score: 8.0 },
+        ];
+        let combined = reciprocal_rank_fusion(vector_results, bm25_results, 5);
+
+        // ID 1 appears in both lists (rank 1 in both), should score highest
+        // ID 2 appears only in vector (rank 2)
+        // ID 3 appears only in BM25 (rank 2)
+        assert!(combined[0].0 == 1, "ID 1 should rank first");
+        assert!(combined[0].1 > combined[1].1, "ID 1 should have highest score");
     }
 }

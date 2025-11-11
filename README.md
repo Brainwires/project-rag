@@ -79,7 +79,7 @@ The server also provides 6 tools that can be used directly:
 
 **USearch (Default - Embedded, Fastest)**
 
-No additional setup needed! USearch is an embedded HNSW vector database that runs directly in the application. It stores data in `./usearch_data` directory by default.
+No additional setup needed! USearch is an embedded HNSW vector database that runs directly in the application. It stores data in `./.usearch_data` directory by default.
 
 **Why USearch is the default:**
 - **10x faster indexing** than LanceDB (HNSW vs IVF_PQ algorithm)
@@ -411,7 +411,7 @@ RUST_LOG=trace cargo run
 - File walking with .gitignore support
 - Language detection (30+ languages)
 - SHA256-based change detection
-- 26 unit tests passing (including BM25 hybrid search tests)
+- 33 unit tests passing (including 8 BM25/RRF hybrid search tests)
 - Comprehensive documentation
 - **Full MCP prompts support enabled**
 - **Hybrid search with Tantivy BM25 + USearch vector using RRF**

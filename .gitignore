@@ -27,3 +27,6 @@ Thumbs.db
 
 # Qdrant data (if running embedded)
 qdrant_data/
+
+# Usearch data
+.usearch_data
