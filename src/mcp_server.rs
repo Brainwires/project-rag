@@ -266,14 +266,14 @@ impl RagMcpServer {
             tracing::warn!("Failed to save hash cache: {}", e);
         }
 
-        // Send completion progress
+        // Send progress before flush
         if let (Some(peer), Some(token)) = (&peer, &progress_token) {
             let _ = peer
                 .notify_progress(ProgressNotificationParam {
                     progress_token: token.clone(),
-                    progress: 100.0,
+                    progress: 98.0,
                     total: Some(100.0),
-                    message: Some("Saving index to disk...".into()),
+                    message: Some("Flushing index to disk...".into()),
                 })
                 .await;
         }
@@ -540,6 +540,18 @@ impl RagMcpServer {
             tracing::warn!("Failed to save hash cache: {}", e);
         }
         drop(cache);
+
+        // Send progress before flush
+        if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+            let _ = peer
+                .notify_progress(ProgressNotificationParam {
+                    progress_token: token.clone(),
+                    progress: 98.0,
+                    total: Some(100.0),
+                    message: Some("Flushing index to disk...".into()),
+                })
+                .await;
+        }
 
         // Flush the vector database to disk
         self.vector_db
@@ -811,57 +823,57 @@ impl RagMcpServer {
         serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
     }
 
-    #[tool(
-        description = "DEPRECATED: Use index_codebase instead, which automatically performs incremental updates. This tool is kept for backward compatibility."
-    )]
-    async fn incremental_update(
-        &self,
-        meta: Meta,
-        peer: Peer<RoleServer>,
-        Parameters(req): Parameters<IncrementalUpdateRequest>,
-    ) -> Result<String, String> {
-        tracing::warn!(
-            "incremental_update is deprecated, use index_codebase instead which auto-detects the mode"
-        );
+    // #[tool(
+    //     description = "DEPRECATED: Use index_codebase instead, which automatically performs incremental updates. This tool is kept for backward compatibility."
+    // )]
+    // async fn incremental_update(
+    //     &self,
+    //     meta: Meta,
+    //     peer: Peer<RoleServer>,
+    //     Parameters(req): Parameters<IncrementalUpdateRequest>,
+    // ) -> Result<String, String> {
+    //     tracing::warn!(
+    //         "incremental_update is deprecated, use index_codebase instead which auto-detects the mode"
+    //     );
 
-        // Get progress token if provided
-        let progress_token = meta.get_progress_token();
+    //     // Get progress token if provided
+    //     let progress_token = meta.get_progress_token();
 
-        // Convert IncrementalUpdateRequest to IndexRequest
-        let index_req = IndexRequest {
-            path: req.path,
-            project: req.project,
-            include_patterns: req.include_patterns,
-            exclude_patterns: req.exclude_patterns,
-            max_file_size: 1_048_576, // Use default
-        };
+    //     // Convert IncrementalUpdateRequest to IndexRequest
+    //     let index_req = IndexRequest {
+    //         path: req.path,
+    //         project: req.project,
+    //         include_patterns: req.include_patterns,
+    //         exclude_patterns: req.exclude_patterns,
+    //         max_file_size: 1_048_576, // Use default
+    //     };
 
-        // Call the smart index method which will detect that this is an incremental update
-        let response = self
-            .do_index_smart(
-                index_req.path,
-                index_req.project,
-                index_req.include_patterns,
-                index_req.exclude_patterns,
-                index_req.max_file_size,
-                Some(peer),
-                progress_token,
-            )
-            .await
-            .map_err(|e| format!("{:#}", e))?;
+    //     // Call the smart index method which will detect that this is an incremental update
+    //     let response = self
+    //         .do_index_smart(
+    //             index_req.path,
+    //             index_req.project,
+    //             index_req.include_patterns,
+    //             index_req.exclude_patterns,
+    //             index_req.max_file_size,
+    //             Some(peer),
+    //             progress_token,
+    //         )
+    //         .await
+    //         .map_err(|e| format!("{:#}", e))?;
 
-        // Convert IndexResponse to IncrementalUpdateResponse for backward compatibility
-        let compat_response = IncrementalUpdateResponse {
-            files_added: response.files_indexed,
-            files_updated: response.files_updated,
-            files_removed: response.files_removed,
-            chunks_modified: response.chunks_created,
-            duration_ms: response.duration_ms,
-        };
+    //     // Convert IndexResponse to IncrementalUpdateResponse for backward compatibility
+    //     let compat_response = IncrementalUpdateResponse {
+    //         files_added: response.files_indexed,
+    //         files_updated: response.files_updated,
+    //         files_removed: response.files_removed,
+    //         chunks_modified: response.chunks_created,
+    //         duration_ms: response.duration_ms,
+    //     };
 
-        serde_json::to_string_pretty(&compat_response)
-            .map_err(|e| format!("Serialization failed: {}", e))
-    }
+    //     serde_json::to_string_pretty(&compat_response)
+    //         .map_err(|e| format!("Serialization failed: {}", e))
+    // }
 
     #[tool(description = "Advanced search with filters for file type, language, and path patterns")]
     async fn search_by_filters(
@@ -1024,24 +1036,24 @@ impl RagMcpServer {
         )]
     }
 
-    #[prompt(
-        name = "update",
-        description = "DEPRECATED: Use /index instead. This command is kept for backward compatibility."
-    )]
-    async fn update_prompt(
-        &self,
-        Parameters(args): Parameters<serde_json::Value>,
-    ) -> Result<Vec<PromptMessage>, McpError> {
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    // #[prompt(
+    //     name = "update",
+    //     description = "DEPRECATED: Use /index instead. This command is kept for backward compatibility."
+    // )]
+    // async fn update_prompt(
+    //     &self,
+    //     Parameters(args): Parameters<serde_json::Value>,
+    // ) -> Result<Vec<PromptMessage>, McpError> {
+    //     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
-        Ok(vec![PromptMessage::new_text(
-            PromptMessageRole::User,
-            format!(
-                "Please index the codebase at path: {}. Note: The /update command is deprecated - use /index instead, which automatically detects whether to do a full index or incremental update.",
-                path
-            ),
-        )])
-    }
+    //     Ok(vec![PromptMessage::new_text(
+    //         PromptMessageRole::User,
+    //         format!(
+    //             "Please index the codebase at path: {}. Note: The /update command is deprecated - use /index instead, which automatically detects whether to do a full index or incremental update.",
+    //             path
+    //         ),
+    //     )])
+    // }
 
     #[prompt(
         name = "search",

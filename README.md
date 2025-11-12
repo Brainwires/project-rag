@@ -31,7 +31,6 @@ The server provides 6 slash commands for quick access in Claude Code:
 2. **`/project:query`** - Search the indexed codebase
 3. **`/project:stats`** - Get index statistics
 4. **`/project:clear`** - Clear all indexed data
-5. **`/project:update`** - *DEPRECATED:* Use `/project:index` instead
 6. **`/project:search`** - Advanced search with filters
 
 See [SLASH_COMMANDS.md](SLASH_COMMANDS.md) for detailed usage.
@@ -60,11 +59,7 @@ The server also provides 6 tools that can be used directly:
    - Deletes the entire vector database collection
    - Prepares for fresh indexing
 
-5. **incremental_update** - *DEPRECATED:* Use `index_codebase` instead
-   - Kept for backward compatibility
-   - Redirects to the smart index functionality
-
-6. **search_by_filters** - Advanced hybrid search with filters
+5. **search_by_filters** - Advanced hybrid search with filters
    - Always uses hybrid search for best results
    - Filter by file extensions (e.g., ["rs", "toml"])
    - Filter by programming languages
