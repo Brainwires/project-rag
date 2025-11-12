@@ -16,7 +16,7 @@ This MCP server enables AI assistants to efficiently search and understand large
 - **Hybrid Search**: Combines vector similarity with BM25 keyword matching using Reciprocal Rank Fusion (RRF) for optimal results
 - **AST-Based Chunking**: Uses Tree-sitter to extract semantic units (functions, classes, methods) for 12 languages
 - **Multi-Project Support**: Index and query multiple codebases simultaneously with project filtering
-- **Incremental Updates**: Only re-index changed files with persistent hash cache
+- **Smart Indexing**: Automatically performs full indexing for new codebases or incremental updates for previously indexed ones
 - **Stable Embedded Database**: LanceDB vector database (default, no external dependencies) with optional Qdrant support
 - **Language Detection**: Automatic detection of 30+ programming languages
 - **Advanced Filtering**: Search by file type, language, or path patterns
@@ -27,11 +27,10 @@ This MCP server enables AI assistants to efficiently search and understand large
 
 The server provides 6 slash commands for quick access in Claude Code:
 
-1. **`/project:index`** - Index a codebase directory
+1. **`/project:index`** - Index a codebase directory (automatically performs full or incremental)
 2. **`/project:query`** - Search the indexed codebase
 3. **`/project:stats`** - Get index statistics
 4. **`/project:clear`** - Clear all indexed data
-5. **`/project:update`** - Incremental update for changed files
 6. **`/project:search`** - Advanced search with filters
 
 See [SLASH_COMMANDS.md](SLASH_COMMANDS.md) for detailed usage.
@@ -40,10 +39,11 @@ See [SLASH_COMMANDS.md](SLASH_COMMANDS.md) for detailed usage.
 
 The server also provides 6 tools that can be used directly:
 
-1. **index_codebase** - Index a complete codebase directory
-   - Creates embeddings for all code files
+1. **index_codebase** - Smartly index a codebase directory
+   - Automatically performs full indexing for new codebases
+   - Automatically performs incremental updates for previously indexed codebases
    - Respects .gitignore and exclude patterns
-   - Tracks file hashes for incremental updates
+   - Returns mode information (full or incremental)
 
 2. **query_codebase** - Hybrid semantic + keyword search across the indexed code
    - Combines vector similarity with BM25 keyword matching (enabled by default)
@@ -59,11 +59,7 @@ The server also provides 6 tools that can be used directly:
    - Deletes the entire vector database collection
    - Prepares for fresh indexing
 
-5. **incremental_update** - Update only changed files
-   - Detects new, modified, and deleted files
-   - Only re-processes changes since last index
-
-6. **search_by_filters** - Advanced hybrid search with filters
+5. **search_by_filters** - Advanced hybrid search with filters
    - Always uses hybrid search for best results
    - Filter by file extensions (e.g., ["rs", "toml"])
    - Filter by programming languages
@@ -149,6 +145,23 @@ The server communicates over stdio following the MCP protocol:
 ./target/release/project-rag
 ```
 
+### Configuring in Claude Code
+
+Add the MCP server to Claude Code using the CLI:
+
+```bash
+# Navigate to the project directory first
+cd /path/to/project-rag
+
+# Add the MCP server to Claude Code
+claude mcp add project --command "$(pwd)/target/release/project-rag"
+
+# Or with logging enabled
+claude mcp add project --command "$(pwd)/target/release/project-rag" --env RUST_LOG=info
+```
+
+After adding, restart Claude Code to load the server. The slash commands (`/project:index`, `/project:query`, etc.) will be available immediately.
+
 ### Configuring in Claude Desktop
 
 Add to your Claude Desktop config:
@@ -169,6 +182,8 @@ Add to your Claude Desktop config:
   }
 }
 ```
+
+**Note**: Claude Code and Claude Desktop are different products with different configuration methods.
 
 ### Example Tool Usage
 
@@ -203,7 +218,7 @@ Add to your Claude Desktop config:
 }
 ```
 
-**Incremental update:**
+**Index (or re-index) a codebase:**
 ```json
 {
   "path": "/path/to/your/project",
@@ -211,6 +226,7 @@ Add to your Claude Desktop config:
   "exclude_patterns": []
 }
 ```
+*Note: This automatically performs a full index for new codebases or an incremental update for previously indexed ones.*
 
 ## Architecture
 

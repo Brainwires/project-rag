@@ -1,6 +1,6 @@
 use super::CodeChunk;
-use crate::indexer::file_walker::FileInfo;
 use crate::indexer::ast_parser::AstParser;
+use crate::indexer::file_walker::FileInfo;
 use crate::types::ChunkMetadata;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,9 +39,7 @@ impl CodeChunker {
             ChunkStrategy::SlidingWindow { size, overlap } => {
                 self.chunk_sliding_window(file_info, *size, *overlap)
             }
-            ChunkStrategy::AstBased => {
-                self.chunk_ast_based(file_info)
-            }
+            ChunkStrategy::AstBased => self.chunk_ast_based(file_info),
             ChunkStrategy::Hybrid { fallback_lines } => {
                 // Try AST-based first, fallback to fixed lines if it fails
                 let ast_chunks = self.chunk_ast_based(file_info);
@@ -257,7 +255,10 @@ mod tests {
 
     #[test]
     fn test_fixed_lines_chunking() {
-        let content = (1..=100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (1..=100)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let file_info = create_test_file_info(&content);
 
         let chunker = CodeChunker::new(ChunkStrategy::FixedLines(10));
@@ -272,7 +273,10 @@ mod tests {
 
     #[test]
     fn test_sliding_window_chunking() {
-        let content = (1..=20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (1..=20)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let file_info = create_test_file_info(&content);
 
         let chunker = CodeChunker::new(ChunkStrategy::SlidingWindow {
@@ -285,5 +289,188 @@ mod tests {
         // Chunks: [1-10], [6-15], [11-20]
         assert!(chunks.len() >= 3);
         assert_eq!(chunks[0].metadata.start_line, 1);
+    }
+
+    #[test]
+    fn test_default_strategy() {
+        let chunker = CodeChunker::default_strategy();
+        assert!(matches!(chunker.strategy, ChunkStrategy::Hybrid { .. }));
+    }
+
+    #[test]
+    fn test_default() {
+        let chunker = CodeChunker::default();
+        assert!(matches!(chunker.strategy, ChunkStrategy::Hybrid { .. }));
+    }
+
+    #[test]
+    fn test_empty_file() {
+        let file_info = create_test_file_info("");
+        let chunker = CodeChunker::new(ChunkStrategy::FixedLines(10));
+        let chunks = chunker.chunk_file(&file_info);
+        assert_eq!(chunks.len(), 0);
+    }
+
+    #[test]
+    fn test_whitespace_only_file() {
+        let file_info = create_test_file_info("   \n\t\n   ");
+        let chunker = CodeChunker::new(ChunkStrategy::FixedLines(10));
+        let chunks = chunker.chunk_file(&file_info);
+        assert_eq!(chunks.len(), 0);
+    }
+
+    #[test]
+    fn test_single_line_file() {
+        let file_info = create_test_file_info("fn main() {}");
+        let chunker = CodeChunker::new(ChunkStrategy::FixedLines(10));
+        let chunks = chunker.chunk_file(&file_info);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].metadata.start_line, 1);
+        assert_eq!(chunks[0].metadata.end_line, 1);
+    }
+
+    #[test]
+    fn test_sliding_window_overlap_equal_size() {
+        let content = (1..=20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let file_info = create_test_file_info(&content);
+
+        let chunker = CodeChunker::new(ChunkStrategy::SlidingWindow {
+            size: 10,
+            overlap: 10,
+        });
+        let chunks = chunker.chunk_file(&file_info);
+        // When overlap equals size, step should be 1
+        assert!(chunks.len() > 10);
+    }
+
+    #[test]
+    fn test_sliding_window_overlap_greater_than_size() {
+        let content = (1..=20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let file_info = create_test_file_info(&content);
+
+        let chunker = CodeChunker::new(ChunkStrategy::SlidingWindow {
+            size: 10,
+            overlap: 15,
+        });
+        let chunks = chunker.chunk_file(&file_info);
+        // When overlap > size, step should be 1
+        assert!(chunks.len() > 10);
+    }
+
+    #[test]
+    fn test_ast_based_rust() {
+        let content = r#"
+fn hello() {
+    println!("Hello");
+}
+
+fn world() {
+    println!("World");
+}
+"#;
+        let file_info = create_test_file_info(content);
+        let chunker = CodeChunker::new(ChunkStrategy::AstBased);
+        let chunks = chunker.chunk_file(&file_info);
+        // Should extract two functions
+        assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn test_ast_based_no_extension() {
+        let mut file_info = create_test_file_info("fn main() {}");
+        file_info.extension = None;
+        let chunker = CodeChunker::new(ChunkStrategy::AstBased);
+        let chunks = chunker.chunk_file(&file_info);
+        assert_eq!(chunks.len(), 0);
+    }
+
+    #[test]
+    fn test_ast_based_unsupported_language() {
+        let mut file_info = create_test_file_info("some content");
+        file_info.extension = Some("txt".to_string());
+        let chunker = CodeChunker::new(ChunkStrategy::AstBased);
+        let chunks = chunker.chunk_file(&file_info);
+        assert_eq!(chunks.len(), 0);
+    }
+
+    #[test]
+    fn test_hybrid_with_ast_success() {
+        let content = r#"
+fn hello() {
+    println!("Hello");
+}
+"#;
+        let file_info = create_test_file_info(content);
+        let chunker = CodeChunker::new(ChunkStrategy::Hybrid { fallback_lines: 50 });
+        let chunks = chunker.chunk_file(&file_info);
+        // Should use AST parsing
+        assert!(chunks.len() >= 1);
+    }
+
+    #[test]
+    fn test_hybrid_fallback_to_fixed() {
+        let mut file_info = create_test_file_info("line 1\nline 2\nline 3");
+        file_info.extension = Some("txt".to_string());
+        let chunker = CodeChunker::new(ChunkStrategy::Hybrid { fallback_lines: 2 });
+        let chunks = chunker.chunk_file(&file_info);
+        // Should fallback to fixed lines since .txt is not supported by AST
+        assert!(chunks.len() >= 1);
+    }
+
+    #[test]
+    fn test_metadata_fields() {
+        let mut file_info = create_test_file_info("fn main() {}");
+        file_info.project = Some("test-project".to_string());
+        file_info.hash = "abc123".to_string();
+
+        let chunker = CodeChunker::new(ChunkStrategy::FixedLines(10));
+        let chunks = chunker.chunk_file(&file_info);
+
+        assert_eq!(chunks.len(), 1);
+        let chunk = &chunks[0];
+        assert_eq!(chunk.metadata.file_path, "test.rs");
+        assert_eq!(chunk.metadata.project, Some("test-project".to_string()));
+        assert_eq!(chunk.metadata.language, Some("Rust".to_string()));
+        assert_eq!(chunk.metadata.extension, Some("rs".to_string()));
+        assert_eq!(chunk.metadata.file_hash, "abc123");
+        assert!(chunk.metadata.indexed_at > 0);
+    }
+
+    #[test]
+    fn test_sliding_window_empty_chunks_skipped() {
+        let content = "line 1\n\n\n\nline 5";
+        let file_info = create_test_file_info(content);
+        let chunker = CodeChunker::new(ChunkStrategy::SlidingWindow {
+            size: 2,
+            overlap: 0,
+        });
+        let chunks = chunker.chunk_file(&file_info);
+        // Should skip chunks with only whitespace
+        assert!(chunks.len() >= 1);
+        for chunk in chunks {
+            assert!(!chunk.content.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_fixed_lines_empty_chunks_skipped() {
+        let content = "line 1\n\n\nline 4";
+        let file_info = create_test_file_info(content);
+        let chunker = CodeChunker::new(ChunkStrategy::FixedLines(2));
+        let chunks = chunker.chunk_file(&file_info);
+        // Should have chunks but skip empty ones
+        for chunk in chunks {
+            assert!(!chunk.content.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_ast_based_invalid_syntax() {
+        let content = "fn incomplete {"; // Invalid Rust
+        let file_info = create_test_file_info(content);
+        let chunker = CodeChunker::new(ChunkStrategy::AstBased);
+        let chunks = chunker.chunk_file(&file_info);
+        // Should handle parse errors gracefully
+        assert_eq!(chunks.len(), 0);
     }
 }

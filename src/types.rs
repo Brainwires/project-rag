@@ -24,9 +24,21 @@ fn default_max_file_size() -> usize {
     1_048_576 // 1MB
 }
 
+/// Indexing mode used
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexingMode {
+    /// Full indexing (all files)
+    Full,
+    /// Incremental update (only changed files)
+    Incremental,
+}
+
 /// Response from indexing operation
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IndexResponse {
+    /// Indexing mode used (full or incremental)
+    pub mode: IndexingMode,
     /// Number of files successfully indexed
     pub files_indexed: usize,
     /// Number of code chunks created
@@ -38,6 +50,12 @@ pub struct IndexResponse {
     /// Any errors encountered (non-fatal)
     #[serde(default)]
     pub errors: Vec<String>,
+    /// Number of files updated (incremental mode only)
+    #[serde(default)]
+    pub files_updated: usize,
+    /// Number of files removed (incremental mode only)
+    #[serde(default)]
+    pub files_removed: usize,
 }
 
 /// Request to query the codebase
@@ -242,6 +260,44 @@ mod tests {
         assert_eq!(req.max_file_size, 1_048_576);
         assert!(req.include_patterns.is_empty());
         assert!(req.exclude_patterns.is_empty());
+    }
+
+    #[test]
+    fn test_index_response_full_mode() {
+        let response = IndexResponse {
+            mode: IndexingMode::Full,
+            files_indexed: 100,
+            chunks_created: 500,
+            embeddings_generated: 500,
+            duration_ms: 1000,
+            errors: vec![],
+            files_updated: 0,
+            files_removed: 0,
+        };
+
+        assert!(matches!(response.mode, IndexingMode::Full));
+        assert_eq!(response.files_indexed, 100);
+        assert_eq!(response.files_updated, 0);
+        assert_eq!(response.files_removed, 0);
+    }
+
+    #[test]
+    fn test_index_response_incremental_mode() {
+        let response = IndexResponse {
+            mode: IndexingMode::Incremental,
+            files_indexed: 10,
+            chunks_created: 50,
+            embeddings_generated: 50,
+            duration_ms: 500,
+            errors: vec![],
+            files_updated: 5,
+            files_removed: 2,
+        };
+
+        assert!(matches!(response.mode, IndexingMode::Incremental));
+        assert_eq!(response.files_indexed, 10);
+        assert_eq!(response.files_updated, 5);
+        assert_eq!(response.files_removed, 2);
     }
 
     #[test]

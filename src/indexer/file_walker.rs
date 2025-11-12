@@ -103,7 +103,11 @@ impl FileWalker {
             let content = match fs::read_to_string(path) {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::debug!("Skipping file that can't be read as UTF-8: {:?}: {}", path, e);
+                    tracing::debug!(
+                        "Skipping file that can't be read as UTF-8: {:?}: {}",
+                        path,
+                        e
+                    );
                     continue;
                 }
             };
