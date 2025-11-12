@@ -90,11 +90,6 @@ No additional setup needed! USearch is an embedded HNSW vector database that run
 - **Hybrid search built-in** - Tantivy BM25 + USearch vector with Reciprocal Rank Fusion
 - Excellent memory efficiency with fast query performance (20-30ms)
 
-**Performance Comparison:**
-- USearch (HNSW): ~20-40 seconds for 100k chunks
-- Qdrant (HNSW): ~100 seconds for 100k chunks
-- LanceDB (IVF_PQ): ~200 seconds for 100k chunks (2x slower than Qdrant)
-
 **LanceDB (Optional - More Features)**
 
 To use LanceDB instead of USearch, build with the `lancedb-backend` feature:

@@ -1,3 +1,4 @@
+use crate::bm25_search::BM25Search;
 use crate::types::{ChunkMetadata, SearchResult};
 use crate::vector_db::{DatabaseStats, VectorDatabase};
 use anyhow::{Context, Result};
@@ -11,13 +12,16 @@ use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::Table;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// LanceDB vector database implementation (embedded, no server required)
+/// Now includes BM25 hybrid search support using Tantivy
 pub struct LanceVectorDB {
     connection: Connection,
     table_name: String,
     db_path: String,
+    /// BM25 search index for keyword matching
+    bm25_index: Arc<RwLock<Option<BM25Search>>>,
 }
 
 impl LanceVectorDB {
@@ -36,10 +40,16 @@ impl LanceVectorDB {
             .await
             .context("Failed to connect to LanceDB")?;
 
+        // Initialize BM25 index
+        let bm25_path = format!("{}/lancedb_bm25", db_path);
+        let bm25_index = BM25Search::new(&bm25_path)
+            .context("Failed to initialize BM25 index")?;
+
         Ok(Self {
             connection,
             table_name: "code_embeddings".to_string(),
             db_path: db_path.to_string(),
+            bm25_index: Arc::new(RwLock::new(Some(bm25_index))),
         })
     }
 
@@ -191,6 +201,7 @@ impl LanceVectorDB {
     }
 }
 
+#[async_trait::async_trait]
 impl VectorDatabase for LanceVectorDB {
     async fn initialize(&self, dimension: usize) -> Result<()> {
         tracing::info!(
@@ -247,10 +258,20 @@ impl VectorDatabase for LanceVectorDB {
         let dimension = embeddings[0].len();
         let schema = Self::create_schema(dimension);
 
-        let batch = Self::create_record_batch(embeddings, metadata, contents, schema.clone())?;
-        let count = batch.num_rows();
-
+        // Get current row count to use as starting ID for BM25
         let table = self.get_table().await?;
+        let current_count = table
+            .count_rows(None)
+            .await
+            .unwrap_or(0) as u64;
+
+        let batch = Self::create_record_batch(
+            embeddings,
+            metadata.clone(),
+            contents.clone(),
+            schema.clone()
+        )?;
+        let count = batch.num_rows();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
 
@@ -260,269 +281,315 @@ impl VectorDatabase for LanceVectorDB {
             .await
             .context("Failed to add records to table")?;
 
-        tracing::info!("Stored {} embeddings", count);
+        // Add documents to BM25 index
+        let bm25_docs: Vec<_> = (0..count)
+            .map(|i| {
+                let id = current_count + i as u64;
+                (id, contents[i].clone())
+            })
+            .collect();
+
+        let bm25_lock = self.bm25_index.read()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
+        if let Some(bm25) = bm25_lock.as_ref() {
+            bm25.add_documents(bm25_docs)
+                .context("Failed to add documents to BM25 index")?;
+        }
+        drop(bm25_lock);
+
+        tracing::info!("Stored {} embeddings with BM25 indexing", count);
         Ok(count)
     }
 
     async fn search(
         &self,
         query_vector: Vec<f32>,
-        _query_text: &str,
+        query_text: &str,
         limit: usize,
         min_score: f32,
         project: Option<String>,
-        _hybrid: bool,
+        hybrid: bool,
     ) -> Result<Vec<SearchResult>> {
         let table = self.get_table().await?;
 
-        let query = table
-            .vector_search(query_vector)
-            .context("Failed to create vector search")?
-            .limit(limit);
+        if hybrid {
+            // Hybrid search: combine vector and BM25 results with RRF
+            // Get more results from each source for RRF to combine
+            let search_limit = limit * 3;
 
-        // Add project filter if specified and execute
-        let stream = if let Some(ref project_name) = project {
-            query.only_if(format!("project = '{}'", project_name)).execute().await.context("Failed to execute search")?
-        } else {
-            query.execute().await.context("Failed to execute search")?
-        };
+            // Vector search
+            let query = table
+                .vector_search(query_vector)
+                .context("Failed to create vector search")?
+                .limit(search_limit);
 
-        let results: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .context("Failed to collect search results")?;
+            let stream = if let Some(ref project_name) = project {
+                query.only_if(format!("project = '{}'", project_name)).execute().await.context("Failed to execute search")?
+            } else {
+                query.execute().await.context("Failed to execute search")?
+            };
 
-        let mut search_results = Vec::new();
+            let results: Vec<RecordBatch> = stream
+                .try_collect()
+                .await
+                .context("Failed to collect search results")?;
 
-        for batch in results {
-            let file_path_array = batch
-                .column_by_name("file_path")
-                .context("Missing file_path column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("Invalid file_path type")?;
+            // Build vector results with row-based IDs
+            let mut vector_results = Vec::new();
+            let mut row_offset = 0u64;
 
-            let start_line_array = batch
-                .column_by_name("start_line")
-                .context("Missing start_line column")?
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .context("Invalid start_line type")?;
+            for batch in &results {
+                let distance_array = batch
+                    .column_by_name("_distance")
+                    .context("Missing _distance column")?
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .context("Invalid _distance type")?;
 
-            let end_line_array = batch
-                .column_by_name("end_line")
-                .context("Missing end_line column")?
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .context("Invalid end_line type")?;
+                for i in 0..batch.num_rows() {
+                    let distance = distance_array.value(i);
+                    let score = 1.0 / (1.0 + distance);
+                    let id = row_offset + i as u64;
+                    vector_results.push((id, score));
+                }
+                row_offset += batch.num_rows() as u64;
+            }
 
-            let language_array = batch
-                .column_by_name("language")
-                .context("Missing language column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("Invalid language type")?;
+            // BM25 keyword search
+            let bm25_lock = self.bm25_index.read()
+                .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
+            let bm25_results = if let Some(bm25) = bm25_lock.as_ref() {
+                bm25.search(query_text, search_limit)
+                    .context("Failed to search BM25 index")?
+            } else {
+                Vec::new()
+            };
+            drop(bm25_lock);
 
-            let content_array = batch
-                .column_by_name("content")
-                .context("Missing content column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("Invalid content type")?;
+            // Combine results with Reciprocal Rank Fusion
+            let combined = crate::bm25_search::reciprocal_rank_fusion(
+                vector_results,
+                bm25_results,
+                limit,
+            );
 
-            let project_array = batch
-                .column_by_name("project")
-                .context("Missing project column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("Invalid project type")?;
+            // Build final results by looking up the combined IDs in the vector results
+            let mut search_results = Vec::new();
 
-            // LanceDB returns distance, we need to convert to similarity score
-            let distance_array = batch
-                .column_by_name("_distance")
-                .context("Missing _distance column")?
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .context("Invalid _distance type")?;
+            for (id, combined_score) in combined {
+                // Find this result in the original batch results
+                let mut found = false;
+                let mut batch_offset = 0u64;
 
-            for i in 0..batch.num_rows() {
-                let distance = distance_array.value(i);
-                // Convert L2 distance to similarity score (0-1 range)
-                let score = 1.0 / (1.0 + distance);
+                for batch in &results {
+                    if id >= batch_offset && id < batch_offset + batch.num_rows() as u64 {
+                        let idx = (id - batch_offset) as usize;
 
-                if score >= min_score {
-                    search_results.push(SearchResult {
-                        score,
-                        vector_score: score,
-                        keyword_score: None,
-                        file_path: file_path_array.value(i).to_string(),
-                        start_line: start_line_array.value(i) as usize,
-                        end_line: end_line_array.value(i) as usize,
-                        language: language_array.value(i).to_string(),
-                        content: content_array.value(i).to_string(),
-                        project: if project_array.is_null(i) {
-                            None
-                        } else {
-                            Some(project_array.value(i).to_string())
-                        },
-                    });
+                        let file_path_array = batch.column_by_name("file_path")
+                            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                        let start_line_array = batch.column_by_name("start_line")
+                            .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+                        let end_line_array = batch.column_by_name("end_line")
+                            .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+                        let language_array = batch.column_by_name("language")
+                            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                        let content_array = batch.column_by_name("content")
+                            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                        let project_array = batch.column_by_name("project")
+                            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+                        if let (Some(fp), Some(sl), Some(el), Some(lang), Some(cont), Some(proj)) =
+                            (file_path_array, start_line_array, end_line_array, language_array, content_array, project_array)
+                        {
+                            if combined_score >= min_score {
+                                search_results.push(SearchResult {
+                                    score: combined_score,
+                                    vector_score: combined_score,
+                                    keyword_score: Some(combined_score),
+                                    file_path: fp.value(idx).to_string(),
+                                    start_line: sl.value(idx) as usize,
+                                    end_line: el.value(idx) as usize,
+                                    language: lang.value(idx).to_string(),
+                                    content: cont.value(idx).to_string(),
+                                    project: if proj.is_null(idx) {
+                                        None
+                                    } else {
+                                        Some(proj.value(idx).to_string())
+                                    },
+                                });
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                    batch_offset += batch.num_rows() as u64;
+                }
+
+                if !found {
+                    tracing::warn!("Could not find result for RRF ID {}", id);
                 }
             }
-        }
 
-        Ok(search_results)
+            Ok(search_results)
+        } else {
+            // Pure vector search
+            let query = table
+                .vector_search(query_vector)
+                .context("Failed to create vector search")?
+                .limit(limit);
+
+            let stream = if let Some(ref project_name) = project {
+                query.only_if(format!("project = '{}'", project_name)).execute().await.context("Failed to execute search")?
+            } else {
+                query.execute().await.context("Failed to execute search")?
+            };
+
+            let results: Vec<RecordBatch> = stream
+                .try_collect()
+                .await
+                .context("Failed to collect search results")?;
+
+            let mut search_results = Vec::new();
+
+            for batch in results {
+                let file_path_array = batch
+                    .column_by_name("file_path")
+                    .context("Missing file_path column")?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("Invalid file_path type")?;
+
+                let start_line_array = batch
+                    .column_by_name("start_line")
+                    .context("Missing start_line column")?
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .context("Invalid start_line type")?;
+
+                let end_line_array = batch
+                    .column_by_name("end_line")
+                    .context("Missing end_line column")?
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .context("Invalid end_line type")?;
+
+                let language_array = batch
+                    .column_by_name("language")
+                    .context("Missing language column")?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("Invalid language type")?;
+
+                let content_array = batch
+                    .column_by_name("content")
+                    .context("Missing content column")?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("Invalid content type")?;
+
+                let project_array = batch
+                    .column_by_name("project")
+                    .context("Missing project column")?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("Invalid project type")?;
+
+                let distance_array = batch
+                    .column_by_name("_distance")
+                    .context("Missing _distance column")?
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .context("Invalid _distance type")?;
+
+                for i in 0..batch.num_rows() {
+                    let distance = distance_array.value(i);
+                    let score = 1.0 / (1.0 + distance);
+
+                    if score >= min_score {
+                        search_results.push(SearchResult {
+                            score,
+                            vector_score: score,
+                            keyword_score: None,
+                            file_path: file_path_array.value(i).to_string(),
+                            start_line: start_line_array.value(i) as usize,
+                            end_line: end_line_array.value(i) as usize,
+                            language: language_array.value(i).to_string(),
+                            content: content_array.value(i).to_string(),
+                            project: if project_array.is_null(i) {
+                                None
+                            } else {
+                                Some(project_array.value(i).to_string())
+                            },
+                        });
+                    }
+                }
+            }
+
+            Ok(search_results)
+        }
     }
 
     async fn search_filtered(
         &self,
         query_vector: Vec<f32>,
-        _query_text: &str,
+        query_text: &str,
         limit: usize,
         min_score: f32,
         project: Option<String>,
-        _hybrid: bool,
+        hybrid: bool,
         file_extensions: Vec<String>,
         languages: Vec<String>,
         path_patterns: Vec<String>,
     ) -> Result<Vec<SearchResult>> {
-        let table = self.get_table().await?;
+        // Get more results than requested to account for filtering
+        let search_limit = limit * 3;
 
-        let query = table
-            .vector_search(query_vector)
-            .context("Failed to create vector search")?
-            .limit(limit * 2); // Get more results for filtering
+        // Do basic search with hybrid support
+        let mut results = self.search(
+            query_vector,
+            query_text,
+            search_limit,
+            min_score,
+            project,
+            hybrid,
+        ).await?;
 
-        // Build filter expression
-        let mut filters = Vec::new();
-
-        if let Some(ref project_name) = project {
-            filters.push(format!("project = '{}'", project_name));
-        }
-
-        if !file_extensions.is_empty() {
-            let ext_filters: Vec<String> = file_extensions
-                .iter()
-                .map(|ext| format!("extension = '{}'", ext))
-                .collect();
-            filters.push(format!("({})", ext_filters.join(" OR ")));
-        }
-
-        if !languages.is_empty() {
-            let lang_filters: Vec<String> = languages
-                .iter()
-                .map(|lang| format!("language = '{}'", lang))
-                .collect();
-            filters.push(format!("({})", lang_filters.join(" OR ")));
-        }
-
-        // Execute with or without filters
-        let stream = if !filters.is_empty() {
-            query.only_if(filters.join(" AND ")).execute().await.context("Failed to execute filtered search")?
-        } else {
-            query.execute().await.context("Failed to execute filtered search")?
-        };
-
-        let results: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .context("Failed to collect filtered results")?;
-
-        let mut search_results = Vec::new();
-
-        for batch in results {
-            let file_path_array = batch
-                .column_by_name("file_path")
-                .context("Missing file_path column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("Invalid file_path type")?;
-
-            let start_line_array = batch
-                .column_by_name("start_line")
-                .context("Missing start_line column")?
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .context("Invalid start_line type")?;
-
-            let end_line_array = batch
-                .column_by_name("end_line")
-                .context("Missing end_line column")?
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .context("Invalid end_line type")?;
-
-            let language_array = batch
-                .column_by_name("language")
-                .context("Missing language column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("Invalid language type")?;
-
-            let content_array = batch
-                .column_by_name("content")
-                .context("Missing content column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("Invalid content type")?;
-
-            let project_array = batch
-                .column_by_name("project")
-                .context("Missing project column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("Invalid project type")?;
-
-            let distance_array = batch
-                .column_by_name("_distance")
-                .context("Missing _distance column")?
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .context("Invalid _distance type")?;
-
-            for i in 0..batch.num_rows() {
-                let file_path = file_path_array.value(i).to_string();
-
-                // Apply path pattern filter (post-processing)
-                if !path_patterns.is_empty() {
-                    if !path_patterns
-                        .iter()
-                        .any(|pattern| file_path.contains(pattern))
-                    {
-                        continue;
-                    }
-                }
-
-                let distance = distance_array.value(i);
-                let score = 1.0 / (1.0 + distance);
-
-                if score >= min_score {
-                    search_results.push(SearchResult {
-                        score,
-                        vector_score: score,
-                        keyword_score: None,
-                        file_path,
-                        start_line: start_line_array.value(i) as usize,
-                        end_line: end_line_array.value(i) as usize,
-                        language: language_array.value(i).to_string(),
-                        content: content_array.value(i).to_string(),
-                        project: if project_array.is_null(i) {
-                            None
-                        } else {
-                            Some(project_array.value(i).to_string())
-                        },
-                    });
-                }
-
-                if search_results.len() >= limit {
-                    break;
+        // Post-process filtering
+        results.retain(|result| {
+            // Filter by file extension
+            if !file_extensions.is_empty() {
+                let has_extension = file_extensions.iter().any(|ext| {
+                    result.file_path.ends_with(&format!(".{}", ext))
+                });
+                if !has_extension {
+                    return false;
                 }
             }
-        }
 
-        // Truncate to limit
-        search_results.truncate(limit);
+            // Filter by language
+            if !languages.is_empty() {
+                if !languages.contains(&result.language) {
+                    return false;
+                }
+            }
 
-        Ok(search_results)
+            // Filter by path pattern
+            if !path_patterns.is_empty() {
+                let matches_pattern = path_patterns.iter().any(|pattern| {
+                    result.file_path.contains(pattern)
+                });
+                if !matches_pattern {
+                    return false;
+                }
+            }
+
+            true
+        });
+
+        // Truncate to requested limit
+        results.truncate(limit);
+
+        Ok(results)
     }
 
     async fn delete_by_file(&self, file_path: &str) -> Result<usize> {
@@ -535,6 +602,11 @@ impl VectorDatabase for LanceVectorDB {
             .delete(&filter)
             .await
             .context("Failed to delete records")?;
+
+        // Note: BM25 index entries are not deleted here to avoid maintaining
+        // a file_path -> BM25 ID mapping. Stale BM25 entries will be filtered
+        // out by the vector search results and cleaned up on next full index.
+        // In production, consider maintaining an ID mapping for precise deletion.
 
         tracing::info!("Deleted embeddings for file: {}", file_path);
 
@@ -549,7 +621,15 @@ impl VectorDatabase for LanceVectorDB {
             .await
             .context("Failed to drop table")?;
 
-        tracing::info!("Cleared all embeddings");
+        // Clear BM25 index
+        let bm25_lock = self.bm25_index.read()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
+        if let Some(bm25) = bm25_lock.as_ref() {
+            bm25.clear().context("Failed to clear BM25 index")?;
+        }
+        drop(bm25_lock);
+
+        tracing::info!("Cleared all embeddings and BM25 index");
         Ok(())
     }
 

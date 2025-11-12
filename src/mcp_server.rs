@@ -66,7 +66,7 @@ impl RagMcpServer {
         let vector_db = {
             tracing::info!("Using LanceDB vector database backend");
             Arc::new(
-                LanceVectorDB::new("./.lancedb_data", "code_embeddings")
+                LanceVectorDB::with_path("./.lancedb_data")
                     .await
                     .context("Failed to initialize LanceDB vector database")?,
             )
