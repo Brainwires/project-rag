@@ -101,6 +101,12 @@ pub struct QueryResponse {
     pub results: Vec<SearchResult>,
     /// Time taken in milliseconds
     pub duration_ms: u64,
+    /// The actual threshold used (may be lower than requested if adaptive search kicked in)
+    #[serde(default)]
+    pub threshold_used: f32,
+    /// Whether the threshold was automatically lowered to find results
+    #[serde(default)]
+    pub threshold_lowered: bool,
 }
 
 /// Request to get statistics about the index

@@ -338,6 +338,9 @@ impl VectorDatabase for LanceVectorDB {
             let mut vector_results = Vec::new();
             let mut row_offset = 0u64;
 
+            // Store original scores for later reporting
+            let mut original_scores: HashMap<u64, (f32, Option<f32>)> = HashMap::new();
+
             for batch in &results {
                 let distance_array = batch
                     .column_by_name("_distance")
@@ -350,7 +353,12 @@ impl VectorDatabase for LanceVectorDB {
                     let distance = distance_array.value(i);
                     let score = 1.0 / (1.0 + distance);
                     let id = row_offset + i as u64;
+
+                    // For hybrid search, don't filter by min_score before RRF
+                    // RRF will combine weak vector + strong keyword (or vice versa)
+                    // Filtering happens after RRF based on the combined ranking
                     vector_results.push((id, score));
+                    original_scores.insert(id, (score, None));
                 }
                 row_offset += batch.num_rows() as u64;
             }
@@ -359,14 +367,25 @@ impl VectorDatabase for LanceVectorDB {
             let bm25_lock = self.bm25_index.read()
                 .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
             let bm25_results = if let Some(bm25) = bm25_lock.as_ref() {
-                bm25.search(query_text, search_limit)
-                    .context("Failed to search BM25 index")?
+                let all_bm25_results = bm25.search(query_text, search_limit)
+                    .context("Failed to search BM25 index")?;
+
+                // Store BM25 scores (don't filter - let RRF combine them)
+                // BM25 scores are not normalized to 0-1 range, so min_score doesn't apply
+                for result in &all_bm25_results {
+                    original_scores.entry(result.id)
+                        .and_modify(|e| e.1 = Some(result.score))
+                        .or_insert((0.0, Some(result.score)));  // No vector score, only keyword
+                }
+
+                all_bm25_results
             } else {
                 Vec::new()
             };
             drop(bm25_lock);
 
             // Combine results with Reciprocal Rank Fusion
+            // RRF produces scores ~0.01-0.03, so don't apply min_score to combined scores
             let combined = crate::bm25_search::reciprocal_rank_fusion(
                 vector_results,
                 bm25_results,
@@ -401,11 +420,24 @@ impl VectorDatabase for LanceVectorDB {
                         if let (Some(fp), Some(sl), Some(el), Some(lang), Some(cont), Some(proj)) =
                             (file_path_array, start_line_array, end_line_array, language_array, content_array, project_array)
                         {
-                            if combined_score >= min_score {
+                            // Look up original scores for filtering and reporting
+                            let (vector_score, keyword_score) = original_scores.get(&id)
+                                .copied()
+                                .unwrap_or((0.0, None));
+
+                            // For hybrid search, apply min_score intelligently:
+                            // Accept if EITHER vector or keyword score meets threshold
+                            // This allows pure keyword matches (weak vector) and pure semantic matches (weak keyword)
+                            let passes_filter = vector_score >= min_score
+                                || keyword_score.map_or(false, |k| k >= min_score);
+
+                            if passes_filter {
+                                // Use RRF combined score as the main score for ranking
+                                // But report original vector/keyword scores for transparency
                                 search_results.push(SearchResult {
-                                    score: combined_score,
-                                    vector_score: combined_score,
-                                    keyword_score: Some(combined_score),
+                                    score: combined_score,  // RRF score for ranking
+                                    vector_score,           // Original vector score
+                                    keyword_score,          // Original BM25 score
                                     file_path: fp.value(idx).to_string(),
                                     start_line: sl.value(idx) as usize,
                                     end_line: el.value(idx) as usize,

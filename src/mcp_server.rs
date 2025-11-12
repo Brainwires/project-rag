@@ -66,7 +66,7 @@ impl RagMcpServer {
         let vector_db = {
             tracing::info!("Using LanceDB vector database backend");
             Arc::new(
-                LanceVectorDB::with_path("./.lancedb_data")
+                LanceVectorDB::new()
                     .await
                     .context("Failed to initialize LanceDB vector database")?,
             )
@@ -337,16 +337,71 @@ impl RagMcpServer {
             .next()
             .ok_or("No embedding generated")?;
 
-        // Search vector database
-        let results = self
+        // Adaptive search: try with requested threshold, then progressively lower if no results
+        let original_threshold = req.min_score;
+        let mut threshold_used = original_threshold;
+        let mut threshold_lowered = false;
+
+        // Try original threshold first
+        let mut results = self
             .vector_db
-            .search(query_embedding, &req.query, req.limit, req.min_score, req.project, req.hybrid)
+            .search(
+                query_embedding.clone(),
+                &req.query,
+                req.limit,
+                threshold_used,
+                req.project.clone(),
+                req.hybrid
+            )
             .await
             .map_err(|e| format!("Failed to search: {}", e))?;
+
+        // If no results and threshold is high, try progressively lower thresholds
+        if results.is_empty() && original_threshold > 0.3 {
+            let fallback_thresholds = [0.6, 0.5, 0.4, 0.3];
+
+            for &threshold in &fallback_thresholds {
+                if threshold >= original_threshold {
+                    continue; // Skip thresholds that are higher than or equal to what we already tried
+                }
+
+                tracing::info!(
+                    "No results with threshold {}, trying {}",
+                    threshold_used,
+                    threshold
+                );
+
+                results = self
+                    .vector_db
+                    .search(
+                        query_embedding.clone(),
+                        &req.query,
+                        req.limit,
+                        threshold,
+                        req.project.clone(),
+                        req.hybrid
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to search: {}", e))?;
+
+                if !results.is_empty() {
+                    threshold_used = threshold;
+                    threshold_lowered = true;
+                    tracing::info!(
+                        "Found {} results with lowered threshold {}",
+                        results.len(),
+                        threshold
+                    );
+                    break;
+                }
+            }
+        }
 
         let response = QueryResponse {
             results,
             duration_ms: start.elapsed().as_millis() as u64,
+            threshold_used,
+            threshold_lowered,
         };
 
         serde_json::to_string_pretty(&response)
@@ -568,26 +623,77 @@ impl RagMcpServer {
             .next()
             .ok_or("No embedding generated")?;
 
-        // Search with filters
-        let results = self
+        // Adaptive search: try with requested threshold, then progressively lower if no results
+        let original_threshold = req.min_score;
+        let mut threshold_used = original_threshold;
+        let mut threshold_lowered = false;
+
+        // Try original threshold first
+        let mut results = self
             .vector_db
             .search_filtered(
-                query_embedding,
+                query_embedding.clone(),
                 &req.query,
                 req.limit,
-                req.min_score,
-                req.project,
+                threshold_used,
+                req.project.clone(),
                 true, // Always use hybrid for advanced search
-                req.file_extensions,
-                req.languages,
-                req.path_patterns,
+                req.file_extensions.clone(),
+                req.languages.clone(),
+                req.path_patterns.clone(),
             )
             .await
             .map_err(|e| format!("Failed to search: {}", e))?;
 
+        // If no results and threshold is high, try progressively lower thresholds
+        if results.is_empty() && original_threshold > 0.3 {
+            let fallback_thresholds = [0.6, 0.5, 0.4, 0.3];
+
+            for &threshold in &fallback_thresholds {
+                if threshold >= original_threshold {
+                    continue;
+                }
+
+                tracing::info!(
+                    "No filtered results with threshold {}, trying {}",
+                    threshold_used,
+                    threshold
+                );
+
+                results = self
+                    .vector_db
+                    .search_filtered(
+                        query_embedding.clone(),
+                        &req.query,
+                        req.limit,
+                        threshold,
+                        req.project.clone(),
+                        true,
+                        req.file_extensions.clone(),
+                        req.languages.clone(),
+                        req.path_patterns.clone(),
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to search: {}", e))?;
+
+                if !results.is_empty() {
+                    threshold_used = threshold;
+                    threshold_lowered = true;
+                    tracing::info!(
+                        "Found {} filtered results with lowered threshold {}",
+                        results.len(),
+                        threshold
+                    );
+                    break;
+                }
+            }
+        }
+
         let response = QueryResponse {
             results,
             duration_ms: start.elapsed().as_millis() as u64,
+            threshold_used,
+            threshold_lowered,
         };
 
         serde_json::to_string_pretty(&response)
