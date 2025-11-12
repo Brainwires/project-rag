@@ -31,8 +31,8 @@ impl FastEmbedManager {
         options.model_name = model;
         options.show_download_progress = true;
 
-        let embedding_model = TextEmbedding::try_new(options)
-            .context("Failed to initialize FastEmbed model")?;
+        let embedding_model =
+            TextEmbedding::try_new(options).context("Failed to initialize FastEmbed model")?;
 
         Ok(Self {
             model: embedding_model,
@@ -53,8 +53,8 @@ impl EmbeddingProvider for FastEmbedManager {
         // by using unsafe to get a mutable reference. This is safe because TextEmbedding
         // is Send + Sync and the method is internally synchronized.
         let model_ptr = &self.model as *const TextEmbedding as *mut TextEmbedding;
-        let embeddings = unsafe { (*model_ptr).embed(texts, None) }
-            .context("Failed to generate embeddings")?;
+        let embeddings =
+            unsafe { (*model_ptr).embed(texts, None) }.context("Failed to generate embeddings")?;
 
         Ok(embeddings)
     }

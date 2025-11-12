@@ -3,14 +3,14 @@ use crate::types::{ChunkMetadata, SearchResult};
 use crate::vector_db::{DatabaseStats, VectorDatabase};
 use anyhow::{Context, Result};
 use arrow_array::{
-    types::Float32Type, Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
-    StringArray, UInt32Array,
+    Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
+    UInt32Array, types::Float32Type,
 };
 use arrow_schema::{DataType, Field, Schema};
 use futures::stream::TryStreamExt;
+use lancedb::Table;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::Table;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -42,8 +42,7 @@ impl LanceVectorDB {
 
         // Initialize BM25 index
         let bm25_path = format!("{}/lancedb_bm25", db_path);
-        let bm25_index = BM25Search::new(&bm25_path)
-            .context("Failed to initialize BM25 index")?;
+        let bm25_index = BM25Search::new(&bm25_path).context("Failed to initialize BM25 index")?;
 
         Ok(Self {
             connection,
@@ -120,7 +119,9 @@ impl LanceVectorDB {
 
         // Create FixedSizeListArray for vectors
         let vector_array = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            embeddings.into_iter().map(|v| Some(v.into_iter().map(Some))),
+            embeddings
+                .into_iter()
+                .map(|v| Some(v.into_iter().map(Some))),
             dimension as i32,
         );
 
@@ -230,10 +231,8 @@ impl VectorDatabase for LanceVectorDB {
         let empty_batch = RecordBatch::new_empty(schema.clone());
 
         // Need to wrap in iterator that returns Result<RecordBatch>
-        let batches = RecordBatchIterator::new(
-            vec![empty_batch].into_iter().map(Ok),
-            schema.clone(),
-        );
+        let batches =
+            RecordBatchIterator::new(vec![empty_batch].into_iter().map(Ok), schema.clone());
 
         self.connection
             .create_table(&self.table_name, Box::new(batches))
@@ -260,16 +259,13 @@ impl VectorDatabase for LanceVectorDB {
 
         // Get current row count to use as starting ID for BM25
         let table = self.get_table().await?;
-        let current_count = table
-            .count_rows(None)
-            .await
-            .unwrap_or(0) as u64;
+        let current_count = table.count_rows(None).await.unwrap_or(0) as u64;
 
         let batch = Self::create_record_batch(
             embeddings,
             metadata.clone(),
             contents.clone(),
-            schema.clone()
+            schema.clone(),
         )?;
         let count = batch.num_rows();
 
@@ -289,7 +285,9 @@ impl VectorDatabase for LanceVectorDB {
             })
             .collect();
 
-        let bm25_lock = self.bm25_index.read()
+        let bm25_lock = self
+            .bm25_index
+            .read()
             .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
         if let Some(bm25) = bm25_lock.as_ref() {
             bm25.add_documents(bm25_docs)
@@ -324,7 +322,11 @@ impl VectorDatabase for LanceVectorDB {
                 .limit(search_limit);
 
             let stream = if let Some(ref project_name) = project {
-                query.only_if(format!("project = '{}'", project_name)).execute().await.context("Failed to execute search")?
+                query
+                    .only_if(format!("project = '{}'", project_name))
+                    .execute()
+                    .await
+                    .context("Failed to execute search")?
             } else {
                 query.execute().await.context("Failed to execute search")?
             };
@@ -364,18 +366,22 @@ impl VectorDatabase for LanceVectorDB {
             }
 
             // BM25 keyword search
-            let bm25_lock = self.bm25_index.read()
+            let bm25_lock = self
+                .bm25_index
+                .read()
                 .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
             let bm25_results = if let Some(bm25) = bm25_lock.as_ref() {
-                let all_bm25_results = bm25.search(query_text, search_limit)
+                let all_bm25_results = bm25
+                    .search(query_text, search_limit)
                     .context("Failed to search BM25 index")?;
 
                 // Store BM25 scores (don't filter - let RRF combine them)
                 // BM25 scores are not normalized to 0-1 range, so min_score doesn't apply
                 for result in &all_bm25_results {
-                    original_scores.entry(result.id)
+                    original_scores
+                        .entry(result.id)
                         .and_modify(|e| e.1 = Some(result.score))
-                        .or_insert((0.0, Some(result.score)));  // No vector score, only keyword
+                        .or_insert((0.0, Some(result.score))); // No vector score, only keyword
                 }
 
                 all_bm25_results
@@ -386,11 +392,8 @@ impl VectorDatabase for LanceVectorDB {
 
             // Combine results with Reciprocal Rank Fusion
             // RRF produces scores ~0.01-0.03, so don't apply min_score to combined scores
-            let combined = crate::bm25_search::reciprocal_rank_fusion(
-                vector_results,
-                bm25_results,
-                limit,
-            );
+            let combined =
+                crate::bm25_search::reciprocal_rank_fusion(vector_results, bm25_results, limit);
 
             // Build final results by looking up the combined IDs in the vector results
             let mut search_results = Vec::new();
@@ -404,26 +407,36 @@ impl VectorDatabase for LanceVectorDB {
                     if id >= batch_offset && id < batch_offset + batch.num_rows() as u64 {
                         let idx = (id - batch_offset) as usize;
 
-                        let file_path_array = batch.column_by_name("file_path")
+                        let file_path_array = batch
+                            .column_by_name("file_path")
                             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-                        let start_line_array = batch.column_by_name("start_line")
+                        let start_line_array = batch
+                            .column_by_name("start_line")
                             .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
-                        let end_line_array = batch.column_by_name("end_line")
+                        let end_line_array = batch
+                            .column_by_name("end_line")
                             .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
-                        let language_array = batch.column_by_name("language")
+                        let language_array = batch
+                            .column_by_name("language")
                             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-                        let content_array = batch.column_by_name("content")
+                        let content_array = batch
+                            .column_by_name("content")
                             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-                        let project_array = batch.column_by_name("project")
+                        let project_array = batch
+                            .column_by_name("project")
                             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
-                        if let (Some(fp), Some(sl), Some(el), Some(lang), Some(cont), Some(proj)) =
-                            (file_path_array, start_line_array, end_line_array, language_array, content_array, project_array)
-                        {
+                        if let (Some(fp), Some(sl), Some(el), Some(lang), Some(cont), Some(proj)) = (
+                            file_path_array,
+                            start_line_array,
+                            end_line_array,
+                            language_array,
+                            content_array,
+                            project_array,
+                        ) {
                             // Look up original scores for filtering and reporting
-                            let (vector_score, keyword_score) = original_scores.get(&id)
-                                .copied()
-                                .unwrap_or((0.0, None));
+                            let (vector_score, keyword_score) =
+                                original_scores.get(&id).copied().unwrap_or((0.0, None));
 
                             // For hybrid search, apply min_score intelligently:
                             // Accept if EITHER vector or keyword score meets threshold
@@ -435,9 +448,9 @@ impl VectorDatabase for LanceVectorDB {
                                 // Use RRF combined score as the main score for ranking
                                 // But report original vector/keyword scores for transparency
                                 search_results.push(SearchResult {
-                                    score: combined_score,  // RRF score for ranking
-                                    vector_score,           // Original vector score
-                                    keyword_score,          // Original BM25 score
+                                    score: combined_score, // RRF score for ranking
+                                    vector_score,          // Original vector score
+                                    keyword_score,         // Original BM25 score
                                     file_path: fp.value(idx).to_string(),
                                     start_line: sl.value(idx) as usize,
                                     end_line: el.value(idx) as usize,
@@ -471,7 +484,11 @@ impl VectorDatabase for LanceVectorDB {
                 .limit(limit);
 
             let stream = if let Some(ref project_name) = project {
-                query.only_if(format!("project = '{}'", project_name)).execute().await.context("Failed to execute search")?
+                query
+                    .only_if(format!("project = '{}'", project_name))
+                    .execute()
+                    .await
+                    .context("Failed to execute search")?
             } else {
                 query.execute().await.context("Failed to execute search")?
             };
@@ -577,22 +594,24 @@ impl VectorDatabase for LanceVectorDB {
         let search_limit = limit * 3;
 
         // Do basic search with hybrid support
-        let mut results = self.search(
-            query_vector,
-            query_text,
-            search_limit,
-            min_score,
-            project,
-            hybrid,
-        ).await?;
+        let mut results = self
+            .search(
+                query_vector,
+                query_text,
+                search_limit,
+                min_score,
+                project,
+                hybrid,
+            )
+            .await?;
 
         // Post-process filtering
         results.retain(|result| {
             // Filter by file extension
             if !file_extensions.is_empty() {
-                let has_extension = file_extensions.iter().any(|ext| {
-                    result.file_path.ends_with(&format!(".{}", ext))
-                });
+                let has_extension = file_extensions
+                    .iter()
+                    .any(|ext| result.file_path.ends_with(&format!(".{}", ext)));
                 if !has_extension {
                     return false;
                 }
@@ -607,9 +626,9 @@ impl VectorDatabase for LanceVectorDB {
 
             // Filter by path pattern
             if !path_patterns.is_empty() {
-                let matches_pattern = path_patterns.iter().any(|pattern| {
-                    result.file_path.contains(pattern)
-                });
+                let matches_pattern = path_patterns
+                    .iter()
+                    .any(|pattern| result.file_path.contains(pattern));
                 if !matches_pattern {
                     return false;
                 }
@@ -654,7 +673,9 @@ impl VectorDatabase for LanceVectorDB {
             .context("Failed to drop table")?;
 
         // Clear BM25 index
-        let bm25_lock = self.bm25_index.read()
+        let bm25_lock = self
+            .bm25_index
+            .read()
             .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
         if let Some(bm25) = bm25_lock.as_ref() {
             bm25.clear().context("Failed to clear BM25 index")?;
@@ -705,8 +726,7 @@ impl VectorDatabase for LanceVectorDB {
             }
         }
 
-        let mut language_breakdown: Vec<(String, usize)> =
-            language_counts.into_iter().collect();
+        let mut language_breakdown: Vec<(String, usize)> = language_counts.into_iter().collect();
         language_breakdown.sort_by(|a, b| b.1.cmp(&a.1));
 
         Ok(DatabaseStats {

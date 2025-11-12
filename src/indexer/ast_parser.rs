@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tree_sitter::{Language, Parser, Node};
+use tree_sitter::{Language, Node, Parser};
 
 /// AST node information for chunking
 #[derive(Debug, Clone)]
@@ -25,12 +25,17 @@ impl AstParser {
             "rs" => (tree_sitter_rust::LANGUAGE.into(), "Rust"),
             "py" => (tree_sitter_python::LANGUAGE.into(), "Python"),
             "js" | "mjs" | "cjs" | "jsx" => (tree_sitter_javascript::LANGUAGE.into(), "JavaScript"),
-            "ts" | "tsx" => (tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), "TypeScript"),
+            "ts" | "tsx" => (
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                "TypeScript",
+            ),
             "go" => (tree_sitter_go::LANGUAGE.into(), "Go"),
             "java" => (tree_sitter_java::LANGUAGE.into(), "Java"),
             "swift" => (tree_sitter_swift::LANGUAGE.into(), "Swift"),
             "c" | "h" => (tree_sitter_c::LANGUAGE.into(), "C"),
-            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => (tree_sitter_cpp::LANGUAGE.into(), "C++"),
+            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => {
+                (tree_sitter_cpp::LANGUAGE.into(), "C++")
+            }
             "cs" => (tree_sitter_c_sharp::LANGUAGE.into(), "C#"),
             "rb" => (tree_sitter_ruby::LANGUAGE.into(), "Ruby"),
             "php" => (tree_sitter_php::LANGUAGE_PHP.into(), "PHP"),

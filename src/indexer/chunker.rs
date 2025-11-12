@@ -1,6 +1,6 @@
 use super::CodeChunk;
-use crate::indexer::file_walker::FileInfo;
 use crate::indexer::ast_parser::AstParser;
+use crate::indexer::file_walker::FileInfo;
 use crate::types::ChunkMetadata;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,9 +39,7 @@ impl CodeChunker {
             ChunkStrategy::SlidingWindow { size, overlap } => {
                 self.chunk_sliding_window(file_info, *size, *overlap)
             }
-            ChunkStrategy::AstBased => {
-                self.chunk_ast_based(file_info)
-            }
+            ChunkStrategy::AstBased => self.chunk_ast_based(file_info),
             ChunkStrategy::Hybrid { fallback_lines } => {
                 // Try AST-based first, fallback to fixed lines if it fails
                 let ast_chunks = self.chunk_ast_based(file_info);
@@ -257,7 +255,10 @@ mod tests {
 
     #[test]
     fn test_fixed_lines_chunking() {
-        let content = (1..=100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (1..=100)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let file_info = create_test_file_info(&content);
 
         let chunker = CodeChunker::new(ChunkStrategy::FixedLines(10));
@@ -272,7 +273,10 @@ mod tests {
 
     #[test]
     fn test_sliding_window_chunking() {
-        let content = (1..=20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (1..=20)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let file_info = create_test_file_info(&content);
 
         let chunker = CodeChunker::new(ChunkStrategy::SlidingWindow {

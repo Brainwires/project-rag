@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
-use tantivy::{doc, Index, IndexWriter, ReloadPolicy, TantivyDocument};
+use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument, doc};
 
 /// BM25-based keyword search using Tantivy
 pub struct BM25Search {
@@ -35,12 +35,10 @@ impl BM25Search {
         let schema = schema_builder.build();
 
         // Create or open index
-        std::fs::create_dir_all(&index_path)
-            .context("Failed to create BM25 index directory")?;
+        std::fs::create_dir_all(&index_path).context("Failed to create BM25 index directory")?;
 
         let index = if index_path.join("meta.json").exists() {
-            Index::open_in_dir(&index_path)
-                .context("Failed to open existing BM25 index")?
+            Index::open_in_dir(&index_path).context("Failed to open existing BM25 index")?
         } else {
             Index::create_in_dir(&index_path, schema.clone())
                 .context("Failed to create BM25 index")?
@@ -57,10 +55,14 @@ impl BM25Search {
     /// Add documents to the index
     pub fn add_documents(&self, documents: Vec<(u64, String)>) -> Result<()> {
         // Lock to ensure only one writer at a time
-        let _guard = self.writer_lock.lock()
+        let _guard = self
+            .writer_lock
+            .lock()
             .map_err(|e| anyhow::anyhow!("Failed to acquire writer lock: {}", e))?;
 
-        let mut index_writer: IndexWriter<TantivyDocument> = self.index.writer(50_000_000)
+        let mut index_writer: IndexWriter<TantivyDocument> = self
+            .index
+            .writer(50_000_000)
             .context("Failed to create index writer")?;
 
         for (id, content) in documents {
@@ -68,11 +70,13 @@ impl BM25Search {
                 self.id_field => id,
                 self.content_field => content,
             );
-            index_writer.add_document(doc)
+            index_writer
+                .add_document(doc)
                 .context("Failed to add document")?;
         }
 
-        index_writer.commit()
+        index_writer
+            .commit()
             .context("Failed to commit documents")?;
 
         Ok(())
@@ -80,7 +84,8 @@ impl BM25Search {
 
     /// Search the index with BM25 scoring
     pub fn search(&self, query_text: &str, limit: usize) -> Result<Vec<BM25Result>> {
-        let reader = self.index
+        let reader = self
+            .index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
@@ -90,24 +95,24 @@ impl BM25Search {
 
         // Parse query
         let query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
-        let query = query_parser.parse_query(query_text)
+        let query = query_parser
+            .parse_query(query_text)
             .context("Failed to parse query")?;
 
         // Search with BM25
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))
+        let top_docs = searcher
+            .search(&query, &TopDocs::with_limit(limit))
             .context("Failed to execute search")?;
 
         let mut results = Vec::new();
         for (score, doc_address) in top_docs {
-            let retrieved_doc: TantivyDocument = searcher.doc(doc_address)
+            let retrieved_doc: TantivyDocument = searcher
+                .doc(doc_address)
                 .context("Failed to retrieve document")?;
 
             if let Some(id_value) = retrieved_doc.get_first(self.id_field) {
                 if let Some(id) = id_value.as_u64() {
-                    results.push(BM25Result {
-                        id,
-                        score,
-                    });
+                    results.push(BM25Result { id, score });
                 }
             }
         }
@@ -118,17 +123,20 @@ impl BM25Search {
     /// Delete all documents for a specific ID
     pub fn delete_by_id(&self, id: u64) -> Result<()> {
         // Lock to ensure only one writer at a time
-        let _guard = self.writer_lock.lock()
+        let _guard = self
+            .writer_lock
+            .lock()
             .map_err(|e| anyhow::anyhow!("Failed to acquire writer lock: {}", e))?;
 
-        let mut index_writer: IndexWriter<TantivyDocument> = self.index.writer(50_000_000)
+        let mut index_writer: IndexWriter<TantivyDocument> = self
+            .index
+            .writer(50_000_000)
             .context("Failed to create index writer")?;
 
         let term = Term::from_field_u64(self.id_field, id);
         index_writer.delete_term(term);
 
-        index_writer.commit()
-            .context("Failed to commit deletion")?;
+        index_writer.commit().context("Failed to commit deletion")?;
 
         Ok(())
     }
@@ -136,24 +144,29 @@ impl BM25Search {
     /// Clear the entire index
     pub fn clear(&self) -> Result<()> {
         // Lock to ensure only one writer at a time
-        let _guard = self.writer_lock.lock()
+        let _guard = self
+            .writer_lock
+            .lock()
             .map_err(|e| anyhow::anyhow!("Failed to acquire writer lock: {}", e))?;
 
-        let mut index_writer: IndexWriter<TantivyDocument> = self.index.writer(50_000_000)
+        let mut index_writer: IndexWriter<TantivyDocument> = self
+            .index
+            .writer(50_000_000)
             .context("Failed to create index writer")?;
 
-        index_writer.delete_all_documents()
+        index_writer
+            .delete_all_documents()
             .context("Failed to delete all documents")?;
 
-        index_writer.commit()
-            .context("Failed to commit clear")?;
+        index_writer.commit().context("Failed to commit clear")?;
 
         Ok(())
     }
 
     /// Get index statistics
     pub fn get_stats(&self) -> Result<BM25Stats> {
-        let reader = self.index
+        let reader = self
+            .index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
@@ -330,9 +343,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let bm25 = BM25Search::new(temp_dir.path()).unwrap();
 
-        let docs = vec![
-            (1, "test content".to_string()),
-        ];
+        let docs = vec![(1, "test content".to_string())];
         bm25.add_documents(docs).unwrap();
 
         // Empty query should not crash
@@ -378,6 +389,9 @@ mod tests {
         // ID 2 appears only in vector (rank 2)
         // ID 3 appears only in BM25 (rank 2)
         assert!(combined[0].0 == 1, "ID 1 should rank first");
-        assert!(combined[0].1 > combined[1].1, "ID 1 should have highest score");
+        assert!(
+            combined[0].1 > combined[1].1,
+            "ID 1 should have highest score"
+        );
     }
 }

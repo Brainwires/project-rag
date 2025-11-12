@@ -19,11 +19,10 @@ impl HashCache {
             return Ok(Self::default());
         }
 
-        let content = fs::read_to_string(cache_path)
-            .context("Failed to read cache file")?;
+        let content = fs::read_to_string(cache_path).context("Failed to read cache file")?;
 
-        let cache: HashCache = serde_json::from_str(&content)
-            .context("Failed to parse cache file")?;
+        let cache: HashCache =
+            serde_json::from_str(&content).context("Failed to parse cache file")?;
 
         tracing::info!("Loaded cache with {} indexed roots", cache.roots.len());
         Ok(cache)
@@ -33,15 +32,12 @@ impl HashCache {
     pub fn save(&self, cache_path: &Path) -> Result<()> {
         // Create parent directory if it doesn't exist
         if let Some(parent) = cache_path.parent() {
-            fs::create_dir_all(parent)
-                .context("Failed to create cache directory")?;
+            fs::create_dir_all(parent).context("Failed to create cache directory")?;
         }
 
-        let content = serde_json::to_string_pretty(self)
-            .context("Failed to serialize cache")?;
+        let content = serde_json::to_string_pretty(self).context("Failed to serialize cache")?;
 
-        fs::write(cache_path, content)
-            .context("Failed to write cache file")?;
+        fs::write(cache_path, content).context("Failed to write cache file")?;
 
         tracing::debug!("Saved cache to {:?}", cache_path);
         Ok(())
@@ -72,7 +68,10 @@ impl HashCache {
         } else {
             // Linux/Unix
             PathBuf::from(std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| {
-                format!("{}/.cache", std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+                format!(
+                    "{}/.cache",
+                    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+                )
             }))
         };
 

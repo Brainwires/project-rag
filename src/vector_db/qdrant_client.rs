@@ -1,12 +1,12 @@
 use super::{DatabaseStats, VectorDatabase};
 use crate::types::{ChunkMetadata, SearchResult};
 use anyhow::{Context, Result};
-use qdrant_client::{Payload, Qdrant};
 use qdrant_client::qdrant::vectors_config::Config;
 use qdrant_client::qdrant::{
     Condition, CreateCollectionBuilder, DeletePointsBuilder, Distance, Filter, PointStruct,
     SearchPointsBuilder, UpsertPointsBuilder, VectorParams, VectorsConfig,
 };
+use qdrant_client::{Payload, Qdrant};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -91,7 +91,8 @@ impl QdrantVectorDB {
 
                     // Extract unique terms from this document
                     let terms = Self::tokenize(content);
-                    let unique_terms: std::collections::HashSet<String> = terms.into_iter().collect();
+                    let unique_terms: std::collections::HashSet<String> =
+                        terms.into_iter().collect();
 
                     for term in unique_terms {
                         *doc_frequencies.entry(term).or_insert(0) += 1;
@@ -109,8 +110,11 @@ impl QdrantVectorDB {
         stats.total_docs = total_docs;
         stats.doc_frequencies = doc_frequencies;
 
-        tracing::info!("IDF stats refreshed: {} documents, {} unique terms",
-            total_docs, stats.doc_frequencies.len());
+        tracing::info!(
+            "IDF stats refreshed: {} documents, {} unique terms",
+            total_docs,
+            stats.doc_frequencies.len()
+        );
 
         Ok(())
     }
@@ -197,14 +201,13 @@ impl VectorDatabase for QdrantVectorDB {
 
         self.client
             .create_collection(
-                CreateCollectionBuilder::new(COLLECTION_NAME)
-                    .vectors_config(VectorsConfig {
-                        config: Some(Config::Params(VectorParams {
-                            size: dimension as u64,
-                            distance: Distance::Cosine.into(),
-                            ..Default::default()
-                        })),
-                    })
+                CreateCollectionBuilder::new(COLLECTION_NAME).vectors_config(VectorsConfig {
+                    config: Some(Config::Params(VectorParams {
+                        size: dimension as u64,
+                        distance: Distance::Cosine.into(),
+                        ..Default::default()
+                    })),
+                }),
             )
             .await
             .context("Failed to create collection")?;
@@ -250,9 +253,7 @@ impl VectorDatabase for QdrantVectorDB {
             .collect();
 
         self.client
-            .upsert_points(
-                UpsertPointsBuilder::new(COLLECTION_NAME, points)
-            )
+            .upsert_points(UpsertPointsBuilder::new(COLLECTION_NAME, points))
             .await
             .context("Failed to upsert points")?;
 
@@ -273,8 +274,18 @@ impl VectorDatabase for QdrantVectorDB {
         project: Option<String>,
         hybrid: bool,
     ) -> Result<Vec<SearchResult>> {
-        self.search_filtered(query_vector, query_text, limit, min_score, project, hybrid, vec![], vec![], vec![])
-            .await
+        self.search_filtered(
+            query_vector,
+            query_text,
+            limit,
+            min_score,
+            project,
+            hybrid,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await
     }
 
     async fn search_filtered(
@@ -331,9 +342,10 @@ impl VectorDatabase for QdrantVectorDB {
             filter.must = must_conditions;
         }
 
-        let mut search_builder = SearchPointsBuilder::new(COLLECTION_NAME, query_vector, limit as u64)
-            .score_threshold(min_score)
-            .with_payload(true);
+        let mut search_builder =
+            SearchPointsBuilder::new(COLLECTION_NAME, query_vector, limit as u64)
+                .score_threshold(min_score)
+                .with_payload(true);
 
         if !filter.must.is_empty() {
             search_builder = search_builder.filter(filter);
@@ -405,7 +417,11 @@ impl VectorDatabase for QdrantVectorDB {
 
         // Re-sort by combined score if hybrid
         if hybrid {
-            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
 
         // Post-filter by path patterns if needed
@@ -426,10 +442,7 @@ impl VectorDatabase for QdrantVectorDB {
         let filter = Filter::must([Condition::matches("file_path", file_path.to_string())]);
 
         self.client
-            .delete_points(
-                DeletePointsBuilder::new(COLLECTION_NAME)
-                    .points(filter)
-            )
+            .delete_points(DeletePointsBuilder::new(COLLECTION_NAME).points(filter))
             .await
             .context("Failed to delete points")?;
 
@@ -461,7 +474,10 @@ impl VectorDatabase for QdrantVectorDB {
             .await
             .context("Failed to get collection info")?;
 
-        let points_count = collection_info.result.and_then(|r| r.points_count).unwrap_or(0);
+        let points_count = collection_info
+            .result
+            .and_then(|r| r.points_count)
+            .unwrap_or(0);
 
         // For language breakdown, we'd need to scroll through all points
         // For now, return a simplified version
