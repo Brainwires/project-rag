@@ -64,6 +64,9 @@ pub trait VectorDatabase: Send + Sync {
 
     /// Get statistics
     async fn get_statistics(&self) -> Result<DatabaseStats>;
+
+    /// Flush/save changes to disk
+    async fn flush(&self) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]

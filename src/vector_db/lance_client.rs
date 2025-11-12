@@ -603,4 +603,9 @@ impl VectorDatabase for LanceVectorDB {
             language_breakdown,
         })
     }
+
+    async fn flush(&self) -> Result<()> {
+        // LanceDB persists automatically, no explicit flush needed
+        Ok(())
+    }
 }

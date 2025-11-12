@@ -265,6 +265,20 @@ impl RagMcpServer {
                 progress_token: token.clone(),
                 progress: 100.0,
                 total: Some(100.0),
+                message: Some("Saving index to disk...".into()),
+            }).await;
+        }
+
+        // Flush the index to disk
+        self.vector_db.flush().await
+            .map_err(|e| anyhow::anyhow!("Failed to flush index to disk: {}", e))?;
+
+        // Send final completion progress
+        if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+            let _ = peer.notify_progress(ProgressNotificationParam {
+                progress_token: token.clone(),
+                progress: 100.0,
+                total: Some(100.0),
                 message: Some("Indexing complete!".into()),
             }).await;
         }
@@ -521,6 +535,10 @@ impl RagMcpServer {
         if let Err(e) = cache.save(&self.cache_path) {
             tracing::warn!("Failed to save hash cache: {}", e);
         }
+
+        // Flush the vector database to disk
+        self.vector_db.flush().await
+            .map_err(|e| format!("Failed to flush index to disk: {}", e))?;
 
         let response = IncrementalUpdateResponse {
             files_added,

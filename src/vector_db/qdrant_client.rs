@@ -471,6 +471,11 @@ impl VectorDatabase for QdrantVectorDB {
             language_breakdown: vec![],
         })
     }
+
+    async fn flush(&self) -> Result<()> {
+        // Qdrant persists automatically, no explicit flush needed
+        Ok(())
+    }
 }
 
 impl Default for QdrantVectorDB {
