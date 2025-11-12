@@ -148,4 +148,86 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap().roots.len(), 0);
     }
+
+    #[test]
+    fn test_load_corrupted_cache() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let cache_path = temp_file.path().to_path_buf();
+
+        // Write invalid JSON
+        fs::write(&cache_path, "{ invalid json }").unwrap();
+
+        let result = HashCache::load(&cache_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_save_creates_parent_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("subdir").join("cache.json");
+
+        let cache = HashCache::default();
+        cache.save(&cache_path).unwrap();
+
+        assert!(cache_path.exists());
+    }
+
+    #[test]
+    fn test_default_path() {
+        let path = HashCache::default_path();
+        assert!(path.to_string_lossy().contains("project-rag"));
+        assert!(path.to_string_lossy().contains("hash_cache.json"));
+    }
+
+    #[test]
+    fn test_update_root_replaces_existing() {
+        let mut cache = HashCache::default();
+
+        // Add first set of hashes
+        let mut hashes1 = HashMap::new();
+        hashes1.insert("file1.rs".to_string(), "hash1".to_string());
+        cache.update_root("/test/path".to_string(), hashes1);
+
+        // Replace with new set
+        let mut hashes2 = HashMap::new();
+        hashes2.insert("file2.rs".to_string(), "hash2".to_string());
+        cache.update_root("/test/path".to_string(), hashes2);
+
+        let root_hashes = cache.get_root("/test/path").unwrap();
+        assert_eq!(root_hashes.len(), 1);
+        assert!(root_hashes.contains_key("file2.rs"));
+        assert!(!root_hashes.contains_key("file1.rs"));
+    }
+
+    #[test]
+    fn test_multiple_roots() {
+        let mut cache = HashCache::default();
+
+        let mut hashes1 = HashMap::new();
+        hashes1.insert("file1.rs".to_string(), "hash1".to_string());
+        cache.update_root("/path1".to_string(), hashes1);
+
+        let mut hashes2 = HashMap::new();
+        hashes2.insert("file2.rs".to_string(), "hash2".to_string());
+        cache.update_root("/path2".to_string(), hashes2);
+
+        assert_eq!(cache.roots.len(), 2);
+        assert!(cache.get_root("/path1").is_some());
+        assert!(cache.get_root("/path2").is_some());
+    }
+
+    #[test]
+    fn test_empty_cache_operations() {
+        let cache = HashCache::default();
+        assert!(cache.get_root("/any/path").is_none());
+        assert_eq!(cache.roots.len(), 0);
+    }
+
+    #[test]
+    fn test_remove_root_nonexistent() {
+        let mut cache = HashCache::default();
+        cache.remove_root("/nonexistent");
+        // Should not panic
+        assert_eq!(cache.roots.len(), 0);
+    }
 }
