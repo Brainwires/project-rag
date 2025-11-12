@@ -33,7 +33,7 @@ The server provides 6 slash commands for quick access in Claude Code:
 4. **`/project:clear`** - Clear all indexed data
 6. **`/project:search`** - Advanced search with filters
 
-See [SLASH_COMMANDS.md](SLASH_COMMANDS.md) for detailed usage.
+See [SLASH_COMMANDS.md](docs/SLASH_COMMANDS.md) for detailed usage.
 
 ## MCP Tools
 

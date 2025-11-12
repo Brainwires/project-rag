@@ -95,6 +95,14 @@ impl RagMcpServer {
         })
     }
 
+    /// Normalize a path to a canonical absolute form for consistent cache lookups
+    fn normalize_path(path: &str) -> Result<String> {
+        let path_buf = PathBuf::from(path);
+        let canonical = std::fs::canonicalize(&path_buf)
+            .with_context(|| format!("Failed to canonicalize path: {}", path))?;
+        Ok(canonical.to_string_lossy().to_string())
+    }
+
     /// Index a complete codebase
     async fn do_index(
         &self,
@@ -594,18 +602,22 @@ impl RagMcpServer {
         peer: Option<Peer<RoleServer>>,
         progress_token: Option<ProgressToken>,
     ) -> Result<IndexResponse> {
+        // Normalize path to canonical form for consistent cache lookups
+        let normalized_path = Self::normalize_path(&path)?;
+
         // Check if we have an existing cache for this path
         let cache = self.hash_cache.read().await;
-        let has_existing_index = cache.get_root(&path).is_some();
+        let has_existing_index = cache.get_root(&normalized_path).is_some();
         drop(cache);
 
         if has_existing_index {
             tracing::info!(
-                "Existing index found for '{}', performing incremental update",
-                path
+                "Existing index found for '{}' (normalized: '{}'), performing incremental update",
+                path,
+                normalized_path
             );
             self.do_incremental_update(
-                path,
+                normalized_path,
                 project,
                 include_patterns,
                 exclude_patterns,
@@ -616,11 +628,12 @@ impl RagMcpServer {
             .await
         } else {
             tracing::info!(
-                "No existing index found for '{}', performing full index",
-                path
+                "No existing index found for '{}' (normalized: '{}'), performing full index",
+                path,
+                normalized_path
             );
             self.do_index(
-                path,
+                normalized_path,
                 project,
                 include_patterns,
                 exclude_patterns,
