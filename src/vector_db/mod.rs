@@ -1,11 +1,5 @@
-// USearch is the default embedded vector database (10x faster than LanceDB)
-mod usearch_client;
-pub use usearch_client::USearchDB;
-
-// LanceDB is optional (slower but has more features)
-#[cfg(feature = "lancedb-backend")]
+// LanceDB is the default embedded vector database (stable, feature-rich)
 mod lance_client;
-#[cfg(feature = "lancedb-backend")]
 pub use lance_client::LanceVectorDB;
 
 // Qdrant is optional (requires external server)

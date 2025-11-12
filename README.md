@@ -17,7 +17,7 @@ This MCP server enables AI assistants to efficiently search and understand large
 - **AST-Based Chunking**: Uses Tree-sitter to extract semantic units (functions, classes, methods) for 12 languages
 - **Multi-Project Support**: Index and query multiple codebases simultaneously with project filtering
 - **Incremental Updates**: Only re-index changed files with persistent hash cache
-- **Blazing Fast Indexing**: USearch HNSW vector database (10x faster than LanceDB) with optional LanceDB/Qdrant support
+- **Stable Embedded Database**: LanceDB vector database (default, no external dependencies) with optional Qdrant support
 - **Language Detection**: Automatic detection of 30+ programming languages
 - **Advanced Filtering**: Search by file type, language, or path patterns
 - **Respects .gitignore**: Automatically excludes ignored files during indexing
@@ -77,35 +77,21 @@ The server also provides 6 tools that can be used directly:
 
 ### Vector Database Options
 
-**USearch (Default - Embedded, Fastest)**
+**LanceDB (Default - Embedded, Stable)**
 
-No additional setup needed! USearch is an embedded HNSW vector database that runs directly in the application. It stores data in `./.usearch_data` directory by default.
+No additional setup needed! LanceDB is an embedded vector database that runs directly in the application. It stores data in `./.lancedb` directory by default.
 
-**Why USearch is the default:**
-- **10x faster indexing** than LanceDB (HNSW vs IVF_PQ algorithm)
-- **16x less memory** than standard hnswlib
-- **SIMD-optimized** for 119x speedup on distance calculations
-- **No training phase** - immediate indexing without expensive clustering
-- **Production-proven** - used by YugabyteDB
-- **Hybrid search built-in** - Tantivy BM25 + USearch vector with Reciprocal Rank Fusion
-- Excellent memory efficiency with fast query performance (20-30ms)
-
-**LanceDB (Optional - More Features)**
-
-To use LanceDB instead of USearch, build with the `lancedb-backend` feature:
-
-```bash
-cargo build --release --no-default-features --features lancedb-backend
-```
-
-Benefits:
-- Full SQL-like filtering
-- ACID transactions
-- Better for scenarios requiring complex queries
+**Why LanceDB is the default:**
+- **Embedded** - No external dependencies or servers required
+- **Stable** - Production-proven with ACID transactions
+- **Feature-rich** - Full SQL-like filtering capabilities
+- **Hybrid search built-in** - Tantivy BM25 + LanceDB vector with Reciprocal Rank Fusion
+- **Columnar storage** - Efficient for large datasets with Apache Arrow
+- **Zero-copy** - Memory-mapped files for fast queries
 
 **Qdrant (Optional - Server-Based)**
 
-To use Qdrant instead of USearch, build with the `qdrant-backend` feature:
+To use Qdrant instead of LanceDB, build with the `qdrant-backend` feature:
 
 ```bash
 cargo build --release --no-default-features --features qdrant-backend
@@ -144,11 +130,10 @@ cd project-rag
 # Install protobuf compiler (Ubuntu/Debian)
 sudo apt-get install protobuf-compiler
 
-# Build the release binary (with default USearch backend - fastest!)
+# Build the release binary (with default LanceDB backend - stable and embedded!)
 cargo build --release
 
-# Or build with alternative backends
-cargo build --release --no-default-features --features lancedb-backend
+# Or build with Qdrant backend (requires external server)
 cargo build --release --no-default-features --features qdrant-backend
 
 # The binary will be at target/release/project-rag
@@ -238,8 +223,7 @@ project-rag/
 │   │   └── fastembed_manager.rs  # all-MiniLM-L6-v2 implementation
 │   ├── vector_db/          # Vector database implementations
 │   │   ├── mod.rs          # VectorDatabase trait
-│   │   ├── usearch_client.rs # USearch + Tantivy hybrid search (default)
-│   │   ├── lance_client.rs # LanceDB implementation (optional)
+│   │   ├── lance_client.rs # LanceDB + Tantivy hybrid search (default)
 │   │   └── qdrant_client.rs  # Qdrant implementation (optional)
 │   ├── indexer/            # File walking and code chunking
 │   │   ├── mod.rs          # Module exports
@@ -291,7 +275,7 @@ project-rag/
 - **Payload**: Stores file path, project, line numbers, language, hash, timestamp, content
 
 ### Hybrid Search
-- **Vector Similarity**: Semantic understanding via embeddings (USearch HNSW)
+- **Vector Similarity**: Semantic understanding via embeddings (LanceDB or Qdrant)
 - **Keyword Matching**: Full-text BM25 search via Tantivy inverted index
 - **Fusion Algorithm**: Reciprocal Rank Fusion (RRF) with k=60 constant
 - **BM25 Parameters**: Uses Tantivy's optimized BM25 implementation
@@ -409,7 +393,7 @@ RUST_LOG=trace cargo run
 - 33 unit tests passing (including 8 BM25/RRF hybrid search tests)
 - Comprehensive documentation
 - **Full MCP prompts support enabled**
-- **Hybrid search with Tantivy BM25 + USearch vector using RRF**
+- **Hybrid search with Tantivy BM25 + LanceDB vector using RRF**
 
 ### 📋 Known Limitations
 
@@ -429,8 +413,8 @@ RUST_LOG=trace cargo run
 
 ### Current Limitations
 
-- **Qdrant Dependency**: Requires external Qdrant server
-  - Future: Consider embedded vector DB option (Lance, etc.)
+- **Qdrant Backend**: Requires external Qdrant server when using qdrant-backend feature
+  - Default LanceDB backend is fully embedded with no external dependencies
 
 - **Model Download**: First run downloads ~50MB model
   - Future: Include model in binary or provide offline installer

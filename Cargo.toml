@@ -7,13 +7,11 @@ edition = "2024"
 rmcp = { version = "0.8", features = ["server", "transport-io", "macros"] }
 schemars = "1.0"
 tokio = { version = "1.43", features = ["full"] }
-# Vector databases - USearch is default (embedded, fastest), others are optional
-usearch = { version = "2.21", features = ["simsimd", "openmp"] }
-rayon = "1.10"
-lancedb = { version = "0.10", optional = true }
-arrow-array = { version = "52.2", optional = true }
-arrow-schema = { version = "52.2", optional = true }
-futures = { version = "0.3", optional = true }
+# Vector databases - LanceDB is default (embedded, stable), Qdrant is optional (external)
+lancedb = "0.10"
+arrow-array = "52.2"
+arrow-schema = "52.2"
+futures = "0.3"
 qdrant-client = { version = "1.15", optional = true }
 fastembed = "5.1"
 tantivy = "0.22"
@@ -44,9 +42,8 @@ tree-sitter-php = "0.24"
 tempfile = "3.0"
 
 [features]
-default = ["usearch-backend"]
-usearch-backend = []
-lancedb-backend = ["lancedb", "arrow-array", "arrow-schema", "futures"]
+default = ["lancedb-backend"]
+lancedb-backend = []
 qdrant-backend = ["qdrant-client"]
 
 [lib]

@@ -8,11 +8,8 @@ use crate::vector_db::VectorDatabase;
 #[cfg(feature = "qdrant-backend")]
 use crate::vector_db::QdrantVectorDB;
 
-#[cfg(feature = "lancedb-backend")]
+#[cfg(not(feature = "qdrant-backend"))]
 use crate::vector_db::LanceVectorDB;
-
-#[cfg(not(any(feature = "qdrant-backend", feature = "lancedb-backend")))]
-use crate::vector_db::USearchDB;
 
 use anyhow::{Context, Result};
 use rmcp::{
@@ -33,10 +30,8 @@ pub struct RagMcpServer {
     embedding_provider: Arc<FastEmbedManager>,
     #[cfg(feature = "qdrant-backend")]
     vector_db: Arc<QdrantVectorDB>,
-    #[cfg(feature = "lancedb-backend")]
+    #[cfg(not(feature = "qdrant-backend"))]
     vector_db: Arc<LanceVectorDB>,
-    #[cfg(not(any(feature = "qdrant-backend", feature = "lancedb-backend")))]
-    vector_db: Arc<USearchDB>,
     chunker: Arc<CodeChunker>,
     // Persistent hash cache for incremental updates
     hash_cache: Arc<RwLock<HashCache>>,
@@ -62,22 +57,13 @@ impl RagMcpServer {
             )
         };
 
-        #[cfg(feature = "lancedb-backend")]
+        #[cfg(not(feature = "qdrant-backend"))]
         let vector_db = {
-            tracing::info!("Using LanceDB vector database backend");
+            tracing::info!("Using LanceDB vector database backend (default)");
             Arc::new(
                 LanceVectorDB::new()
                     .await
                     .context("Failed to initialize LanceDB vector database")?,
-            )
-        };
-
-        #[cfg(not(any(feature = "qdrant-backend", feature = "lancedb-backend")))]
-        let vector_db = {
-            tracing::info!("Using USearch vector database backend (default)");
-            Arc::new(
-                USearchDB::new("./.usearch_data", "code_embeddings")
-                    .context("Failed to initialize USearch vector database")?,
             )
         };
 
