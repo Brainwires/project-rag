@@ -540,7 +540,7 @@ impl RagMcpServer {
         let messages = vec![PromptMessage::new_text(
             PromptMessageRole::User,
             format!(
-                "Please index the codebase at path: {}. This will automatically perform a full index if this is the first time, or an incremental update if the codebase has been indexed before.",
+                "Please index the codebase at path: '{}'. This will automatically perform a full index if this is the first time, or an incremental update if the codebase has been indexed before.",
                 path
             ),
         )];
