@@ -277,11 +277,11 @@ impl VectorDatabase for LanceVectorDB {
             .await
             .context("Failed to add records to table")?;
 
-        // Add documents to BM25 index
+        // Add documents to BM25 index with file_path for deletion tracking
         let bm25_docs: Vec<_> = (0..count)
             .map(|i| {
                 let id = current_count + i as u64;
-                (id, contents[i].clone())
+                (id, contents[i].clone(), metadata[i].file_path.clone())
             })
             .collect();
 
@@ -644,6 +644,20 @@ impl VectorDatabase for LanceVectorDB {
     }
 
     async fn delete_by_file(&self, file_path: &str) -> Result<usize> {
+        // Delete from BM25 index first (using file_path field)
+        // Must be done in a scope to drop lock before await
+        {
+            let bm25_lock = self
+                .bm25_index
+                .read()
+                .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
+            if let Some(bm25) = bm25_lock.as_ref() {
+                bm25.delete_by_file_path(file_path)
+                    .context("Failed to delete from BM25 index")?;
+                tracing::debug!("Deleted BM25 entries for file: {}", file_path);
+            }
+        } // bm25_lock dropped here
+
         let table = self.get_table().await?;
 
         // LanceDB uses SQL-like delete
@@ -653,11 +667,6 @@ impl VectorDatabase for LanceVectorDB {
             .delete(&filter)
             .await
             .context("Failed to delete records")?;
-
-        // Note: BM25 index entries are not deleted here to avoid maintaining
-        // a file_path -> BM25 ID mapping. Stale BM25 entries will be filtered
-        // out by the vector search results and cleaned up on next full index.
-        // In production, consider maintaining an ID mapping for precise deletion.
 
         tracing::info!("Deleted embeddings for file: {}", file_path);
 
