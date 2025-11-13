@@ -1,6 +1,7 @@
 use crate::cache::HashCache;
 use crate::embedding::{EmbeddingProvider, FastEmbedManager};
-use crate::indexer::{CodeChunker, FileWalker};
+use crate::git_cache::GitCache;
+use crate::indexer::CodeChunker;
 use crate::types::*;
 use crate::vector_db::VectorDatabase;
 
@@ -20,7 +21,6 @@ use rmcp::{
     service::RequestContext,
     tool, tool_handler, tool_router,
 };
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,6 +37,9 @@ pub struct RagMcpServer {
     // Persistent hash cache for incremental updates
     hash_cache: Arc<RwLock<HashCache>>,
     cache_path: PathBuf,
+    // Git cache for git history indexing
+    git_cache: Arc<RwLock<GitCache>>,
+    git_cache_path: PathBuf,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -84,12 +87,23 @@ impl RagMcpServer {
 
         tracing::info!("Using cache file: {:?}", cache_path);
 
+        // Load persistent git cache
+        let git_cache_path = GitCache::default_path();
+        let git_cache = GitCache::load(&git_cache_path).unwrap_or_else(|e| {
+            tracing::warn!("Failed to load git cache: {}, starting fresh", e);
+            GitCache::default()
+        });
+
+        tracing::info!("Using git cache file: {:?}", git_cache_path);
+
         Ok(Self {
             embedding_provider,
             vector_db,
             chunker,
             hash_cache: Arc::new(RwLock::new(hash_cache)),
             cache_path,
+            git_cache: Arc::new(RwLock::new(git_cache)),
+            git_cache_path,
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         })
@@ -127,12 +141,17 @@ impl RagMcpServer {
         let chunker = Arc::new(CodeChunker::default_strategy());
         let hash_cache = HashCache::default();
 
+        // Create temporary git cache path for tests
+        let git_cache_path = cache_path.parent().unwrap().join("git_cache.json");
+
         Ok(Self {
             embedding_provider,
             vector_db,
             chunker,
             hash_cache: Arc::new(RwLock::new(hash_cache)),
             cache_path,
+            git_cache: Arc::new(RwLock::new(GitCache::default())),
+            git_cache_path,
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         })
@@ -149,6 +168,8 @@ impl RagMcpServer {
 
 // Indexing operations module
 mod indexing;
+// Git indexing operations module
+mod git_indexing;
 
 #[tool_router(router = tool_router)]
 impl RagMcpServer {
@@ -483,6 +504,24 @@ impl RagMcpServer {
 
         serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
     }
+
+    #[tool(description = "Search git commit history using semantic search with on-demand indexing")]
+    async fn search_git_history(
+        &self,
+        Parameters(req): Parameters<SearchGitHistoryRequest>,
+    ) -> Result<String, String> {
+        let response = git_indexing::do_search_git_history(
+            self.embedding_provider.clone(),
+            self.vector_db.clone(),
+            self.git_cache.clone(),
+            &self.git_cache_path,
+            req,
+        )
+        .await
+        .map_err(|e| format!("{:#}", e))?;
+
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
 }
 
 // Prompts for slash commands
@@ -585,6 +624,26 @@ impl RagMcpServer {
         Ok(vec![PromptMessage::new_text(
             PromptMessageRole::User,
             format!("Please perform an advanced search for: {}", query),
+        )])
+    }
+
+    #[prompt(
+        name = "git-search",
+        description = "Search git commit history using semantic search (automatically indexes commits on-demand)"
+    )]
+    async fn git_search_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+
+        Ok(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Please search git commit history at path '{}' for: {}. This will automatically index commits as needed.",
+                path, query
+            ),
         )])
     }
 }

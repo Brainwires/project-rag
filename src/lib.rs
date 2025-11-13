@@ -1,6 +1,8 @@
 pub mod bm25_search;
 pub mod cache;
 pub mod embedding;
+pub mod git;
+pub mod git_cache;
 pub mod indexer;
 pub mod mcp_server;
 pub mod types;
