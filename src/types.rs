@@ -25,7 +25,7 @@ fn default_max_file_size() -> usize {
 }
 
 /// Indexing mode used
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexingMode {
     /// Full indexing (all files)
@@ -220,6 +220,89 @@ pub struct AdvancedSearchRequest {
     /// Filter by file path patterns (glob)
     #[serde(default)]
     pub path_patterns: Vec<String>,
+}
+
+/// Request to search git history
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SearchGitHistoryRequest {
+    /// The search query
+    pub query: String,
+    /// Path to the codebase (will discover git repo)
+    #[serde(default = "default_git_path")]
+    pub path: String,
+    /// Optional project name
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Optional branch name (default: current branch)
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Maximum number of commits to index/search (default: 10)
+    #[serde(default = "default_max_commits")]
+    pub max_commits: usize,
+    /// Number of results to return (default: 10)
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    /// Minimum similarity score (0.0 to 1.0, default: 0.7)
+    #[serde(default = "default_min_score")]
+    pub min_score: f32,
+    /// Filter by commit author (optional regex pattern)
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Filter by commits since this date (ISO 8601 or Unix timestamp)
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Filter by commits until this date (ISO 8601 or Unix timestamp)
+    #[serde(default)]
+    pub until: Option<String>,
+    /// Filter by file path pattern (optional regex)
+    #[serde(default)]
+    pub file_pattern: Option<String>,
+}
+
+fn default_git_path() -> String {
+    ".".to_string()
+}
+
+fn default_max_commits() -> usize {
+    10
+}
+
+/// A single git search result
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GitSearchResult {
+    /// Git commit hash (SHA)
+    pub commit_hash: String,
+    /// Commit message
+    pub commit_message: String,
+    /// Author name
+    pub author: String,
+    /// Author email
+    pub author_email: String,
+    /// Commit date (Unix timestamp)
+    pub commit_date: i64,
+    /// Combined similarity score (0.0 to 1.0)
+    pub score: f32,
+    /// Vector similarity score
+    pub vector_score: f32,
+    /// Keyword match score (if hybrid search enabled)
+    pub keyword_score: Option<f32>,
+    /// Files changed in this commit
+    pub files_changed: Vec<String>,
+    /// Diff snippet (first ~500 characters)
+    pub diff_snippet: String,
+}
+
+/// Response from git history search
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SearchGitHistoryResponse {
+    /// List of matching commits, ordered by relevance
+    pub results: Vec<GitSearchResult>,
+    /// Number of commits indexed during this search
+    pub commits_indexed: usize,
+    /// Total commits in cache for this repo
+    pub total_cached_commits: usize,
+    /// Time taken in milliseconds
+    pub duration_ms: u64,
 }
 
 /// Metadata stored with each code chunk

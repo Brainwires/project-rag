@@ -15,6 +15,7 @@ This MCP server enables AI assistants to efficiently search and understand large
 - **Local-First**: All processing happens locally using fastembed-rs (no API keys required)
 - **Hybrid Search**: Combines vector similarity with BM25 keyword matching using Reciprocal Rank Fusion (RRF) for optimal results
 - **AST-Based Chunking**: Uses Tree-sitter to extract semantic units (functions, classes, methods) for 12 languages
+- **Git History Search**: Search commit history with smart on-demand indexing (default: 10 commits, only indexes deeper as needed)
 - **Multi-Project Support**: Index and query multiple codebases simultaneously with project filtering
 - **Smart Indexing**: Automatically performs full indexing for new codebases or incremental updates for previously indexed ones
 - **Stable Embedded Database**: LanceDB vector database (default, no external dependencies) with optional Qdrant support
@@ -31,13 +32,14 @@ The server provides 6 slash commands for quick access in Claude Code:
 2. **`/project:query`** - Search the indexed codebase
 3. **`/project:stats`** - Get index statistics
 4. **`/project:clear`** - Clear all indexed data
-6. **`/project:search`** - Advanced search with filters
+5. **`/project:search`** - Advanced search with filters
+6. **`/project:git-search`** - Search git commit history with on-demand indexing
 
 See [SLASH_COMMANDS.md](docs/SLASH_COMMANDS.md) for detailed usage.
 
 ## MCP Tools
 
-The server also provides 6 tools that can be used directly:
+The server provides 6 tools that can be used directly:
 
 1. **index_codebase** - Smartly index a codebase directory
    - Automatically performs full indexing for new codebases
@@ -65,6 +67,14 @@ The server also provides 6 tools that can be used directly:
    - Filter by programming languages
    - Filter by path patterns
    - Optional project filtering
+
+6. **search_git_history** - Search git commit history using semantic search
+   - Automatically indexes commits on-demand (default: 10 commits, configurable)
+   - Searches commit messages, diffs, author info, and changed files
+   - Smart caching: only indexes new commits as needed
+   - Regex filtering by author name/email and file paths
+   - Date range filtering (ISO 8601 or Unix timestamp)
+   - Branch selection support
 
 ## Prerequisites
 
