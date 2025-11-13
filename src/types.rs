@@ -25,7 +25,7 @@ fn default_max_file_size() -> usize {
 }
 
 /// Indexing mode used
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexingMode {
     /// Full indexing (all files)

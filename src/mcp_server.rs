@@ -95,6 +95,49 @@ impl RagMcpServer {
         })
     }
 
+    /// Create a new server with custom database path (for testing)
+    #[cfg(test)]
+    pub async fn new_with_db_path(db_path: &str, cache_path: PathBuf) -> Result<Self> {
+        let embedding_provider =
+            Arc::new(FastEmbedManager::new().context("Failed to initialize embedding provider")?);
+
+        #[cfg(not(feature = "qdrant-backend"))]
+        let vector_db = {
+            Arc::new(
+                LanceVectorDB::with_path(db_path)
+                    .await
+                    .context("Failed to initialize LanceDB vector database")?,
+            )
+        };
+
+        #[cfg(feature = "qdrant-backend")]
+        let vector_db = {
+            Arc::new(
+                QdrantVectorDB::new()
+                    .await
+                    .context("Failed to initialize Qdrant vector database")?,
+            )
+        };
+
+        vector_db
+            .initialize(embedding_provider.dimension())
+            .await
+            .context("Failed to initialize vector database collections")?;
+
+        let chunker = Arc::new(CodeChunker::default_strategy());
+        let hash_cache = HashCache::default();
+
+        Ok(Self {
+            embedding_provider,
+            vector_db,
+            chunker,
+            hash_cache: Arc::new(RwLock::new(hash_cache)),
+            cache_path,
+            tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
+        })
+    }
+
     /// Normalize a path to a canonical absolute form for consistent cache lookups
     fn normalize_path(path: &str) -> Result<String> {
         let path_buf = PathBuf::from(path);
@@ -1125,3 +1168,6 @@ impl RagMcpServer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;
