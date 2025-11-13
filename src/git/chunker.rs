@@ -19,9 +19,7 @@ impl CommitChunker {
 
     /// Create with custom max content length
     pub fn with_max_length(max_content_length: usize) -> Self {
-        Self {
-            max_content_length,
-        }
+        Self { max_content_length }
     }
 
     /// Convert a commit into a chunk for embedding
@@ -115,7 +113,9 @@ mod tests {
     fn create_test_commit() -> CommitInfo {
         CommitInfo {
             hash: "abc123def456".to_string(),
-            message: "Fix authentication bug\n\nThis commit fixes a critical bug in the auth module.".to_string(),
+            message:
+                "Fix authentication bug\n\nThis commit fixes a critical bug in the auth module."
+                    .to_string(),
             author_name: "John Doe".to_string(),
             author_email: "john@example.com".to_string(),
             commit_date: 1704067200, // 2024-01-01
@@ -160,14 +160,11 @@ mod tests {
     #[test]
     fn test_commits_to_chunks_batch() {
         let chunker = CommitChunker::new();
-        let commits = vec![
-            create_test_commit(),
-            {
-                let mut c = create_test_commit();
-                c.hash = "different_hash".to_string();
-                c
-            },
-        ];
+        let commits = vec![create_test_commit(), {
+            let mut c = create_test_commit();
+            c.hash = "different_hash".to_string();
+            c
+        }];
 
         let chunks = chunker
             .commits_to_chunks(&commits, "/repo/path", Some("my-project".to_string()))

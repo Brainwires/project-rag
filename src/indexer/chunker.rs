@@ -331,7 +331,10 @@ mod tests {
 
     #[test]
     fn test_sliding_window_overlap_equal_size() {
-        let content = (1..=20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (1..=20)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let file_info = create_test_file_info(&content);
 
         let chunker = CodeChunker::new(ChunkStrategy::SlidingWindow {
@@ -345,7 +348,10 @@ mod tests {
 
     #[test]
     fn test_sliding_window_overlap_greater_than_size() {
-        let content = (1..=20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (1..=20)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let file_info = create_test_file_info(&content);
 
         let chunker = CodeChunker::new(ChunkStrategy::SlidingWindow {
@@ -404,7 +410,7 @@ fn hello() {
         let chunker = CodeChunker::new(ChunkStrategy::Hybrid { fallback_lines: 50 });
         let chunks = chunker.chunk_file(&file_info);
         // Should use AST parsing
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
     }
 
     #[test]
@@ -414,7 +420,7 @@ fn hello() {
         let chunker = CodeChunker::new(ChunkStrategy::Hybrid { fallback_lines: 2 });
         let chunks = chunker.chunk_file(&file_info);
         // Should fallback to fixed lines since .txt is not supported by AST
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
     }
 
     #[test]
@@ -446,7 +452,7 @@ fn hello() {
         });
         let chunks = chunker.chunk_file(&file_info);
         // Should skip chunks with only whitespace
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
         for chunk in chunks {
             assert!(!chunk.content.trim().is_empty());
         }

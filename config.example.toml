@@ -1,0 +1,98 @@
+# Project-RAG Configuration File
+#
+# Copy this file to one of these locations:
+#   - Linux:   ~/.config/project-rag/config.toml
+#   - macOS:   ~/Library/Application Support/project-rag/config.toml
+#   - Windows: %APPDATA%\project-rag\config.toml
+#
+# Configuration priority: CLI args > Environment variables > Config file > Defaults
+
+[vector_db]
+# Vector database backend: "lancedb" (default, embedded) or "qdrant" (external server)
+backend = "lancedb"
+
+# LanceDB database directory path (only used if backend = "lancedb")
+# Default: Platform-specific data directory + "/project-rag/lancedb"
+# lancedb_path = "/custom/path/to/lancedb"
+
+# Qdrant server URL (only used if backend = "qdrant")
+# Default: "http://localhost:6334"
+# qdrant_url = "http://localhost:6334"
+
+# Collection name for storing embeddings
+# Default: "code_embeddings"
+collection_name = "code_embeddings"
+
+[embedding]
+# Embedding model to use. Supported models:
+#   - "all-MiniLM-L6-v2" (default, 384 dims, fast)
+#   - "all-MiniLM-L12-v2" (384 dims, more accurate)
+#   - "BAAI/bge-base-en-v1.5" (768 dims, high quality)
+#   - "BAAI/bge-small-en-v1.5" (384 dims, balanced)
+model_name = "all-MiniLM-L6-v2"
+
+# Number of texts to process in each embedding batch
+# Larger batches are faster but use more memory
+# Default: 32
+batch_size = 32
+
+# Timeout in seconds for embedding generation
+# Default: 30
+timeout_secs = 30
+
+[indexing]
+# Chunk size for FixedLines chunking strategy (lines per chunk)
+# Default: 50
+chunk_size = 50
+
+# Maximum file size to index in bytes (1 MB = 1048576)
+# Files larger than this will be skipped
+# Default: 1048576 (1 MB)
+max_file_size = 1048576
+
+# File patterns to include (empty = include all)
+# Example: include_patterns = ["**/*.rs", "**/*.py"]
+include_patterns = []
+
+# File patterns to exclude (always applied)
+# Default: ["target", "node_modules", ".git", "dist", "build"]
+exclude_patterns = ["target", "node_modules", ".git", "dist", "build"]
+
+[search]
+# Minimum similarity score for search results (0.0 to 1.0)
+# Higher values return fewer, more relevant results
+# Default: 0.7
+min_score = 0.7
+
+# Maximum number of search results to return
+# Default: 10
+limit = 10
+
+# Enable hybrid search (vector similarity + BM25 keyword matching)
+# Combining both methods generally improves search quality
+# Default: true
+hybrid = true
+
+[cache]
+# Path to hash cache file for incremental indexing
+# Default: Platform-specific cache directory + "/project-rag/hash_cache.json"
+# hash_cache_path = "/custom/path/to/hash_cache.json"
+
+# Path to git cache file for git history indexing
+# Default: Platform-specific cache directory + "/project-rag/git_cache.json"
+# git_cache_path = "/custom/path/to/git_cache.json"
+
+# Environment Variable Overrides
+# ==============================
+# You can override any configuration value using environment variables:
+#
+#   PROJECT_RAG_DB_BACKEND         - Vector database backend
+#   PROJECT_RAG_LANCEDB_PATH       - LanceDB path
+#   PROJECT_RAG_QDRANT_URL         - Qdrant server URL
+#   PROJECT_RAG_MODEL              - Embedding model name
+#   PROJECT_RAG_BATCH_SIZE         - Embedding batch size
+#   PROJECT_RAG_MIN_SCORE          - Minimum search score
+#
+# Example:
+#   export PROJECT_RAG_MODEL="BAAI/bge-base-en-v1.5"
+#   export PROJECT_RAG_MIN_SCORE="0.8"

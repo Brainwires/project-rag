@@ -4,13 +4,15 @@ use crate::indexer::FileWalker;
 use crate::types::{ChunkMetadata, IndexResponse};
 use crate::vector_db::VectorDatabase;
 use anyhow::{Context, Result};
-use rmcp::{Peer, RoleServer, model::ProgressToken, model::ProgressNotificationParam};
+use rayon::prelude::*;
+use rmcp::{Peer, RoleServer, model::ProgressNotificationParam, model::ProgressToken};
 use std::collections::HashMap;
 use std::time::Instant;
 
 impl RagMcpServer {
     /// Index a complete codebase
-    pub(super) async fn do_index(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn do_index(
         &self,
         path: String,
         project: Option<String>,
@@ -58,11 +60,12 @@ impl RagMcpServer {
                 .await;
         }
 
-        // Chunk all files
-        let mut all_chunks = Vec::new();
-        for file in &files {
-            all_chunks.extend(self.chunker.chunk_file(file));
-        }
+        // Chunk all files in parallel for better performance
+        let chunker = self.chunker.clone();
+        let all_chunks: Vec<_> = files
+            .par_iter()
+            .flat_map(|file| chunker.chunk_file(file))
+            .collect();
 
         let chunks_created = all_chunks.len();
 
@@ -94,18 +97,36 @@ impl RagMcpServer {
             });
         }
 
-        // Generate embeddings in batches
-        let batch_size = 32;
-        let mut all_embeddings = Vec::new();
-        let total_batches = (all_chunks.len() + batch_size - 1) / batch_size;
+        // Generate embeddings in batches (using config values)
+        let batch_size = self.config.embedding.batch_size;
+        let timeout_secs = self.config.embedding.timeout_secs;
+        let mut all_embeddings = Vec::with_capacity(all_chunks.len());
+        let total_batches = all_chunks.len().div_ceil(batch_size);
 
         for (batch_idx, chunk_batch) in all_chunks.chunks(batch_size).enumerate() {
             let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
 
-            match self.embedding_provider.embed_batch(texts) {
-                Ok(embeddings) => all_embeddings.extend(embeddings),
-                Err(e) => {
+            // Generate embeddings with timeout protection (configurable)
+            let provider = self.embedding_provider.clone();
+            let embed_future = tokio::task::spawn_blocking(move || provider.embed_batch(texts));
+
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), embed_future)
+                .await
+            {
+                Ok(Ok(Ok(embeddings))) => all_embeddings.extend(embeddings),
+                Ok(Ok(Err(e))) => {
                     errors.push(format!("Failed to generate embeddings: {}", e));
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    errors.push(format!("Embedding task panicked: {}", e));
+                    continue;
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "Embedding generation timed out after {} seconds",
+                        timeout_secs
+                    ));
                     continue;
                 }
             }
@@ -223,6 +244,7 @@ impl RagMcpServer {
     }
 
     /// Perform incremental update (only changed files)
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn do_incremental_update(
         &self,
         path: String,
@@ -298,8 +320,8 @@ impl RagMcpServer {
         }
 
         // Find new and modified files
-        let mut new_hashes = HashMap::new();
-        let mut files_to_index = Vec::new();
+        let mut new_hashes = HashMap::with_capacity(current_files.len());
+        let mut files_to_index = Vec::with_capacity(current_files.len());
 
         for file in current_files {
             new_hashes.insert(file.relative_path.clone(), file.hash.clone());
@@ -351,10 +373,12 @@ impl RagMcpServer {
 
         // Index new/modified files
         let embeddings_generated = if !files_to_index.is_empty() {
-            let mut all_chunks = Vec::new();
-            for file in &files_to_index {
-                all_chunks.extend(self.chunker.chunk_file(file));
-            }
+            // Chunk files in parallel for better performance
+            let chunker = self.chunker.clone();
+            let all_chunks: Vec<_> = files_to_index
+                .par_iter()
+                .flat_map(|file| chunker.chunk_file(file))
+                .collect();
 
             chunks_modified = all_chunks.len();
 
@@ -373,10 +397,10 @@ impl RagMcpServer {
                     .await;
             }
 
-            // Generate embeddings in batches
-            let batch_size = 32;
-            let mut all_embeddings = Vec::new();
-            let total_batches = (all_chunks.len() + batch_size - 1) / batch_size;
+            // Generate embeddings in batches (using config values)
+            let batch_size = self.config.embedding.batch_size;
+            let mut all_embeddings = Vec::with_capacity(all_chunks.len());
+            let total_batches = all_chunks.len().div_ceil(batch_size);
 
             for (batch_idx, chunk_batch) in all_chunks.chunks(batch_size).enumerate() {
                 let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
@@ -498,6 +522,7 @@ impl RagMcpServer {
     }
 
     /// Smart index that automatically chooses between full and incremental based on existing cache
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn do_index_smart(
         &self,
         path: String,

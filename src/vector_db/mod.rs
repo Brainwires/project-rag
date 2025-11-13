@@ -1,10 +1,10 @@
 // LanceDB is the default embedded vector database (stable, feature-rich)
-mod lance_client;
+pub mod lance_client;
 pub use lance_client::LanceVectorDB;
 
 // Qdrant is optional (requires external server)
 #[cfg(feature = "qdrant-backend")]
-mod qdrant_client;
+pub mod qdrant_client;
 #[cfg(feature = "qdrant-backend")]
 pub use qdrant_client::QdrantVectorDB;
 
@@ -37,6 +37,7 @@ pub trait VectorDatabase: Send + Sync {
     ) -> Result<Vec<SearchResult>>;
 
     /// Search with filters
+    #[allow(clippy::too_many_arguments)]
     async fn search_filtered(
         &self,
         query_vector: Vec<f32>,

@@ -6,13 +6,21 @@ use std::path::{Path, PathBuf};
 /// Information about a git commit
 #[derive(Debug, Clone)]
 pub struct CommitInfo {
+    /// Full commit SHA hash (40 characters)
     pub hash: String,
+    /// Commit message (first line and body)
     pub message: String,
+    /// Author's name
     pub author_name: String,
+    /// Author's email address
     pub author_email: String,
+    /// Commit timestamp (Unix epoch seconds)
     pub commit_date: i64,
+    /// List of file paths changed in this commit
     pub files_changed: Vec<String>,
+    /// Unified diff content (truncated if too large)
     pub diff_content: String,
+    /// SHA hashes of parent commits
     pub parent_hashes: Vec<String>,
 }
 
@@ -35,8 +43,7 @@ impl GitWalker {
             .context("Invalid repository path")?
             .to_path_buf();
 
-        let repo = Repository::open(&repo_path)
-            .context("Failed to open git repository")?;
+        let repo = Repository::open(&repo_path).context("Failed to open git repository")?;
 
         tracing::info!("Opened git repository at: {}", repo_path.display());
 
@@ -50,11 +57,7 @@ impl GitWalker {
 
     /// Get the current branch name, or None if detached HEAD
     pub fn current_branch(&self) -> Option<String> {
-        self.repo
-            .head()
-            .ok()?
-            .shorthand()
-            .map(|s| s.to_string())
+        self.repo.head().ok()?.shorthand().map(|s| s.to_string())
     }
 
     /// Iterate commits with filters
@@ -71,7 +74,8 @@ impl GitWalker {
 
         // Determine starting point
         if let Some(branch_name) = branch {
-            let reference = self.repo
+            let reference = self
+                .repo
                 .find_branch(branch_name, git2::BranchType::Local)
                 .context("Failed to find branch")?;
             let oid = reference.get().target().context("Branch has no target")?;
@@ -103,16 +107,16 @@ impl GitWalker {
             let commit_time = commit.time().seconds();
 
             // Apply date filters
-            if let Some(since) = since_date {
-                if commit_time < since {
-                    break; // Commits are sorted, no need to continue
-                }
+            if let Some(since) = since_date
+                && commit_time < since
+            {
+                break; // Commits are sorted, no need to continue
             }
 
-            if let Some(until) = until_date {
-                if commit_time > until {
-                    continue;
-                }
+            if let Some(until) = until_date
+                && commit_time > until
+            {
+                continue;
             }
 
             // Extract commit info
@@ -139,10 +143,7 @@ impl GitWalker {
         let commit_date = commit.time().seconds();
 
         // Extract parent hashes
-        let parent_hashes: Vec<String> = commit
-            .parents()
-            .map(|p| format!("{}", p.id()))
-            .collect();
+        let parent_hashes: Vec<String> = commit.parents().map(|p| format!("{}", p.id())).collect();
 
         // Get diff and changed files
         let (files_changed, diff_content) = self.extract_diff(commit)?;
@@ -180,10 +181,12 @@ impl GitWalker {
             .ignore_whitespace(false);
 
         let diff = if let Some(parent) = parent_tree {
-            self.repo.diff_tree_to_tree(Some(&parent), Some(&tree), Some(&mut diff_opts))?
+            self.repo
+                .diff_tree_to_tree(Some(&parent), Some(&tree), Some(&mut diff_opts))?
         } else {
             // First commit - diff against empty tree
-            self.repo.diff_tree_to_tree(None, Some(&tree), Some(&mut diff_opts))?
+            self.repo
+                .diff_tree_to_tree(None, Some(&tree), Some(&mut diff_opts))?
         };
 
         // Iterate through deltas (file changes)
@@ -280,7 +283,10 @@ mod tests {
 
         for commit in &commits {
             assert!(!commit.hash.is_empty(), "Commit hash should not be empty");
-            assert!(!commit.author_name.is_empty(), "Author name should not be empty");
+            assert!(
+                !commit.author_name.is_empty(),
+                "Author name should not be empty"
+            );
         }
     }
 
@@ -320,7 +326,10 @@ mod tests {
 
             // Should get different commit (or fewer commits if only one exists)
             if let Some(second_commit) = commits2.first() {
-                assert_ne!(first_commit.hash, second_commit.hash, "Should skip specified commit");
+                assert_ne!(
+                    first_commit.hash, second_commit.hash,
+                    "Should skip specified commit"
+                );
             }
         }
     }

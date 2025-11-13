@@ -87,11 +87,11 @@ impl FileWalker {
             }
 
             // Check file size
-            if let Ok(metadata) = fs::metadata(path) {
-                if metadata.len() > self.max_file_size as u64 {
-                    tracing::debug!("Skipping large file: {:?}", path);
-                    continue;
-                }
+            if let Ok(metadata) = fs::metadata(path)
+                && metadata.len() > self.max_file_size as u64
+            {
+                tracing::debug!("Skipping large file: {:?}", path);
+                continue;
             }
 
             // Check if file is text (binary detection)
@@ -377,7 +377,10 @@ mod tests {
         }
 
         assert_eq!(files.len(), 1, "Expected 1 file matching .rs pattern");
-        assert!(files[0].relative_path.contains(".rs"), "Expected file to contain .rs");
+        assert!(
+            files[0].relative_path.contains(".rs"),
+            "Expected file to contain .rs"
+        );
     }
 
     #[test]
@@ -390,7 +393,10 @@ mod tests {
             FileWalker::new(temp_dir.path(), 1024).with_patterns(vec![], vec![".txt".to_string()]);
         let files = walker.walk().unwrap();
         assert_eq!(files.len(), 1, "Expected 1 file after excluding .txt");
-        assert!(files[0].relative_path.contains(".rs"), "Expected file to contain .rs");
+        assert!(
+            files[0].relative_path.contains(".rs"),
+            "Expected file to contain .rs"
+        );
     }
 
     #[test]
@@ -400,10 +406,8 @@ mod tests {
         fs::write(temp_dir.path().join("test.rs"), "test").unwrap();
         fs::write(temp_dir.path().join("other.txt"), "other").unwrap();
 
-        let walker = FileWalker::new(temp_dir.path(), 1024).with_patterns(
-            vec![".rs".to_string()],
-            vec!["test".to_string()],
-        );
+        let walker = FileWalker::new(temp_dir.path(), 1024)
+            .with_patterns(vec![".rs".to_string()], vec!["test".to_string()]);
         let files = walker.walk().unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].path.ends_with("src.rs"));
@@ -445,7 +449,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("binary.bin");
         // Create file with 50% non-printable bytes (exceeds 30% threshold)
-        let binary_content: Vec<u8> = (0..100).map(|i| if i % 2 == 0 { 0x00 } else { b'A' }).collect();
+        let binary_content: Vec<u8> = (0..100)
+            .map(|i| if i % 2 == 0 { 0x00 } else { b'A' })
+            .collect();
         fs::write(&file_path, binary_content).unwrap();
 
         let walker = FileWalker::new(temp_dir.path(), 1024);
@@ -491,8 +497,7 @@ mod tests {
 
     #[test]
     fn test_matches_patterns_include_match() {
-        let walker =
-            FileWalker::new("/tmp", 1024).with_patterns(vec![".rs".to_string()], vec![]);
+        let walker = FileWalker::new("/tmp", 1024).with_patterns(vec![".rs".to_string()], vec![]);
         assert!(walker.matches_patterns(Path::new("/tmp/test.rs")));
         assert!(!walker.matches_patterns(Path::new("/tmp/test.txt")));
     }
@@ -516,8 +521,10 @@ mod tests {
 
     #[test]
     fn test_matches_patterns_exclude_multiple() {
-        let walker = FileWalker::new("/tmp", 1024)
-            .with_patterns(vec![], vec!["target".to_string(), "node_modules".to_string()]);
+        let walker = FileWalker::new("/tmp", 1024).with_patterns(
+            vec![],
+            vec!["target".to_string(), "node_modules".to_string()],
+        );
         assert!(walker.matches_patterns(Path::new("/tmp/src/main.rs")));
         assert!(!walker.matches_patterns(Path::new("/tmp/target/debug/main")));
         assert!(!walker.matches_patterns(Path::new("/tmp/node_modules/package.json")));
@@ -744,7 +751,7 @@ mod tests {
         let invalid_file = temp_dir.path().join("invalid.txt");
         fs::write(&valid_file, "valid UTF-8").unwrap();
         // Invalid UTF-8 sequence
-        fs::write(&invalid_file, &[0xFF, 0xFE, 0xFD]).unwrap();
+        fs::write(&invalid_file, [0xFF, 0xFE, 0xFD]).unwrap();
 
         let walker = FileWalker::new(temp_dir.path(), 1024);
         let files = walker.walk().unwrap();
@@ -768,7 +775,10 @@ mod tests {
         let files = walker.walk().unwrap();
 
         // Should find included.txt and .gitignore, but NOT ignored.txt (filtered by gitignore)
-        let filenames: Vec<_> = files.iter().map(|f| f.path.file_name().unwrap().to_str().unwrap()).collect();
+        let filenames: Vec<_> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_str().unwrap())
+            .collect();
         assert!(filenames.contains(&"included.txt"));
         assert!(!filenames.contains(&"ignored.txt"));
         assert!(filenames.contains(&".gitignore"));

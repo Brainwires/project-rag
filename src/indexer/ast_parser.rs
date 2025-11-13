@@ -71,7 +71,7 @@ impl AstParser {
     }
 
     /// Extract semantic units (functions, classes, methods) from the AST
-    fn extract_semantic_units(&self, node: Node, source_code: &str, result: &mut Vec<AstNode>) {
+    fn extract_semantic_units(&self, node: Node, _source_code: &str, result: &mut Vec<AstNode>) {
         // Define node types we want to chunk by language
         let target_kinds = match self.language_name.as_str() {
             "Rust" => vec![
@@ -178,7 +178,7 @@ impl AstParser {
         // Recursively process children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            self.extract_semantic_units(child, source_code, result);
+            self.extract_semantic_units(child, _source_code, result);
         }
     }
 
@@ -293,7 +293,7 @@ class MyClass {
         let nodes = parser.parse(source).unwrap();
 
         // Swift parser should extract function and class declarations
-        assert!(nodes.len() >= 1); // At least some declarations found
+        assert!(!nodes.is_empty()); // At least some declarations found
         // Check we can parse Swift without errors
         assert!(parser.language_name() == "Swift");
     }
@@ -320,7 +320,7 @@ struct Point {
         let mut parser = AstParser::new("c").unwrap();
         let nodes = parser.parse(source).unwrap();
 
-        assert!(nodes.len() >= 1);
+        assert!(!nodes.is_empty());
         assert!(parser.language_name() == "C");
     }
 
@@ -342,7 +342,7 @@ namespace MyNamespace {
         let mut parser = AstParser::new("cpp").unwrap();
         let nodes = parser.parse(source).unwrap();
 
-        assert!(nodes.len() >= 1);
+        assert!(!nodes.is_empty());
         assert!(parser.language_name() == "C++");
     }
 
@@ -365,7 +365,7 @@ class MyClass {
         let mut parser = AstParser::new("cs").unwrap();
         let nodes = parser.parse(source).unwrap();
 
-        assert!(nodes.len() >= 1);
+        assert!(!nodes.is_empty());
         assert!(parser.language_name() == "C#");
     }
 
@@ -390,7 +390,7 @@ end
         let mut parser = AstParser::new("rb").unwrap();
         let nodes = parser.parse(source).unwrap();
 
-        assert!(nodes.len() >= 1);
+        assert!(!nodes.is_empty());
         assert!(parser.language_name() == "Ruby");
     }
 
@@ -419,7 +419,7 @@ class MyClass {
         let mut parser = AstParser::new("php").unwrap();
         let nodes = parser.parse(source).unwrap();
 
-        assert!(nodes.len() >= 1);
+        assert!(!nodes.is_empty());
         assert!(parser.language_name() == "PHP");
     }
 }

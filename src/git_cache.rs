@@ -14,10 +14,7 @@ pub struct GitCache {
 impl GitCache {
     /// Get the default cache file path
     pub fn default_path() -> PathBuf {
-        dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from(".cache"))
-            .join("project-rag")
-            .join("git_cache.json")
+        crate::paths::PlatformPaths::default_git_cache_path()
     }
 
     /// Load cache from disk
@@ -80,7 +77,7 @@ impl GitCache {
     pub fn add_commits(&mut self, repo_path: String, commit_hashes: HashSet<String>) {
         self.repos
             .entry(repo_path)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .extend(commit_hashes);
     }
 

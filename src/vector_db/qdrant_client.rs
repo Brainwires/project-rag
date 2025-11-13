@@ -32,7 +32,12 @@ pub struct QdrantVectorDB {
 impl QdrantVectorDB {
     /// Create a new Qdrant client with default local configuration
     pub async fn new() -> Result<Self> {
-        Self::with_url("http://localhost:6334").await
+        Self::with_url(&Self::default_url()).await
+    }
+
+    /// Get default Qdrant URL (public for CLI version info)
+    pub fn default_url() -> String {
+        "http://localhost:6334".to_string()
     }
 
     /// Create a new Qdrant client with a custom URL

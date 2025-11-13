@@ -12,6 +12,7 @@ pub struct BM25Search {
     index: Index,
     id_field: Field,
     content_field: Field,
+    file_path_field: Field,
     /// Mutex to ensure only one IndexWriter is created at a time
     writer_lock: Mutex<()>,
 }
@@ -28,10 +29,11 @@ impl BM25Search {
     pub fn new<P: AsRef<Path>>(index_path: P) -> Result<Self> {
         let index_path = index_path.as_ref().to_path_buf();
 
-        // Create schema with ID and content fields
+        // Create schema with ID, content, and file_path fields
         let mut schema_builder = Schema::builder();
         let id_field = schema_builder.add_u64_field("id", STORED | INDEXED);
         let content_field = schema_builder.add_text_field("content", TEXT);
+        let file_path_field = schema_builder.add_text_field("file_path", STRING | STORED);
         let schema = schema_builder.build();
 
         // Create or open index
@@ -48,12 +50,16 @@ impl BM25Search {
             index,
             id_field,
             content_field,
+            file_path_field,
             writer_lock: Mutex::new(()),
         })
     }
 
     /// Add documents to the index
-    pub fn add_documents(&self, documents: Vec<(u64, String)>) -> Result<()> {
+    ///
+    /// Arguments:
+    /// * `documents` - Vec of (id, content, file_path) tuples
+    pub fn add_documents(&self, documents: Vec<(u64, String, String)>) -> Result<()> {
         // Lock to ensure only one writer at a time
         let _guard = self
             .writer_lock
@@ -65,10 +71,11 @@ impl BM25Search {
             .writer(50_000_000)
             .context("Failed to create index writer")?;
 
-        for (id, content) in documents {
+        for (id, content, file_path) in documents {
             let doc = doc!(
                 self.id_field => id,
                 self.content_field => content,
+                self.file_path_field => file_path,
             );
             index_writer
                 .add_document(doc)
@@ -110,10 +117,10 @@ impl BM25Search {
                 .doc(doc_address)
                 .context("Failed to retrieve document")?;
 
-            if let Some(id_value) = retrieved_doc.get_first(self.id_field) {
-                if let Some(id) = id_value.as_u64() {
-                    results.push(BM25Result { id, score });
-                }
+            if let Some(id_value) = retrieved_doc.get_first(self.id_field)
+                && let Some(id) = id_value.as_u64()
+            {
+                results.push(BM25Result { id, score });
             }
         }
 
@@ -139,6 +146,33 @@ impl BM25Search {
         index_writer.commit().context("Failed to commit deletion")?;
 
         Ok(())
+    }
+
+    /// Delete all documents with a specific file_path
+    ///
+    /// This is used for incremental updates when files are deleted or modified.
+    pub fn delete_by_file_path(&self, file_path: &str) -> Result<usize> {
+        // Lock to ensure only one writer at a time
+        let _guard = self
+            .writer_lock
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire writer lock: {}", e))?;
+
+        let mut index_writer: IndexWriter<TantivyDocument> = self
+            .index
+            .writer(50_000_000)
+            .context("Failed to create index writer")?;
+
+        let term = Term::from_field_text(self.file_path_field, file_path);
+        index_writer.delete_term(term);
+
+        index_writer
+            .commit()
+            .context("Failed to commit file_path deletion")?;
+
+        // Note: Tantivy doesn't return count of deleted documents
+        // Return 0 as placeholder
+        Ok(0)
     }
 
     /// Clear the entire index
@@ -229,11 +263,23 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let bm25 = BM25Search::new(temp_dir.path()).unwrap();
 
-        // Add test documents
+        // Add test documents with file_path
         let docs = vec![
-            (1, "authentication using JWT tokens".to_string()),
-            (2, "database connection pool management".to_string()),
-            (3, "user authentication and authorization".to_string()),
+            (
+                1,
+                "authentication using JWT tokens".to_string(),
+                "/src/auth.rs".to_string(),
+            ),
+            (
+                2,
+                "database connection pool management".to_string(),
+                "/src/db.rs".to_string(),
+            ),
+            (
+                3,
+                "user authentication and authorization".to_string(),
+                "/src/auth.rs".to_string(),
+            ),
         ];
         bm25.add_documents(docs).unwrap();
 
@@ -269,11 +315,15 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let bm25 = BM25Search::new(temp_dir.path()).unwrap();
 
-        // Add documents
+        // Add documents with file_path
         let docs = vec![
-            (1, "test document one".to_string()),
-            (2, "test document two".to_string()),
-            (3, "test document three".to_string()),
+            (1, "test document one".to_string(), "/test1.txt".to_string()),
+            (2, "test document two".to_string(), "/test2.txt".to_string()),
+            (
+                3,
+                "test document three".to_string(),
+                "/test3.txt".to_string(),
+            ),
         ];
         bm25.add_documents(docs).unwrap();
 
@@ -297,10 +347,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let bm25 = BM25Search::new(temp_dir.path()).unwrap();
 
-        // Add documents
+        // Add documents with file_path
         let docs = vec![
-            (1, "content one".to_string()),
-            (2, "content two".to_string()),
+            (1, "content one".to_string(), "/file1.txt".to_string()),
+            (2, "content two".to_string(), "/file2.txt".to_string()),
         ];
         bm25.add_documents(docs).unwrap();
 
@@ -325,11 +375,11 @@ mod tests {
         let stats = bm25.get_stats().unwrap();
         assert_eq!(stats.total_documents, 0);
 
-        // Add documents
+        // Add documents with file_path
         let docs = vec![
-            (1, "document one".to_string()),
-            (2, "document two".to_string()),
-            (3, "document three".to_string()),
+            (1, "document one".to_string(), "/doc1.txt".to_string()),
+            (2, "document two".to_string(), "/doc2.txt".to_string()),
+            (3, "document three".to_string(), "/doc3.txt".to_string()),
         ];
         bm25.add_documents(docs).unwrap();
 
@@ -343,12 +393,59 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let bm25 = BM25Search::new(temp_dir.path()).unwrap();
 
-        let docs = vec![(1, "test content".to_string())];
+        let docs = vec![(1, "test content".to_string(), "/test.txt".to_string())];
         bm25.add_documents(docs).unwrap();
 
         // Empty query should not crash
         let results = bm25.search("", 10);
         assert!(results.is_ok());
+    }
+
+    #[test]
+    fn test_bm25_delete_by_file_path() {
+        let temp_dir = tempdir().unwrap();
+        let bm25 = BM25Search::new(temp_dir.path()).unwrap();
+
+        // Add documents from different files
+        let docs = vec![
+            (
+                1,
+                "content in auth module".to_string(),
+                "/src/auth.rs".to_string(),
+            ),
+            (
+                2,
+                "more auth code here".to_string(),
+                "/src/auth.rs".to_string(),
+            ),
+            (
+                3,
+                "database connection code".to_string(),
+                "/src/db.rs".to_string(),
+            ),
+            (
+                4,
+                "final auth logic".to_string(),
+                "/src/auth.rs".to_string(),
+            ),
+        ];
+        bm25.add_documents(docs).unwrap();
+
+        // Search for "auth" - should find 3 documents
+        let results = bm25.search("auth", 10).unwrap();
+        assert_eq!(results.len(), 3);
+
+        // Delete all documents from /src/auth.rs
+        bm25.delete_by_file_path("/src/auth.rs").unwrap();
+
+        // Search again - should only find doc 3 (db.rs file)
+        let results = bm25.search("auth", 10).unwrap();
+        assert_eq!(results.len(), 0, "All auth documents should be deleted");
+
+        // Verify database document still exists
+        let results = bm25.search("database", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 3);
     }
 
     #[test]
