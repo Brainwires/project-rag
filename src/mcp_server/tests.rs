@@ -19,7 +19,9 @@ async fn test_get_info() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("db").to_string_lossy().to_string();
     let cache_path = temp_dir.path().join("cache.json");
-    let server = RagMcpServer::new_with_db_path(&db_path, cache_path).await.unwrap();
+    let server = RagMcpServer::new_with_db_path(&db_path, cache_path)
+        .await
+        .unwrap();
 
     let info = server.get_info();
 
@@ -61,7 +63,9 @@ async fn test_do_index_empty_directory() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("db").to_string_lossy().to_string();
     let cache_path = temp_dir.path().join("cache.json");
-    let server = RagMcpServer::new_with_db_path(&db_path, cache_path).await.unwrap();
+    let server = RagMcpServer::new_with_db_path(&db_path, cache_path)
+        .await
+        .unwrap();
 
     let data_dir = temp_dir.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
@@ -90,7 +94,9 @@ async fn test_do_index_with_files() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("db").to_string_lossy().to_string();
     let cache_path = temp_dir.path().join("cache.json");
-    let server = RagMcpServer::new_with_db_path(&db_path, cache_path).await.unwrap();
+    let server = RagMcpServer::new_with_db_path(&db_path, cache_path)
+        .await
+        .unwrap();
 
     let data_dir = temp_dir.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
@@ -124,7 +130,9 @@ async fn test_do_index_with_exclude_patterns() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("db").to_string_lossy().to_string();
     let cache_path = temp_dir.path().join("cache.json");
-    let server = RagMcpServer::new_with_db_path(&db_path, cache_path).await.unwrap();
+    let server = RagMcpServer::new_with_db_path(&db_path, cache_path)
+        .await
+        .unwrap();
 
     let data_dir = temp_dir.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
@@ -155,7 +163,9 @@ async fn test_do_incremental_update_no_cache() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("db").to_string_lossy().to_string();
     let cache_path = temp_dir.path().join("cache.json");
-    let server = RagMcpServer::new_with_db_path(&db_path, cache_path).await.unwrap();
+    let server = RagMcpServer::new_with_db_path(&db_path, cache_path)
+        .await
+        .unwrap();
 
     let data_dir = temp_dir.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
@@ -185,7 +195,9 @@ async fn test_do_index_smart_new_codebase() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("db").to_string_lossy().to_string();
     let cache_path = temp_dir.path().join("cache.json");
-    let server = RagMcpServer::new_with_db_path(&db_path, cache_path).await.unwrap();
+    let server = RagMcpServer::new_with_db_path(&db_path, cache_path)
+        .await
+        .unwrap();
 
     let data_dir = temp_dir.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
@@ -215,7 +227,9 @@ async fn test_server_cloneable() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("db").to_string_lossy().to_string();
     let cache_path = temp_dir.path().join("cache.json");
-    let server = RagMcpServer::new_with_db_path(&db_path, cache_path).await.unwrap();
+    let server = RagMcpServer::new_with_db_path(&db_path, cache_path)
+        .await
+        .unwrap();
 
     let _cloned = server.clone();
     // Should compile and run without errors

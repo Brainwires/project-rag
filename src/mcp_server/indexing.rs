@@ -5,12 +5,13 @@ use crate::types::{ChunkMetadata, IndexResponse};
 use crate::vector_db::VectorDatabase;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use rmcp::{Peer, RoleServer, model::ProgressToken, model::ProgressNotificationParam};
+use rmcp::{Peer, RoleServer, model::ProgressNotificationParam, model::ProgressToken};
 use std::collections::HashMap;
 use std::time::Instant;
 
 impl RagMcpServer {
     /// Index a complete codebase
+    #[allow(clippy::too_many_arguments)]
     pub async fn do_index(
         &self,
         path: String,
@@ -100,7 +101,7 @@ impl RagMcpServer {
         let batch_size = self.config.embedding.batch_size;
         let timeout_secs = self.config.embedding.timeout_secs;
         let mut all_embeddings = Vec::with_capacity(all_chunks.len());
-        let total_batches = (all_chunks.len() + batch_size - 1) / batch_size;
+        let total_batches = all_chunks.len().div_ceil(batch_size);
 
         for (batch_idx, chunk_batch) in all_chunks.chunks(batch_size).enumerate() {
             let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
@@ -243,6 +244,7 @@ impl RagMcpServer {
     }
 
     /// Perform incremental update (only changed files)
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn do_incremental_update(
         &self,
         path: String,
@@ -398,7 +400,7 @@ impl RagMcpServer {
             // Generate embeddings in batches (using config values)
             let batch_size = self.config.embedding.batch_size;
             let mut all_embeddings = Vec::with_capacity(all_chunks.len());
-            let total_batches = (all_chunks.len() + batch_size - 1) / batch_size;
+            let total_batches = all_chunks.len().div_ceil(batch_size);
 
             for (batch_idx, chunk_batch) in all_chunks.chunks(batch_size).enumerate() {
                 let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
@@ -520,6 +522,7 @@ impl RagMcpServer {
     }
 
     /// Smart index that automatically chooses between full and incremental based on existing cache
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn do_index_smart(
         &self,
         path: String,

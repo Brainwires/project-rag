@@ -15,10 +15,12 @@ fn main() {
     println!("✓ Found {} recent commits\n", commits.len());
 
     for (i, commit) in commits.iter().enumerate() {
-        println!("{}. {} - {}",
-                 i + 1,
-                 &commit.hash[..8],
-                 commit.message.lines().next().unwrap_or("(no message)"));
+        println!(
+            "{}. {} - {}",
+            i + 1,
+            &commit.hash[..8],
+            commit.message.lines().next().unwrap_or("(no message)")
+        );
         println!("   Author: {}", commit.author_name);
         println!("   Files: {}\n", commit.files_changed.len());
     }

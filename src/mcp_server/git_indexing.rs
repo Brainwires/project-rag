@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use chrono::DateTime;
 use regex::Regex;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -17,7 +17,7 @@ pub async fn do_search_git_history<E, V>(
     embedding_provider: Arc<E>,
     vector_db: Arc<V>,
     git_cache: Arc<RwLock<GitCache>>,
-    cache_path: &PathBuf,
+    cache_path: &Path,
     req: SearchGitHistoryRequest,
 ) -> Result<SearchGitHistoryResponse>
 where
@@ -50,15 +50,9 @@ where
     tracing::info!("Discovered git repository at: {}", repo_path);
 
     // Parse date filters if provided
-    let since_timestamp = req
-        .since
-        .as_ref()
-        .and_then(|s| parse_date_filter(s).ok());
+    let since_timestamp = req.since.as_ref().and_then(|s| parse_date_filter(s).ok());
 
-    let until_timestamp = req
-        .until
-        .as_ref()
-        .and_then(|s| parse_date_filter(s).ok());
+    let until_timestamp = req.until.as_ref().and_then(|s| parse_date_filter(s).ok());
 
     // Determine which commits to index (on-demand strategy)
     let mut git_cache_guard = git_cache.write().await;
@@ -87,7 +81,15 @@ where
         let commits = tokio::task::spawn_blocking({
             let branch = req.branch.clone();
             let max = Some(req.max_commits); // Walk up to max_commits
-            move || walker.iter_commits(branch.as_deref(), max, since_timestamp, until_timestamp, &cached_commits)
+            move || {
+                walker.iter_commits(
+                    branch.as_deref(),
+                    max,
+                    since_timestamp,
+                    until_timestamp,
+                    &cached_commits,
+                )
+            }
         })
         .await
         .context("Failed to spawn blocking task for commit iteration")??;
@@ -154,10 +156,10 @@ where
             req.limit * 2, // Get more results for post-filtering
             req.min_score,
             req.project.clone(),
-            true, // hybrid search
-            vec![], // no extension filter
+            true,                           // hybrid search
+            vec![],                         // no extension filter
             vec!["git-commit".to_string()], // filter by git-commit language
-            vec![], // no path pattern
+            vec![],                         // no path pattern
         )
         .await
         .context("Failed to search vector database")?;
@@ -184,14 +186,18 @@ where
         }
 
         // Extract commit hash from file_hash field
-        let commit_hash = result.file_path.split('/').last().unwrap_or(&result.file_path);
+        let commit_hash = result
+            .file_path
+            .split('/')
+            .next_back()
+            .unwrap_or(&result.file_path);
 
         // Parse content to extract commit details
         // Content format: "Commit Message:\n{message}\n\nAuthor: {name} <{email}>\n\nFiles Changed:\n..."
         let parts: Vec<&str> = result.content.splitn(5, "\n\n").collect();
 
         let commit_message = parts
-            .get(0)
+            .first()
             .and_then(|s| s.strip_prefix("Commit Message:\n"))
             .unwrap_or("")
             .to_string();
@@ -304,12 +310,12 @@ fn parse_date_filter(date_str: &str) -> Result<i64> {
 fn parse_author_line(line: &str) -> (String, String) {
     let author_part = line.strip_prefix("Author: ").unwrap_or(line);
 
-    if let Some(email_start) = author_part.find('<') {
-        if let Some(email_end) = author_part.find('>') {
-            let name = author_part[..email_start].trim().to_string();
-            let email = author_part[email_start + 1..email_end].to_string();
-            return (name, email);
-        }
+    if let Some(email_start) = author_part.find('<')
+        && let Some(email_end) = author_part.find('>')
+    {
+        let name = author_part[..email_start].trim().to_string();
+        let email = author_part[email_start + 1..email_end].to_string();
+        return (name, email);
     }
 
     (author_part.trim().to_string(), String::new())

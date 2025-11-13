@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Main configuration structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     /// Vector database configuration
     pub vector_db: VectorDbConfig,
@@ -179,18 +179,6 @@ fn default_git_cache_path() -> PathBuf {
     crate::paths::PlatformPaths::default_git_cache_path()
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            vector_db: VectorDbConfig::default(),
-            embedding: EmbeddingConfig::default(),
-            indexing: IndexingConfig::default(),
-            search: SearchConfig::default(),
-            cache: CacheConfig::default(),
-        }
-    }
-}
-
 impl Default for VectorDbConfig {
     fn default() -> Self {
         Self {
@@ -249,9 +237,8 @@ impl Config {
             return Err(ConfigError::FileNotFound(path.display().to_string()).into());
         }
 
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            ConfigError::LoadFailed(format!("Failed to read config file: {}", e))
-        })?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::LoadFailed(format!("Failed to read config file: {}", e)))?;
 
         let config: Config = toml::from_str(&content)
             .map_err(|e| ConfigError::ParseFailed(format!("Invalid TOML: {}", e)))?;
@@ -285,9 +272,8 @@ impl Config {
         let content = toml::to_string_pretty(self)
             .map_err(|e| ConfigError::SaveFailed(format!("Failed to serialize config: {}", e)))?;
 
-        std::fs::write(path, content).map_err(|e| {
-            ConfigError::SaveFailed(format!("Failed to write config file: {}", e))
-        })?;
+        std::fs::write(path, content)
+            .map_err(|e| ConfigError::SaveFailed(format!("Failed to write config file: {}", e)))?;
 
         tracing::info!("Saved config to: {}", path.display());
         Ok(())
@@ -344,10 +330,7 @@ impl Config {
         if !(0.0..=1.0).contains(&self.search.min_score) {
             return Err(ConfigError::InvalidValue {
                 key: "search.min_score".to_string(),
-                reason: format!(
-                    "must be between 0.0 and 1.0, got {}",
-                    self.search.min_score
-                ),
+                reason: format!("must be between 0.0 and 1.0, got {}", self.search.min_score),
             }
             .into());
         }
@@ -387,17 +370,17 @@ impl Config {
         }
 
         // Batch size
-        if let Ok(batch_size) = std::env::var("PROJECT_RAG_BATCH_SIZE") {
-            if let Ok(size) = batch_size.parse() {
-                self.embedding.batch_size = size;
-            }
+        if let Ok(batch_size) = std::env::var("PROJECT_RAG_BATCH_SIZE")
+            && let Ok(size) = batch_size.parse()
+        {
+            self.embedding.batch_size = size;
         }
 
         // Min score
-        if let Ok(min_score) = std::env::var("PROJECT_RAG_MIN_SCORE") {
-            if let Ok(score) = min_score.parse() {
-                self.search.min_score = score;
-            }
+        if let Ok(min_score) = std::env::var("PROJECT_RAG_MIN_SCORE")
+            && let Ok(score) = min_score.parse()
+        {
+            self.search.min_score = score;
         }
     }
 
@@ -519,12 +502,24 @@ mod tests {
     #[test]
     fn test_default_exclude_patterns() {
         let config = Config::default();
-        assert!(config.indexing.exclude_patterns.contains(&"target".to_string()));
-        assert!(config
-            .indexing
-            .exclude_patterns
-            .contains(&"node_modules".to_string()));
-        assert!(config.indexing.exclude_patterns.contains(&".git".to_string()));
+        assert!(
+            config
+                .indexing
+                .exclude_patterns
+                .contains(&"target".to_string())
+        );
+        assert!(
+            config
+                .indexing
+                .exclude_patterns
+                .contains(&"node_modules".to_string())
+        );
+        assert!(
+            config
+                .indexing
+                .exclude_patterns
+                .contains(&".git".to_string())
+        );
     }
 
     #[test]

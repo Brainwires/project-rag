@@ -72,10 +72,7 @@ async fn test_full_indexing_workflow() -> Result<()> {
     // Create a simple test file
     let src_dir = codebase_dir.path().join("src");
     std::fs::create_dir_all(&src_dir)?;
-    std::fs::write(
-        src_dir.join("test.rs"),
-        "fn main() { println!(\"test\"); }",
-    )?;
+    std::fs::write(src_dir.join("test.rs"), "fn main() { println!(\"test\"); }")?;
 
     // Create server
     let mut config = Config::default();

@@ -77,7 +77,7 @@ impl GitCache {
     pub fn add_commits(&mut self, repo_path: String, commit_hashes: HashSet<String>) {
         self.repos
             .entry(repo_path)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .extend(commit_hashes);
     }
 

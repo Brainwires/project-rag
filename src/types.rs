@@ -348,7 +348,12 @@ impl IndexRequest {
             .map_err(|e| format!("Failed to canonicalize path: {}", e))?;
 
         // Check that path doesn't try to escape (basic security check)
-        if !canonical.starts_with(std::env::current_dir().unwrap_or_default().parent().unwrap_or(std::path::Path::new("/"))) {
+        if !canonical.starts_with(
+            std::env::current_dir()
+                .unwrap_or_default()
+                .parent()
+                .unwrap_or(std::path::Path::new("/")),
+        ) {
             // Allow any absolute path, this check is just to catch obvious traversal attempts
         }
 
@@ -443,7 +448,10 @@ impl AdvancedSearchRequest {
                 return Err("file extension cannot be empty".to_string());
             }
             if ext.len() > 20 {
-                return Err(format!("file extension too long: {} (max 20 characters)", ext));
+                return Err(format!(
+                    "file extension too long: {} (max 20 characters)",
+                    ext
+                ));
             }
         }
 
@@ -453,7 +461,10 @@ impl AdvancedSearchRequest {
                 return Err("language name cannot be empty".to_string());
             }
             if lang.len() > 50 {
-                return Err(format!("language name too long: {} (max 50 characters)", lang));
+                return Err(format!(
+                    "language name too long: {} (max 50 characters)",
+                    lang
+                ));
             }
         }
 

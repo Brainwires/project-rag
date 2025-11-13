@@ -295,7 +295,10 @@ mod tests {
     #[test]
     fn test_error_display() {
         let err = RagError::Validation(ValidationError::PathNotFound("/test".to_string()));
-        assert_eq!(err.to_string(), "Validation error: Path does not exist: /test");
+        assert_eq!(
+            err.to_string(),
+            "Validation error: Path does not exist: /test"
+        );
     }
 
     #[test]
@@ -317,10 +320,7 @@ mod tests {
         let user_err = RagError::Validation(ValidationError::InvalidPath("test".to_string()));
         assert!(user_err.is_user_error());
 
-        let system_err = RagError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "test",
-        ));
+        let system_err = RagError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "test"));
         assert!(!system_err.is_user_error());
     }
 

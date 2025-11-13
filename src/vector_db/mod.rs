@@ -37,6 +37,7 @@ pub trait VectorDatabase: Send + Sync {
     ) -> Result<Vec<SearchResult>>;
 
     /// Search with filters
+    #[allow(clippy::too_many_arguments)]
     async fn search_filtered(
         &self,
         query_vector: Vec<f32>,

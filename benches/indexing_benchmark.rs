@@ -1,8 +1,7 @@
 /// Benchmarks for indexing and search performance
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use project_rag::config::Config;
 use project_rag::mcp_server::RagMcpServer;
-use std::path::PathBuf;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
@@ -83,16 +82,14 @@ fn benchmark_indexing(c: &mut Criterion) {
 
                         let mut config = Config::default();
                         config.vector_db.lancedb_path = db_dir.path().to_path_buf();
-                        config.cache.hash_cache_path =
-                            cache_dir.path().join("hash_cache.json");
+                        config.cache.hash_cache_path = cache_dir.path().join("hash_cache.json");
                         config.cache.git_cache_path = cache_dir.path().join("git_cache.json");
 
                         let server = RagMcpServer::with_config(config).await.unwrap();
 
-                        let normalized_path = RagMcpServer::normalize_path(
-                            &codebase_dir.path().to_string_lossy(),
-                        )
-                        .unwrap();
+                        let normalized_path =
+                            RagMcpServer::normalize_path(&codebase_dir.path().to_string_lossy())
+                                .unwrap();
 
                         server
                             .do_index(
@@ -115,75 +112,6 @@ fn benchmark_indexing(c: &mut Criterion) {
     group.finish();
 }
 
-fn benchmark_search(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-
-    // Set up test data once
-    let (server, _temp_dirs) = rt.block_on(async {
-        let codebase_dir = TempDir::new().unwrap();
-        let db_dir = TempDir::new().unwrap();
-        let cache_dir = TempDir::new().unwrap();
-
-        create_test_files(&codebase_dir, 50).unwrap();
-
-        let mut config = Config::default();
-        config.vector_db.lancedb_path = db_dir.path().to_path_buf();
-        config.cache.hash_cache_path = cache_dir.path().join("hash_cache.json");
-        config.cache.git_cache_path = cache_dir.path().join("git_cache.json");
-
-        let server = RagMcpServer::with_config(config).await.unwrap();
-
-        let normalized_path =
-            RagMcpServer::normalize_path(&codebase_dir.path().to_string_lossy()).unwrap();
-
-        server
-            .do_index(normalized_path, None, vec![], vec![], 1_048_576, None, None)
-            .await
-            .unwrap();
-
-        // Return server and temp dirs to keep them alive
-        (server, (codebase_dir, db_dir, cache_dir))
-    });
-
-    let mut group = c.benchmark_group("search");
-
-    group.bench_function("vector_search", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                server
-                    .do_query(
-                        black_box("function implementation".to_string()),
-                        10,
-                        0.7,
-                        None,
-                        false, // Pure vector search
-                    )
-                    .await
-                    .unwrap()
-            })
-        });
-    });
-
-    group.bench_function("hybrid_search", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                server
-                    .do_query(
-                        black_box("function implementation".to_string()),
-                        10,
-                        0.7,
-                        None,
-                        true, // Hybrid search (vector + BM25)
-                    )
-                    .await
-                    .unwrap()
-            })
-        });
-    });
-
-    group.finish();
-}
-
 fn benchmark_chunking(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("chunking");
@@ -198,11 +126,8 @@ fn benchmark_chunking(c: &mut Criterion) {
                         let codebase_dir = TempDir::new().unwrap();
                         create_test_files(&codebase_dir, count).unwrap();
 
-                        let config = Config::default();
-                        let server = RagMcpServer::with_config(config).await.unwrap();
-
                         let walker = project_rag::indexer::FileWalker::new(
-                            &codebase_dir.path().to_string_lossy(),
+                            codebase_dir.path().to_string_lossy().to_string(),
                             1_048_576,
                         );
 
@@ -210,9 +135,10 @@ fn benchmark_chunking(c: &mut Criterion) {
 
                         // Benchmark parallel chunking
                         use rayon::prelude::*;
+                        let chunker = project_rag::indexer::CodeChunker::default_strategy();
                         let _chunks: Vec<_> = files
                             .par_iter()
-                            .flat_map(|file| server.chunker.chunk_file(black_box(file)))
+                            .flat_map(|file| chunker.chunk_file(black_box(file)))
                             .collect();
                     })
                 });
@@ -223,10 +149,5 @@ fn benchmark_chunking(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    benchmark_indexing,
-    benchmark_search,
-    benchmark_chunking
-);
+criterion_group!(benches, benchmark_indexing, benchmark_chunking);
 criterion_main!(benches);

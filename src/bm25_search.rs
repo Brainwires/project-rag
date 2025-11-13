@@ -117,10 +117,10 @@ impl BM25Search {
                 .doc(doc_address)
                 .context("Failed to retrieve document")?;
 
-            if let Some(id_value) = retrieved_doc.get_first(self.id_field) {
-                if let Some(id) = id_value.as_u64() {
-                    results.push(BM25Result { id, score });
-                }
+            if let Some(id_value) = retrieved_doc.get_first(self.id_field)
+                && let Some(id) = id_value.as_u64()
+            {
+                results.push(BM25Result { id, score });
             }
         }
 
@@ -265,9 +265,21 @@ mod tests {
 
         // Add test documents with file_path
         let docs = vec![
-            (1, "authentication using JWT tokens".to_string(), "/src/auth.rs".to_string()),
-            (2, "database connection pool management".to_string(), "/src/db.rs".to_string()),
-            (3, "user authentication and authorization".to_string(), "/src/auth.rs".to_string()),
+            (
+                1,
+                "authentication using JWT tokens".to_string(),
+                "/src/auth.rs".to_string(),
+            ),
+            (
+                2,
+                "database connection pool management".to_string(),
+                "/src/db.rs".to_string(),
+            ),
+            (
+                3,
+                "user authentication and authorization".to_string(),
+                "/src/auth.rs".to_string(),
+            ),
         ];
         bm25.add_documents(docs).unwrap();
 
@@ -307,7 +319,11 @@ mod tests {
         let docs = vec![
             (1, "test document one".to_string(), "/test1.txt".to_string()),
             (2, "test document two".to_string(), "/test2.txt".to_string()),
-            (3, "test document three".to_string(), "/test3.txt".to_string()),
+            (
+                3,
+                "test document three".to_string(),
+                "/test3.txt".to_string(),
+            ),
         ];
         bm25.add_documents(docs).unwrap();
 
@@ -392,10 +408,26 @@ mod tests {
 
         // Add documents from different files
         let docs = vec![
-            (1, "content in auth module".to_string(), "/src/auth.rs".to_string()),
-            (2, "more auth code here".to_string(), "/src/auth.rs".to_string()),
-            (3, "database connection code".to_string(), "/src/db.rs".to_string()),
-            (4, "final auth logic".to_string(), "/src/auth.rs".to_string()),
+            (
+                1,
+                "content in auth module".to_string(),
+                "/src/auth.rs".to_string(),
+            ),
+            (
+                2,
+                "more auth code here".to_string(),
+                "/src/auth.rs".to_string(),
+            ),
+            (
+                3,
+                "database connection code".to_string(),
+                "/src/db.rs".to_string(),
+            ),
+            (
+                4,
+                "final auth logic".to_string(),
+                "/src/auth.rs".to_string(),
+            ),
         ];
         bm25.add_documents(docs).unwrap();
 

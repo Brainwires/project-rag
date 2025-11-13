@@ -80,7 +80,9 @@ impl EmbeddingProvider for FastEmbedManager {
         // Generate embeddings using the mutable reference
         // Note: For timeout protection, wrap calls to this method in tokio::time::timeout
         // at the async call site (e.g., in mcp_server/indexing.rs)
-        let embeddings = model.embed(texts, None).context("Failed to generate embeddings")?;
+        let embeddings = model
+            .embed(texts, None)
+            .context("Failed to generate embeddings")?;
 
         Ok(embeddings)
     }
