@@ -182,6 +182,9 @@ impl RagMcpServer {
         peer: Peer<RoleServer>,
         Parameters(req): Parameters<IndexRequest>,
     ) -> Result<String, String> {
+        // Validate request inputs
+        req.validate()?;
+
         // Get progress token if provided
         let progress_token = meta.get_progress_token();
 
@@ -206,6 +209,9 @@ impl RagMcpServer {
         &self,
         Parameters(req): Parameters<QueryRequest>,
     ) -> Result<String, String> {
+        // Validate request inputs
+        req.validate()?;
+
         let start = Instant::now();
 
         // Generate query embedding
@@ -418,6 +424,9 @@ impl RagMcpServer {
         &self,
         Parameters(req): Parameters<AdvancedSearchRequest>,
     ) -> Result<String, String> {
+        // Validate request inputs
+        req.validate()?;
+
         let start = Instant::now();
 
         // Generate query embedding
@@ -510,6 +519,9 @@ impl RagMcpServer {
         &self,
         Parameters(req): Parameters<SearchGitHistoryRequest>,
     ) -> Result<String, String> {
+        // Validate request inputs
+        req.validate()?;
+
         let response = git_indexing::do_search_git_history(
             self.embedding_provider.clone(),
             self.vector_db.clone(),

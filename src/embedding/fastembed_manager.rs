@@ -1,10 +1,13 @@
 use super::EmbeddingProvider;
 use anyhow::{Context, Result};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use std::sync::RwLock;
 
 /// FastEmbed-based embedding provider using all-MiniLM-L6-v2
+///
+/// Uses RwLock for safe interior mutability since fastembed's embed() requires &mut self.
 pub struct FastEmbedManager {
-    model: TextEmbedding,
+    model: RwLock<TextEmbedding>,
     dimension: usize,
 }
 
@@ -35,7 +38,7 @@ impl FastEmbedManager {
             TextEmbedding::try_new(options).context("Failed to initialize FastEmbed model")?;
 
         Ok(Self {
-            model: embedding_model,
+            model: RwLock::new(embedding_model),
             dimension,
         })
     }
@@ -49,12 +52,17 @@ impl EmbeddingProvider for FastEmbedManager {
 
         tracing::debug!("Generating embeddings for {} texts", texts.len());
 
-        // Note: fastembed's embed method requires &mut self, but we work around this
-        // by using unsafe to get a mutable reference. This is safe because TextEmbedding
-        // is Send + Sync and the method is internally synchronized.
-        let model_ptr = &self.model as *const TextEmbedding as *mut TextEmbedding;
-        let embeddings =
-            unsafe { (*model_ptr).embed(texts, None) }.context("Failed to generate embeddings")?;
+        // Acquire write lock safely. If the lock is poisoned (due to a panic while holding
+        // the lock), we recover by taking ownership of the inner value.
+        let mut model = self.model.write().unwrap_or_else(|poisoned| {
+            tracing::warn!("FastEmbed model lock was poisoned, recovering...");
+            poisoned.into_inner()
+        });
+
+        // Generate embeddings using the mutable reference
+        // Note: For timeout protection, wrap calls to this method in tokio::time::timeout
+        // at the async call site (e.g., in mcp_server/indexing.rs)
+        let embeddings = model.embed(texts, None).context("Failed to generate embeddings")?;
 
         Ok(embeddings)
     }

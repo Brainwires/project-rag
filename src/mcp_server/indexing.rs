@@ -102,10 +102,22 @@ impl RagMcpServer {
         for (batch_idx, chunk_batch) in all_chunks.chunks(batch_size).enumerate() {
             let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
 
-            match self.embedding_provider.embed_batch(texts) {
-                Ok(embeddings) => all_embeddings.extend(embeddings),
-                Err(e) => {
+            // Generate embeddings with timeout protection (30 seconds)
+            let provider = self.embedding_provider.clone();
+            let embed_future = tokio::task::spawn_blocking(move || provider.embed_batch(texts));
+
+            match tokio::time::timeout(std::time::Duration::from_secs(30), embed_future).await {
+                Ok(Ok(Ok(embeddings))) => all_embeddings.extend(embeddings),
+                Ok(Ok(Err(e))) => {
                     errors.push(format!("Failed to generate embeddings: {}", e));
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    errors.push(format!("Embedding task panicked: {}", e));
+                    continue;
+                }
+                Err(_) => {
+                    errors.push("Embedding generation timed out after 30 seconds".to_string());
                     continue;
                 }
             }

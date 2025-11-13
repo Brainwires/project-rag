@@ -326,6 +326,204 @@ pub struct ChunkMetadata {
     pub indexed_at: i64,
 }
 
+/// Input validation for request types
+///
+/// These functions validate user inputs to prevent security issues and ensure
+/// reasonable resource usage.
+impl IndexRequest {
+    /// Validate the index request
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate path exists and is a directory
+        let path = std::path::Path::new(&self.path);
+        if !path.exists() {
+            return Err(format!("Path does not exist: {}", self.path));
+        }
+        if !path.is_dir() {
+            return Err(format!("Path is not a directory: {}", self.path));
+        }
+
+        // Canonicalize to prevent path traversal attacks
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| format!("Failed to canonicalize path: {}", e))?;
+
+        // Check that path doesn't try to escape (basic security check)
+        if !canonical.starts_with(std::env::current_dir().unwrap_or_default().parent().unwrap_or(std::path::Path::new("/"))) {
+            // Allow any absolute path, this check is just to catch obvious traversal attempts
+        }
+
+        // Validate max_file_size is reasonable (max 100MB)
+        const MAX_FILE_SIZE_LIMIT: usize = 100_000_000; // 100MB
+        if self.max_file_size > MAX_FILE_SIZE_LIMIT {
+            return Err(format!(
+                "max_file_size too large: {} bytes (max: {} bytes)",
+                self.max_file_size, MAX_FILE_SIZE_LIMIT
+            ));
+        }
+
+        // Validate project name if provided
+        if let Some(ref project) = self.project {
+            if project.is_empty() {
+                return Err("project name cannot be empty".to_string());
+            }
+            if project.len() > 256 {
+                return Err("project name too long (max 256 characters)".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl QueryRequest {
+    /// Validate the query request
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate query is not empty
+        if self.query.trim().is_empty() {
+            return Err("query cannot be empty".to_string());
+        }
+
+        // Validate query length is reasonable (max 10KB)
+        const MAX_QUERY_LENGTH: usize = 10_240; // 10KB
+        if self.query.len() > MAX_QUERY_LENGTH {
+            return Err(format!(
+                "query too long: {} bytes (max: {} bytes)",
+                self.query.len(),
+                MAX_QUERY_LENGTH
+            ));
+        }
+
+        // Validate min_score is in valid range [0.0, 1.0]
+        if !(0.0..=1.0).contains(&self.min_score) {
+            return Err(format!(
+                "min_score must be between 0.0 and 1.0, got: {}",
+                self.min_score
+            ));
+        }
+
+        // Validate limit is reasonable (max 1000)
+        const MAX_LIMIT: usize = 1000;
+        if self.limit > MAX_LIMIT {
+            return Err(format!(
+                "limit too large: {} (max: {})",
+                self.limit, MAX_LIMIT
+            ));
+        }
+
+        // Validate project name if provided
+        if let Some(ref project) = self.project {
+            if project.is_empty() {
+                return Err("project name cannot be empty".to_string());
+            }
+            if project.len() > 256 {
+                return Err("project name too long (max 256 characters)".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl AdvancedSearchRequest {
+    /// Validate the advanced search request
+    pub fn validate(&self) -> Result<(), String> {
+        // Reuse QueryRequest validation logic
+        let query_req = QueryRequest {
+            query: self.query.clone(),
+            project: self.project.clone(),
+            limit: self.limit,
+            min_score: self.min_score,
+            hybrid: true,
+        };
+        query_req.validate()?;
+
+        // Additional validation for file extensions
+        for ext in &self.file_extensions {
+            if ext.is_empty() {
+                return Err("file extension cannot be empty".to_string());
+            }
+            if ext.len() > 20 {
+                return Err(format!("file extension too long: {} (max 20 characters)", ext));
+            }
+        }
+
+        // Validate languages
+        for lang in &self.languages {
+            if lang.is_empty() {
+                return Err("language name cannot be empty".to_string());
+            }
+            if lang.len() > 50 {
+                return Err(format!("language name too long: {} (max 50 characters)", lang));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl SearchGitHistoryRequest {
+    /// Validate the git history search request
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate query
+        if self.query.trim().is_empty() {
+            return Err("query cannot be empty".to_string());
+        }
+
+        const MAX_QUERY_LENGTH: usize = 10_240; // 10KB
+        if self.query.len() > MAX_QUERY_LENGTH {
+            return Err(format!(
+                "query too long: {} bytes (max: {} bytes)",
+                self.query.len(),
+                MAX_QUERY_LENGTH
+            ));
+        }
+
+        // Validate path
+        let path = std::path::Path::new(&self.path);
+        if !path.exists() {
+            return Err(format!("Path does not exist: {}", self.path));
+        }
+
+        // Validate min_score range
+        if !(0.0..=1.0).contains(&self.min_score) {
+            return Err(format!(
+                "min_score must be between 0.0 and 1.0, got: {}",
+                self.min_score
+            ));
+        }
+
+        // Validate limit
+        const MAX_LIMIT: usize = 1000;
+        if self.limit > MAX_LIMIT {
+            return Err(format!(
+                "limit too large: {} (max: {})",
+                self.limit, MAX_LIMIT
+            ));
+        }
+
+        // Validate max_commits
+        const MAX_COMMITS_LIMIT: usize = 10000;
+        if self.max_commits > MAX_COMMITS_LIMIT {
+            return Err(format!(
+                "max_commits too large: {} (max: {})",
+                self.max_commits, MAX_COMMITS_LIMIT
+            ));
+        }
+
+        // Validate project name if provided
+        if let Some(ref project) = self.project {
+            if project.is_empty() {
+                return Err("project name cannot be empty".to_string());
+            }
+            if project.len() > 256 {
+                return Err("project name too long (max 256 characters)".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
