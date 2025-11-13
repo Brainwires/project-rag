@@ -148,7 +148,7 @@ impl RagMcpServer {
     }
 
     /// Normalize a path to a canonical absolute form for consistent cache lookups
-    fn normalize_path(path: &str) -> Result<String> {
+    pub fn normalize_path(path: &str) -> Result<String> {
         let path_buf = PathBuf::from(path);
         let canonical = std::fs::canonicalize(&path_buf)
             .with_context(|| format!("Failed to canonicalize path: {}", path))?;

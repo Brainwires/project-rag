@@ -11,7 +11,7 @@ use std::time::Instant;
 
 impl RagMcpServer {
     /// Index a complete codebase
-    pub(super) async fn do_index(
+    pub async fn do_index(
         &self,
         path: String,
         project: Option<String>,

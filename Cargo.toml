@@ -50,6 +50,7 @@ rayon = "1.10"
 
 [dev-dependencies]
 tempfile = "3.0"
+criterion = { version = "0.5", features = ["async_tokio"] }
 
 [build-dependencies]
 chrono = "0.4"
@@ -66,3 +67,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "project-rag"
 path = "src/main.rs"
+
+[[bench]]
+name = "indexing_benchmark"
+harness = false
