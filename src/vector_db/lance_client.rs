@@ -27,7 +27,7 @@ pub struct LanceVectorDB {
 impl LanceVectorDB {
     /// Create a new LanceDB instance with default path
     pub async fn new() -> Result<Self> {
-        let db_path = Self::default_path();
+        let db_path = Self::default_lancedb_path();
         Self::with_path(&db_path).await
     }
 
@@ -52,26 +52,11 @@ impl LanceVectorDB {
         })
     }
 
-    /// Get default database path
-    fn default_path() -> String {
-        let data_dir = if cfg!(target_os = "windows") {
-            std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string())
-        } else if cfg!(target_os = "macos") {
-            format!(
-                "{}/Library/Application Support",
-                std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
-            )
-        } else {
-            // Linux/Unix
-            std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-                format!(
-                    "{}/.local/share",
-                    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
-                )
-            })
-        };
-
-        format!("{}/project-rag/lancedb", data_dir)
+    /// Get default database path (public for CLI version info)
+    pub fn default_lancedb_path() -> String {
+        crate::paths::PlatformPaths::default_lancedb_path()
+            .to_string_lossy()
+            .to_string()
     }
 
     /// Create schema for the embeddings table
@@ -784,7 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_path() {
-        let path = LanceVectorDB::default_path();
+        let path = LanceVectorDB::default_lancedb_path();
         assert!(path.contains("project-rag"));
         assert!(path.contains("lancedb"));
     }

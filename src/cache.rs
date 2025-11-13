@@ -60,22 +60,7 @@ impl HashCache {
 
     /// Get default cache path (in user's cache directory)
     pub fn default_path() -> PathBuf {
-        let cache_dir = if cfg!(target_os = "windows") {
-            PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string()))
-        } else if cfg!(target_os = "macos") {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
-                .join("Library/Caches")
-        } else {
-            // Linux/Unix
-            PathBuf::from(std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| {
-                format!(
-                    "{}/.cache",
-                    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
-                )
-            }))
-        };
-
-        cache_dir.join("project-rag").join("hash_cache.json")
+        crate::paths::PlatformPaths::default_hash_cache_path()
     }
 }
 
