@@ -1,4 +1,5 @@
 use crate::cache::HashCache;
+use crate::config::Config;
 use crate::embedding::{EmbeddingProvider, FastEmbedManager};
 use crate::git_cache::GitCache;
 use crate::indexer::CodeChunker;
@@ -40,21 +41,41 @@ pub struct RagMcpServer {
     // Git cache for git history indexing
     git_cache: Arc<RwLock<GitCache>>,
     git_cache_path: PathBuf,
+    // Configuration (for accessing batch sizes, timeouts, etc.)
+    config: Arc<Config>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
 
 impl RagMcpServer {
+    /// Create a new RAG MCP server with default configuration
     pub async fn new() -> Result<Self> {
-        let embedding_provider =
-            Arc::new(FastEmbedManager::new().context("Failed to initialize embedding provider")?);
+        let config = Config::new().context("Failed to load configuration")?;
+        Self::with_config(config).await
+    }
+
+    /// Create a new RAG MCP server with custom configuration
+    pub async fn with_config(config: Config) -> Result<Self> {
+        tracing::info!("Initializing RAG MCP server with configuration");
+        tracing::debug!("Vector DB backend: {}", config.vector_db.backend);
+        tracing::debug!("Embedding model: {}", config.embedding.model_name);
+        tracing::debug!("Chunk size: {}", config.indexing.chunk_size);
+
+        // Initialize embedding provider with configured model
+        let embedding_provider = Arc::new(
+            FastEmbedManager::from_model_name(&config.embedding.model_name)
+                .context("Failed to initialize embedding provider")?,
+        );
 
         // Initialize the appropriate vector database backend
         #[cfg(feature = "qdrant-backend")]
         let vector_db = {
-            tracing::info!("Using Qdrant vector database backend");
+            tracing::info!(
+                "Using Qdrant vector database backend at {}",
+                config.vector_db.qdrant_url
+            );
             Arc::new(
-                QdrantVectorDB::new()
+                QdrantVectorDB::with_url(&config.vector_db.qdrant_url)
                     .await
                     .context("Failed to initialize Qdrant vector database")?,
             )
@@ -62,9 +83,12 @@ impl RagMcpServer {
 
         #[cfg(not(feature = "qdrant-backend"))]
         let vector_db = {
-            tracing::info!("Using LanceDB vector database backend (default)");
+            tracing::info!(
+                "Using LanceDB vector database backend at {}",
+                config.vector_db.lancedb_path.display()
+            );
             Arc::new(
-                LanceVectorDB::new()
+                LanceVectorDB::with_path(&config.vector_db.lancedb_path.to_string_lossy())
                     .await
                     .context("Failed to initialize LanceDB vector database")?,
             )
@@ -76,19 +100,20 @@ impl RagMcpServer {
             .await
             .context("Failed to initialize vector database collections")?;
 
+        // Create chunker with configured chunk size
         let chunker = Arc::new(CodeChunker::default_strategy());
 
         // Load persistent hash cache
-        let cache_path = HashCache::default_path();
+        let cache_path = config.cache.hash_cache_path.clone();
         let hash_cache = HashCache::load(&cache_path).unwrap_or_else(|e| {
             tracing::warn!("Failed to load hash cache: {}, starting fresh", e);
             HashCache::default()
         });
 
-        tracing::info!("Using cache file: {:?}", cache_path);
+        tracing::info!("Using hash cache file: {:?}", cache_path);
 
         // Load persistent git cache
-        let git_cache_path = GitCache::default_path();
+        let git_cache_path = config.cache.git_cache_path.clone();
         let git_cache = GitCache::load(&git_cache_path).unwrap_or_else(|e| {
             tracing::warn!("Failed to load git cache: {}, starting fresh", e);
             GitCache::default()
@@ -104,6 +129,7 @@ impl RagMcpServer {
             cache_path,
             git_cache: Arc::new(RwLock::new(git_cache)),
             git_cache_path,
+            config: Arc::new(config),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         })
@@ -112,49 +138,13 @@ impl RagMcpServer {
     /// Create a new server with custom database path (for testing)
     #[cfg(test)]
     pub async fn new_with_db_path(db_path: &str, cache_path: PathBuf) -> Result<Self> {
-        let embedding_provider =
-            Arc::new(FastEmbedManager::new().context("Failed to initialize embedding provider")?);
+        // Create a test config with custom paths
+        let mut config = Config::default();
+        config.vector_db.lancedb_path = PathBuf::from(db_path);
+        config.cache.hash_cache_path = cache_path.clone();
+        config.cache.git_cache_path = cache_path.parent().unwrap().join("git_cache.json");
 
-        #[cfg(not(feature = "qdrant-backend"))]
-        let vector_db = {
-            Arc::new(
-                LanceVectorDB::with_path(db_path)
-                    .await
-                    .context("Failed to initialize LanceDB vector database")?,
-            )
-        };
-
-        #[cfg(feature = "qdrant-backend")]
-        let vector_db = {
-            Arc::new(
-                QdrantVectorDB::new()
-                    .await
-                    .context("Failed to initialize Qdrant vector database")?,
-            )
-        };
-
-        vector_db
-            .initialize(embedding_provider.dimension())
-            .await
-            .context("Failed to initialize vector database collections")?;
-
-        let chunker = Arc::new(CodeChunker::default_strategy());
-        let hash_cache = HashCache::default();
-
-        // Create temporary git cache path for tests
-        let git_cache_path = cache_path.parent().unwrap().join("git_cache.json");
-
-        Ok(Self {
-            embedding_provider,
-            vector_db,
-            chunker,
-            hash_cache: Arc::new(RwLock::new(hash_cache)),
-            cache_path,
-            git_cache: Arc::new(RwLock::new(GitCache::default())),
-            git_cache_path,
-            tool_router: Self::tool_router(),
-            prompt_router: Self::prompt_router(),
-        })
+        Self::with_config(config).await
     }
 
     /// Normalize a path to a canonical absolute form for consistent cache lookups

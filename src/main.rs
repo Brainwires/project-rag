@@ -94,6 +94,15 @@ fn show_version_info() {
     println!("  Provider:        FastEmbed (local, no API calls)");
     println!();
 
+    // Configuration
+    println!("Configuration:");
+    use project_rag::paths::PlatformPaths;
+    let config_path = PlatformPaths::default_config_path();
+    println!("  Config File:     {}", config_path.display());
+    println!("  Config Priority: CLI args > Env vars > Config file > Defaults");
+    println!("  Env Prefix:      PROJECT_RAG_*");
+    println!();
+
     // Additional features
     println!("Features:");
     println!("  Hybrid Search:   Enabled (Vector + BM25 keyword search)");

@@ -17,6 +17,24 @@ impl FastEmbedManager {
         Self::with_model(EmbeddingModel::AllMiniLML6V2)
     }
 
+    /// Create a new FastEmbedManager from a model name string
+    pub fn from_model_name(model_name: &str) -> Result<Self> {
+        let model = match model_name {
+            "all-MiniLM-L6-v2" => EmbeddingModel::AllMiniLML6V2,
+            "all-MiniLM-L12-v2" => EmbeddingModel::AllMiniLML12V2,
+            "BAAI/bge-base-en-v1.5" => EmbeddingModel::BGEBaseENV15,
+            "BAAI/bge-small-en-v1.5" => EmbeddingModel::BGESmallENV15,
+            _ => {
+                tracing::warn!(
+                    "Unknown model '{}', falling back to all-MiniLM-L6-v2",
+                    model_name
+                );
+                EmbeddingModel::AllMiniLML6V2
+            }
+        };
+        Self::with_model(model)
+    }
+
     /// Create a new FastEmbedManager with a specific model
     pub fn with_model(model: EmbeddingModel) -> Result<Self> {
         tracing::info!("Initializing FastEmbed model: {:?}", model);
