@@ -4,7 +4,7 @@ This document describes the testing strategy and procedures for project-rag.
 
 ## Test Organization
 
-### Unit Tests (223 tests)
+### Unit Tests (226 tests)
 Located in `src/**/*.rs` files within `#[cfg(test)]` modules. These tests cover individual functions and modules:
 
 - **BM25 Search** (9 tests): Keyword search, RRF fusion, statistics
@@ -87,11 +87,29 @@ cargo bench indexing
 cargo bench -- --verbose
 ```
 
+### Run Code Coverage
+```bash
+# Generate coverage report with tarpaulin (recommended)
+cargo tarpaulin --lib --engine llvm --out Stdout
+
+# Generate HTML coverage report
+cargo tarpaulin --lib --engine llvm --out Html --output-dir target/coverage
+
+# Coverage with specific modules only
+cargo tarpaulin --lib --engine llvm --out Stdout --packages project-rag
+```
+
+**Note**: Code coverage requires `cargo-tarpaulin` to be installed:
+```bash
+cargo install cargo-tarpaulin
+```
+
 ## Test Coverage
 
 Current test statistics:
-- **Total Tests**: 233 (223 unit + 10 integration)
-- **Success Rate**: 100% (233/233 passing)
+- **Total Tests**: 236 (226 unit + 10 integration)
+- **Success Rate**: 100% (236/236 passing)
+- **Code Coverage**: 59.73% (1,157/1,937 lines covered)
 - **Modules with Tests**: 13/13 (100%)
 - **Critical Paths Covered**: Indexing, search, caching, git integration
 
@@ -282,9 +300,16 @@ Track these metrics over time:
 - Code coverage percentage
 - Benchmark performance
 
-Current baseline (as of Phase 4):
-- Tests: 233
+Current baseline:
+- Tests: 236 (226 unit + 10 integration)
 - Pass Rate: 100%
+- Code Coverage: 59.73% (1,157/1,937 lines)
 - Execution Time: ~5-7 seconds
 - Unit Test Time: ~3-4 seconds
 - Integration Test Time: ~1-2 seconds
+
+### Coverage Tool
+- **Tool**: cargo-tarpaulin with LLVM engine
+- **Command**: `cargo tarpaulin --lib --engine llvm --out Stdout`
+- **Output**: Line coverage percentages per module
+- **Target**: Aim for >70% coverage on critical modules

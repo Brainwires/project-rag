@@ -1,5 +1,9 @@
 # Project RAG - MCP Server for Code Understanding
 
+[![Tests](https://img.shields.io/badge/tests-236%20passing-brightgreen)](https://github.com/nightness/project-rag)
+[![Coverage](https://img.shields.io/badge/coverage-59.73%25-yellow)](https://github.com/nightness/project-rag)
+[![Rust](https://img.shields.io/badge/rust-2024%20edition-orange)](https://www.rust-lang.org/)
+
 A Rust-based Model Context Protocol (MCP) server that provides AI assistants with powerful RAG (Retrieval-Augmented Generation) capabilities for understanding massive codebases.
 
 ## Overview
