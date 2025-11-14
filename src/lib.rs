@@ -92,6 +92,9 @@ pub mod git;
 /// Git commit tracking cache for incremental git history indexing
 pub mod git_cache;
 
+/// Glob pattern matching utilities for path filtering
+pub mod glob_utils;
+
 /// File walking, code chunking, and AST parsing
 pub mod indexer;
 

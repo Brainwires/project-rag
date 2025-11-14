@@ -1,4 +1,5 @@
 use super::{DatabaseStats, VectorDatabase};
+use crate::glob_utils;
 use crate::types::{ChunkMetadata, SearchResult};
 use anyhow::{Context, Result};
 use qdrant_client::qdrant::vectors_config::Config;
@@ -430,13 +431,9 @@ impl VectorDatabase for QdrantVectorDB {
             });
         }
 
-        // Post-filter by path patterns if needed
+        // Post-filter by path patterns using proper glob matching
         if !path_patterns.is_empty() {
-            results.retain(|r| {
-                path_patterns
-                    .iter()
-                    .any(|pattern| r.file_path.contains(pattern))
-            });
+            results.retain(|r| glob_utils::matches_any_pattern(&r.file_path, &path_patterns));
         }
 
         Ok(results)

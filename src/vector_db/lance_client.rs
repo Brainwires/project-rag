@@ -9,6 +9,7 @@
 //! Future refactoring could extract search logic into traits if needed.
 
 use crate::bm25_search::BM25Search;
+use crate::glob_utils;
 use crate::types::{ChunkMetadata, SearchResult};
 use crate::vector_db::{DatabaseStats, VectorDatabase};
 use anyhow::{Context, Result};
@@ -687,12 +688,9 @@ impl VectorDatabase for LanceVectorDB {
                 return false;
             }
 
-            // Filter by path pattern
+            // Filter by path pattern using proper glob matching
             if !path_patterns.is_empty() {
-                let matches_pattern = path_patterns
-                    .iter()
-                    .any(|pattern| result.file_path.contains(pattern));
-                if !matches_pattern {
+                if !glob_utils::matches_any_pattern(&result.file_path, &path_patterns) {
                     return false;
                 }
             }
