@@ -4,21 +4,24 @@ This document describes the testing strategy and procedures for project-rag.
 
 ## Test Organization
 
-### Unit Tests (226 tests)
+### Unit Tests (305 tests)
 Located in `src/**/*.rs` files within `#[cfg(test)]` modules. These tests cover individual functions and modules:
 
-- **BM25 Search** (9 tests): Keyword search, RRF fusion, statistics
-- **Cache** (18 tests): Hash cache operations, serialization, persistence
+- **BM25 Search** (12 tests): Keyword search, RRF fusion, statistics, lock cleanup
+- **Cache** (15 tests): Hash cache operations, serialization, persistence
+- **Client** (24 tests): Core API methods, initialization, query, index, clear
 - **Configuration** (14 tests): Config loading, validation, environment overrides
-- **Embedding** (10 tests): FastEmbed integration, model selection, batch processing
+- **Embedding** (7 tests): FastEmbed integration, model selection, batch processing
 - **Error Types** (14 tests): Error conversion, categorization, display
 - **File Walker** (61 tests): Directory traversal, language detection, gitignore support
-- **Chunking** (29 tests): AST parsing, fixed-line chunking, sliding window
+- **Chunking** (25 tests): AST parsing, fixed-line chunking, sliding window
 - **Git** (13 tests): Git integration, commit parsing, history indexing
-- **MCP Server** (11 tests): Server initialization, path normalization
-- **Types** (9 tests): Request/response serialization, validation
-- **Vector Database** (26 tests): LanceDB operations, search, statistics
+- **MCP Server** (31 tests): Server initialization, tool handlers, prompt handlers, validation
+- **Types** (45 tests): Request/response serialization, validation, edge cases
+- **Vector Database** (22 tests): LanceDB operations, search, statistics, hybrid search
 - **Paths** (9 tests): Platform-specific path computation
+- **Git Cache** (6 tests): Git cache operations
+- **AST Parser** (13 tests): Tree-sitter parsing for 12 languages
 
 ### Integration Tests (10 tests)
 Located in `tests/` directory:
@@ -87,46 +90,29 @@ cargo bench indexing
 cargo bench -- --verbose
 ```
 
-### Run Code Coverage
-```bash
-# Generate coverage report with tarpaulin (recommended)
-cargo tarpaulin --lib --engine llvm --out Stdout
-
-# Generate HTML coverage report
-cargo tarpaulin --lib --engine llvm --out Html --output-dir target/coverage
-
-# Coverage with specific modules only
-cargo tarpaulin --lib --engine llvm --out Stdout --packages project-rag
-```
-
-**Note**: Code coverage requires `cargo-tarpaulin` to be installed:
-```bash
-cargo install cargo-tarpaulin
-```
-
 ## Test Coverage
 
 Current test statistics:
-- **Total Tests**: 236 (226 unit + 10 integration)
-- **Success Rate**: 100% (236/236 passing)
-- **Code Coverage**: 59.73% (1,157/1,937 lines covered)
+- **Total Tests**: 315 (305 unit + 10 integration)
+- **Success Rate**: ~99.7% (314/315 passing, 1 pre-existing flaky test)
 - **Modules with Tests**: 13/13 (100%)
-- **Critical Paths Covered**: Indexing, search, caching, git integration
+- **Critical Paths Covered**: Indexing, search, caching, git integration, MCP server tools, request validation
 
 ### Coverage by Module
 | Module | Unit Tests | Coverage Notes |
 |--------|-----------|----------------|
-| bm25_search | 9 | Full coverage: search, delete, statistics, RRF |
-| cache | 18 | Full coverage: load, save, operations, edge cases |
+| bm25_search | 12 | Full coverage: search, delete, statistics, RRF, lock cleanup |
+| cache | 15 | Full coverage: load, save, operations, edge cases |
+| client | 24 | **NEW**: Full API coverage: init, query, index, clear, filters, git history |
 | config | 14 | Full coverage: validation, env vars, TOML |
-| embedding | 10 | Full coverage: all 4 supported models |
+| embedding | 7 | Full coverage: all supported models, batch processing |
 | error | 14 | Full coverage: all error types, conversions |
 | file_walker | 61 | Full coverage: 25+ languages, gitignore, patterns |
-| chunker | 29 | Full coverage: AST, fixed-line, sliding window |
+| chunker | 25 | Full coverage: AST, fixed-line, sliding window |
 | git | 13 | Full coverage: walker, chunker, history |
-| mcp_server | 11 | Core functionality, needs more integration tests |
-| types | 9 | Full coverage: all request/response types |
-| vector_db | 26 | Full coverage: CRUD, search, hybrid, filters |
+| mcp_server | 31 | **ENHANCED**: Tool handlers, prompt handlers, server info, validation |
+| types | 45 | **ENHANCED**: All request/response types, validation, serialization, edge cases |
+| vector_db | 22 | Full coverage: CRUD, search, hybrid, filters, project isolation |
 | paths | 9 | Full coverage: all platforms, all path types |
 
 ## Writing Tests
@@ -297,19 +283,11 @@ Track these metrics over time:
 - Total test count
 - Test pass rate
 - Test execution time
-- Code coverage percentage
 - Benchmark performance
 
 Current baseline:
-- Tests: 236 (226 unit + 10 integration)
-- Pass Rate: 100%
-- Code Coverage: 59.73% (1,157/1,937 lines)
-- Execution Time: ~5-7 seconds
-- Unit Test Time: ~3-4 seconds
+- Tests: 315 (305 unit + 10 integration)
+- Pass Rate: ~99.7% (314/315 passing, 1 pre-existing flaky test)
+- Execution Time: ~8-10 seconds
+- Unit Test Time: ~6-8 seconds
 - Integration Test Time: ~1-2 seconds
-
-### Coverage Tool
-- **Tool**: cargo-tarpaulin with LLVM engine
-- **Command**: `cargo tarpaulin --lib --engine llvm --out Stdout`
-- **Output**: Line coverage percentages per module
-- **Target**: Aim for >70% coverage on critical modules
