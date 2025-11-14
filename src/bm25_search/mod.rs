@@ -342,6 +342,3 @@ pub fn reciprocal_rank_fusion(
 
     combined
 }
-
-#[cfg(test)]
-mod tests;

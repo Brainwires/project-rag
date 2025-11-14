@@ -81,49 +81,49 @@ impl PlatformPaths {
 
     /// Get default project-specific data directory
     ///
-    /// Returns: {data_dir}/project-rag
+    /// Returns: {data_dir}/brainwires
     pub fn project_data_dir() -> PathBuf {
-        Self::data_dir().join("project-rag")
+        Self::data_dir().join("brainwires")
     }
 
     /// Get default project-specific cache directory
     ///
-    /// Returns: {cache_dir}/project-rag
+    /// Returns: {cache_dir}/brainwires
     pub fn project_cache_dir() -> PathBuf {
-        Self::cache_dir().join("project-rag")
+        Self::cache_dir().join("brainwires")
     }
 
     /// Get default project-specific config directory
     ///
-    /// Returns: {config_dir}/project-rag
+    /// Returns: {config_dir}/brainwires
     pub fn project_config_dir() -> PathBuf {
-        Self::config_dir().join("project-rag")
+        Self::config_dir().join("brainwires")
     }
 
     /// Get default LanceDB database path
     ///
-    /// Returns: {data_dir}/project-rag/lancedb
+    /// Returns: {data_dir}/brainwires/lancedb
     pub fn default_lancedb_path() -> PathBuf {
         Self::project_data_dir().join("lancedb")
     }
 
     /// Get default hash cache path
     ///
-    /// Returns: {cache_dir}/project-rag/hash_cache.json
+    /// Returns: {cache_dir}/brainwires/hash_cache.json
     pub fn default_hash_cache_path() -> PathBuf {
         Self::project_cache_dir().join("hash_cache.json")
     }
 
     /// Get default git cache path
     ///
-    /// Returns: {cache_dir}/project-rag/git_cache.json
+    /// Returns: {cache_dir}/brainwires/git_cache.json
     pub fn default_git_cache_path() -> PathBuf {
         Self::project_cache_dir().join("git_cache.json")
     }
 
     /// Get default config file path
     ///
-    /// Returns: {config_dir}/project-rag/config.toml
+    /// Returns: {config_dir}/brainwires/config.toml
     pub fn default_config_path() -> PathBuf {
         Self::project_config_dir().join("config.toml")
     }
@@ -158,36 +158,36 @@ mod tests {
         let cache_dir = PlatformPaths::project_cache_dir();
         let config_dir = PlatformPaths::project_config_dir();
 
-        assert!(data_dir.to_string_lossy().contains("project-rag"));
-        assert!(cache_dir.to_string_lossy().contains("project-rag"));
-        assert!(config_dir.to_string_lossy().contains("project-rag"));
+        assert!(data_dir.to_string_lossy().contains("brainwires"));
+        assert!(cache_dir.to_string_lossy().contains("brainwires"));
+        assert!(config_dir.to_string_lossy().contains("brainwires"));
     }
 
     #[test]
     fn test_default_lancedb_path() {
         let path = PlatformPaths::default_lancedb_path();
-        assert!(path.to_string_lossy().contains("project-rag"));
+        assert!(path.to_string_lossy().contains("brainwires"));
         assert!(path.to_string_lossy().contains("lancedb"));
     }
 
     #[test]
     fn test_default_hash_cache_path() {
         let path = PlatformPaths::default_hash_cache_path();
-        assert!(path.to_string_lossy().contains("project-rag"));
+        assert!(path.to_string_lossy().contains("brainwires"));
         assert!(path.to_string_lossy().contains("hash_cache.json"));
     }
 
     #[test]
     fn test_default_git_cache_path() {
         let path = PlatformPaths::default_git_cache_path();
-        assert!(path.to_string_lossy().contains("project-rag"));
+        assert!(path.to_string_lossy().contains("brainwires"));
         assert!(path.to_string_lossy().contains("git_cache.json"));
     }
 
     #[test]
     fn test_default_config_path() {
         let path = PlatformPaths::default_config_path();
-        assert!(path.to_string_lossy().contains("project-rag"));
+        assert!(path.to_string_lossy().contains("brainwires"));
         assert!(path.to_string_lossy().contains("config.toml"));
     }
 
@@ -376,8 +376,8 @@ mod tests {
         // All should contain project name
         for path in [&lancedb_path, &hash_cache_path, &git_cache_path, &config_path] {
             assert!(
-                path.to_string_lossy().contains("project-rag"),
-                "Path {:?} should contain 'project-rag'",
+                path.to_string_lossy().contains("brainwires"),
+                "Path {:?} should contain 'brainwires'",
                 path
             );
         }
