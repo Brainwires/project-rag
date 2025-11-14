@@ -63,6 +63,9 @@ pub struct IndexResponse {
 pub struct QueryRequest {
     /// The question or search query
     pub query: String,
+    /// Optional path to filter by specific indexed codebase
+    #[serde(default)]
+    pub path: Option<String>,
     /// Optional project name to filter by
     #[serde(default)]
     pub project: Option<String>,
@@ -94,6 +97,9 @@ fn default_min_score() -> f32 {
 pub struct SearchResult {
     /// File path relative to the indexed root
     pub file_path: String,
+    /// Absolute path to the indexed root directory
+    #[serde(default)]
+    pub root_path: Option<String>,
     /// The code chunk content
     pub content: String,
     /// Combined similarity score (0.0 to 1.0)
@@ -202,6 +208,9 @@ pub struct IncrementalUpdateResponse {
 pub struct AdvancedSearchRequest {
     /// The search query
     pub query: String,
+    /// Optional path to filter by specific indexed codebase
+    #[serde(default)]
+    pub path: Option<String>,
     /// Optional project name to filter by
     #[serde(default)]
     pub project: Option<String>,
@@ -310,6 +319,9 @@ pub struct SearchGitHistoryResponse {
 pub struct ChunkMetadata {
     /// File path relative to indexed root
     pub file_path: String,
+    /// Absolute path to the indexed root directory
+    #[serde(default)]
+    pub root_path: Option<String>,
     /// Project name (for multi-project support)
     pub project: Option<String>,
     /// Starting line number
@@ -435,6 +447,7 @@ impl AdvancedSearchRequest {
         // Reuse QueryRequest validation logic
         let query_req = QueryRequest {
             query: self.query.clone(),
+            path: None,
             project: self.project.clone(),
             limit: self.limit,
             min_score: self.min_score,
@@ -596,6 +609,7 @@ mod tests {
     fn test_query_request_defaults() {
         let req = QueryRequest {
             query: "test".to_string(),
+            path: None,
             project: None,
             limit: default_limit(),
             min_score: default_min_score(),
@@ -630,6 +644,7 @@ mod tests {
     fn test_search_result_creation() {
         let result = SearchResult {
             file_path: "src/main.rs".to_string(),
+            root_path: None,
             content: "fn main() {}".to_string(),
             score: 0.95,
             vector_score: 0.92,
@@ -650,6 +665,7 @@ mod tests {
     fn test_chunk_metadata_creation() {
         let metadata = ChunkMetadata {
             file_path: "src/lib.rs".to_string(),
+            root_path: None,
             project: Some("test-project".to_string()),
             start_line: 1,
             end_line: 50,
@@ -781,7 +797,8 @@ mod tests {
     #[test]
     fn test_query_request_validate_empty_query() {
         let req = QueryRequest {
-            query: "   ".to_string(), // Whitespace only
+            query: "   ".to_string(),
+            path: None, // Whitespace only
             project: None,
             limit: default_limit(),
             min_score: default_min_score(),
@@ -796,7 +813,8 @@ mod tests {
     #[test]
     fn test_query_request_validate_query_too_long() {
         let req = QueryRequest {
-            query: "a".repeat(20_000), // 20KB, over the limit
+            query: "a".repeat(20_000),
+            path: None, // 20KB, over the limit
             project: None,
             limit: default_limit(),
             min_score: default_min_score(),
@@ -812,6 +830,7 @@ mod tests {
     fn test_query_request_validate_min_score_out_of_range() {
         let req = QueryRequest {
             query: "test".to_string(),
+            path: None,
             project: None,
             limit: default_limit(),
             min_score: 1.5, // Out of range
@@ -827,6 +846,7 @@ mod tests {
     fn test_query_request_validate_limit_too_large() {
         let req = QueryRequest {
             query: "test".to_string(),
+            path: None,
             project: None,
             limit: 2000, // Over the limit
             min_score: default_min_score(),
@@ -842,6 +862,7 @@ mod tests {
     fn test_query_request_validate_valid() {
         let req = QueryRequest {
             query: "test query".to_string(),
+            path: None,
             project: Some("my-project".to_string()),
             limit: 50,
             min_score: 0.8,
@@ -856,6 +877,7 @@ mod tests {
     fn test_advanced_search_request_validate_empty_file_extension() {
         let req = AdvancedSearchRequest {
             query: "test".to_string(),
+            path: None,
             project: None,
             limit: default_limit(),
             min_score: default_min_score(),
@@ -873,6 +895,7 @@ mod tests {
     fn test_advanced_search_request_validate_file_extension_too_long() {
         let req = AdvancedSearchRequest {
             query: "test".to_string(),
+            path: None,
             project: None,
             limit: default_limit(),
             min_score: default_min_score(),
@@ -890,6 +913,7 @@ mod tests {
     fn test_advanced_search_request_validate_empty_language() {
         let req = AdvancedSearchRequest {
             query: "test".to_string(),
+            path: None,
             project: None,
             limit: default_limit(),
             min_score: default_min_score(),
@@ -907,6 +931,7 @@ mod tests {
     fn test_advanced_search_request_validate_language_too_long() {
         let req = AdvancedSearchRequest {
             query: "test".to_string(),
+            path: None,
             project: None,
             limit: default_limit(),
             min_score: default_min_score(),
@@ -924,6 +949,7 @@ mod tests {
     fn test_advanced_search_request_validate_valid() {
         let req = AdvancedSearchRequest {
             query: "test".to_string(),
+            path: None,
             project: Some("my-project".to_string()),
             limit: 20,
             min_score: 0.8,
@@ -1089,6 +1115,7 @@ mod tests {
         let response = QueryResponse {
             results: vec![SearchResult {
                 file_path: "test.rs".to_string(),
+                root_path: None,
                 content: "test content".to_string(),
                 score: 0.9,
                 vector_score: 0.85,
@@ -1179,6 +1206,7 @@ mod tests {
     fn test_advanced_search_request_serialization() {
         let request = AdvancedSearchRequest {
             query: "test query".to_string(),
+            path: None,
             project: Some("test-project".to_string()),
             limit: 20,
             min_score: 0.8,
@@ -1300,6 +1328,7 @@ mod tests {
         // Test 0.0
         let req = QueryRequest {
             query: "test".to_string(),
+            path: None,
             project: None,
             limit: default_limit(),
             min_score: 0.0,
@@ -1310,6 +1339,7 @@ mod tests {
         // Test 1.0
         let req = QueryRequest {
             query: "test".to_string(),
+            path: None,
             project: None,
             limit: default_limit(),
             min_score: 1.0,
@@ -1336,6 +1366,7 @@ mod tests {
         // Test exactly at the limit (1000)
         let req = QueryRequest {
             query: "test".to_string(),
+            path: None,
             project: None,
             limit: 1000,
             min_score: default_min_score(),

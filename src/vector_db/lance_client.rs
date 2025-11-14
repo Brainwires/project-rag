@@ -140,6 +140,7 @@ impl LanceVectorDB {
             ),
             Field::new("id", DataType::Utf8, false),
             Field::new("file_path", DataType::Utf8, false),
+            Field::new("root_path", DataType::Utf8, true),
             Field::new("start_line", DataType::UInt32, false),
             Field::new("end_line", DataType::UInt32, false),
             Field::new("language", DataType::Utf8, false),
@@ -188,6 +189,12 @@ impl LanceVectorDB {
             metadata
                 .iter()
                 .map(|m| m.file_path.as_str())
+                .collect::<Vec<_>>(),
+        );
+        let root_path_array = StringArray::from(
+            metadata
+                .iter()
+                .map(|m| m.root_path.as_deref())
                 .collect::<Vec<_>>(),
         );
         let start_line_array = UInt32Array::from(
@@ -241,6 +248,7 @@ impl LanceVectorDB {
                 Arc::new(vector_array),
                 Arc::new(id_array),
                 Arc::new(file_path_array),
+                Arc::new(root_path_array),
                 Arc::new(start_line_array),
                 Arc::new(end_line_array),
                 Arc::new(language_array),
@@ -369,6 +377,7 @@ impl VectorDatabase for LanceVectorDB {
         limit: usize,
         min_score: f32,
         project: Option<String>,
+        root_path: Option<String>,
         hybrid: bool,
     ) -> Result<Vec<SearchResult>> {
         let table = self.get_table().await?;
@@ -476,6 +485,9 @@ impl VectorDatabase for LanceVectorDB {
                         let file_path_array = batch
                             .column_by_name("file_path")
                             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                        let root_path_array = batch
+                            .column_by_name("root_path")
+                            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
                         let start_line_array = batch
                             .column_by_name("start_line")
                             .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
@@ -492,8 +504,9 @@ impl VectorDatabase for LanceVectorDB {
                             .column_by_name("project")
                             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
-                        if let (Some(fp), Some(sl), Some(el), Some(lang), Some(cont), Some(proj)) = (
+                        if let (Some(fp), Some(rp), Some(sl), Some(el), Some(lang), Some(cont), Some(proj)) = (
                             file_path_array,
+                            root_path_array,
                             start_line_array,
                             end_line_array,
                             language_array,
@@ -511,6 +524,20 @@ impl VectorDatabase for LanceVectorDB {
                                 || keyword_score.is_some_and(|k| k >= min_score);
 
                             if passes_filter {
+                                let result_root_path = if rp.is_null(idx) {
+                                    None
+                                } else {
+                                    Some(rp.value(idx).to_string())
+                                };
+
+                                // Filter by root_path if specified
+                                if let Some(ref filter_path) = root_path {
+                                    if result_root_path.as_ref() != Some(filter_path) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+
                                 // Use RRF combined score as the main score for ranking
                                 // But report original vector/keyword scores for transparency
                                 search_results.push(SearchResult {
@@ -518,6 +545,7 @@ impl VectorDatabase for LanceVectorDB {
                                     vector_score,          // Original vector score
                                     keyword_score,         // Original BM25 score
                                     file_path: fp.value(idx).to_string(),
+                                    root_path: result_root_path,
                                     start_line: sl.value(idx) as usize,
                                     end_line: el.value(idx) as usize,
                                     language: lang.value(idx).to_string(),
@@ -574,6 +602,13 @@ impl VectorDatabase for LanceVectorDB {
                     .downcast_ref::<StringArray>()
                     .context("Invalid file_path type")?;
 
+                let root_path_array = batch
+                    .column_by_name("root_path")
+                    .context("Missing root_path column")?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("Invalid root_path type")?;
+
                 let start_line_array = batch
                     .column_by_name("start_line")
                     .context("Missing start_line column")?
@@ -621,11 +656,25 @@ impl VectorDatabase for LanceVectorDB {
                     let score = 1.0 / (1.0 + distance);
 
                     if score >= min_score {
+                        let result_root_path = if root_path_array.is_null(i) {
+                            None
+                        } else {
+                            Some(root_path_array.value(i).to_string())
+                        };
+
+                        // Filter by root_path if specified
+                        if let Some(ref filter_path) = root_path {
+                            if result_root_path.as_ref() != Some(filter_path) {
+                                continue;
+                            }
+                        }
+
                         search_results.push(SearchResult {
                             score,
                             vector_score: score,
                             keyword_score: None,
                             file_path: file_path_array.value(i).to_string(),
+                            root_path: result_root_path,
                             start_line: start_line_array.value(i) as usize,
                             end_line: end_line_array.value(i) as usize,
                             language: language_array.value(i).to_string(),
@@ -651,6 +700,7 @@ impl VectorDatabase for LanceVectorDB {
         limit: usize,
         min_score: f32,
         project: Option<String>,
+        root_path: Option<String>,
         hybrid: bool,
         file_extensions: Vec<String>,
         languages: Vec<String>,
@@ -666,7 +716,8 @@ impl VectorDatabase for LanceVectorDB {
                 query_text,
                 search_limit,
                 min_score,
-                project,
+                project.clone(),
+                root_path.clone(),
                 hybrid,
             )
             .await?;
@@ -827,6 +878,7 @@ mod tests {
 
     fn create_test_metadata(file_path: &str, start_line: usize, end_line: usize) -> ChunkMetadata {
         ChunkMetadata {
+                root_path: None,
             file_path: file_path.to_string(),
             project: Some("test-project".to_string()),
             start_line,
@@ -943,7 +995,7 @@ mod tests {
         // Verify storage by searching
         let query = vec![0.1; 384];
         let results = db
-            .search(query, "main", 10, 0.0, None, false)
+            .search(query, "main", 10, 0.0, None, None, false)
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -971,7 +1023,7 @@ mod tests {
         // Search with pure vector (hybrid=false)
         let query = vec![0.1; 384];
         let results = db
-            .search(query, "main", 10, 0.0, None, false)
+            .search(query, "main", 10, 0.0, None, None, false)
             .await
             .unwrap();
 
@@ -1004,7 +1056,7 @@ mod tests {
         // Search with hybrid (hybrid=true)
         let query = vec![0.1; 384];
         let results = db
-            .search(query, "println", 10, 0.0, None, true)
+            .search(query, "println", 10, 0.0, None, None, true)
             .await
             .unwrap();
 
@@ -1036,7 +1088,7 @@ mod tests {
         // Search with high min_score (should filter out results)
         let query = vec![0.9; 384]; // Very different from stored embedding
         let results = db
-            .search(query, "main", 10, 0.99, None, false)
+            .search(query, "main", 10, 0.99, None, None, false)
             .await
             .unwrap();
 
@@ -1071,7 +1123,7 @@ mod tests {
         // Search with project filter
         let query = vec![0.15; 384];
         let results = db
-            .search(query, "main", 10, 0.0, Some("project-a".to_string()), false)
+            .search(query, "main", 10, 0.0, Some("project-a".to_string()), None, false)
             .await
             .unwrap();
 
@@ -1112,6 +1164,7 @@ mod tests {
                 "main",
                 10,
                 0.0,
+                None,
                 None,
                 false,
                 vec!["rs".to_string()],
@@ -1155,6 +1208,7 @@ mod tests {
                 "main",
                 10,
                 0.0,
+                None,
                 None,
                 false,
                 vec![],
@@ -1202,6 +1256,7 @@ mod tests {
                 10,
                 0.0,
                 None,
+                None,
                 false,
                 vec![],
                 vec![],
@@ -1246,7 +1301,7 @@ mod tests {
         // Verify deletion
         let query = vec![0.15; 384];
         let results = db
-            .search(query, "main", 10, 0.0, None, false)
+            .search(query, "main", 10, 0.0, None, None, false)
             .await
             .unwrap();
 
@@ -1364,19 +1419,20 @@ mod tests {
     async fn test_create_schema() {
         let schema = LanceVectorDB::create_schema(384);
 
-        // Verify schema has expected fields
-        assert_eq!(schema.fields().len(), 11);
+        // Verify schema has expected fields (12 fields including root_path)
+        assert_eq!(schema.fields().len(), 12);
         assert_eq!(schema.field(0).name(), "vector");
         assert_eq!(schema.field(1).name(), "id");
         assert_eq!(schema.field(2).name(), "file_path");
-        assert_eq!(schema.field(3).name(), "start_line");
-        assert_eq!(schema.field(4).name(), "end_line");
-        assert_eq!(schema.field(5).name(), "language");
-        assert_eq!(schema.field(6).name(), "extension");
-        assert_eq!(schema.field(7).name(), "file_hash");
-        assert_eq!(schema.field(8).name(), "indexed_at");
-        assert_eq!(schema.field(9).name(), "content");
-        assert_eq!(schema.field(10).name(), "project");
+        assert_eq!(schema.field(3).name(), "root_path");
+        assert_eq!(schema.field(4).name(), "start_line");
+        assert_eq!(schema.field(5).name(), "end_line");
+        assert_eq!(schema.field(6).name(), "language");
+        assert_eq!(schema.field(7).name(), "extension");
+        assert_eq!(schema.field(8).name(), "file_hash");
+        assert_eq!(schema.field(9).name(), "indexed_at");
+        assert_eq!(schema.field(10).name(), "content");
+        assert_eq!(schema.field(11).name(), "project");
     }
 
     #[tokio::test]
@@ -1394,7 +1450,7 @@ mod tests {
 
         let batch = batch.unwrap();
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 11);
+        assert_eq!(batch.num_columns(), 12); // 12 columns including root_path
     }
 
     #[tokio::test]
@@ -1420,7 +1476,7 @@ mod tests {
         for _ in 0..3 {
             let query = vec![0.1; 384];
             let results = db
-                .search(query, "main", 10, 0.0, None, false)
+                .search(query, "main", 10, 0.0, None, None, false)
                 .await
                 .unwrap();
             assert_eq!(results.len(), 1);
@@ -1479,7 +1535,7 @@ mod tests {
         // Verify both projects can be searched (hybrid search across all BM25 indexes)
         let query = vec![0.15; 384];
         let results = db
-            .search(query.clone(), "main", 10, 0.0, None, true)
+            .search(query.clone(), "main", 10, 0.0, None, None, true)
             .await
             .unwrap();
 

@@ -257,6 +257,7 @@ async fn test_tool_query_codebase_with_empty_index() {
 
     let req = QueryRequest {
         query: "test query".to_string(),
+        path: None,
         project: None,
         limit: 10,
         min_score: 0.7,
@@ -287,6 +288,7 @@ async fn test_tool_query_codebase_validation_failure() {
     // Empty query should fail validation
     let req = QueryRequest {
         query: "   ".to_string(), // Whitespace only
+        path: None,
         project: None,
         limit: 10,
         min_score: 0.7,
@@ -408,6 +410,7 @@ async fn test_tool_search_by_filters_validation_failure() {
     // Empty file extension should fail validation
     let req = AdvancedSearchRequest {
         query: "test".to_string(),
+        path: None,
         project: None,
         limit: 10,
         min_score: 0.7,
@@ -433,6 +436,7 @@ async fn test_tool_search_by_filters_valid_request() {
 
     let req = AdvancedSearchRequest {
         query: "test".to_string(),
+        path: None,
         project: None,
         limit: 10,
         min_score: 0.7,

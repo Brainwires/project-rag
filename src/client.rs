@@ -300,6 +300,7 @@ impl RagClient {
                 request.limit,
                 threshold_used,
                 request.project.clone(),
+                request.path.clone(),
                 request.hybrid,
             )
             .await
@@ -321,6 +322,7 @@ impl RagClient {
                         request.limit,
                         threshold,
                         request.project.clone(),
+                        request.path.clone(),
                         request.hybrid,
                     )
                     .await
@@ -367,6 +369,7 @@ impl RagClient {
                 request.limit,
                 request.min_score,
                 request.project,
+                request.path,
                 true,
                 request.file_extensions,
                 request.languages,
@@ -661,6 +664,7 @@ mod tests {
 
         let request = QueryRequest {
             query: "test query".to_string(),
+            path: None,
             project: None,
             limit: 10,
             min_score: 0.7,
@@ -701,6 +705,7 @@ mod tests {
         // Now query
         let query_req = QueryRequest {
             query: "authentication".to_string(),
+            path: None,
             project: Some("test-project".to_string()),
             limit: 10,
             min_score: 0.3,
@@ -736,6 +741,7 @@ mod tests {
         // Query with high threshold (might trigger adaptive lowering)
         let query_req = QueryRequest {
             query: "completely unrelated query about databases".to_string(),
+            path: None,
             project: None,
             limit: 10,
             min_score: 0.9, // Very high threshold
@@ -753,6 +759,7 @@ mod tests {
 
         let request = QueryRequest {
             query: "   ".to_string(), // Empty query
+            path: None,
             project: None,
             limit: 10,
             min_score: 0.7,
@@ -772,6 +779,7 @@ mod tests {
 
         let request = AdvancedSearchRequest {
             query: "test".to_string(),
+            path: None,
             project: None,
             limit: 10,
             min_score: 0.7,
@@ -793,6 +801,7 @@ mod tests {
 
         let request = AdvancedSearchRequest {
             query: "test".to_string(),
+            path: None,
             project: None,
             limit: 10,
             min_score: 0.7,
@@ -972,6 +981,7 @@ mod tests {
         // Step 2: Query
         let query_req = QueryRequest {
             query: "addition function".to_string(),
+            path: None,
             project: Some("math-lib".to_string()),
             limit: 5,
             min_score: 0.3,
@@ -1028,6 +1038,7 @@ mod tests {
         // Query only project A
         let query_a = QueryRequest {
             query: "project".to_string(),
+            path: None,
             project: Some("project-a".to_string()),
             limit: 10,
             min_score: 0.3,

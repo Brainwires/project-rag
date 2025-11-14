@@ -576,3 +576,532 @@ pub async fn do_index_smart(
             .await
         }
     }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // Helper to create test client
+    async fn create_test_client() -> (RagClient, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db").to_string_lossy().to_string();
+        let cache_path = temp_dir.path().join("cache.json");
+        let client = RagClient::new_with_db_path(&db_path, cache_path)
+            .await
+            .unwrap();
+        (client, temp_dir)
+    }
+
+    // ===== do_index Tests =====
+
+    #[tokio::test]
+    async fn test_do_index_empty_directory() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.mode, crate::types::IndexingMode::Full);
+        assert_eq!(response.files_indexed, 0);
+        assert_eq!(response.chunks_created, 0);
+        assert!(!response.errors.is_empty());
+        assert!(response.errors[0].contains("No code chunks found"));
+    }
+
+    #[tokio::test]
+    async fn test_do_index_single_file() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("test.rs"), "fn main() {\n    println!(\"Hello\");\n}").unwrap();
+
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            Some("test-project".to_string()),
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.mode, crate::types::IndexingMode::Full);
+        assert_eq!(response.files_indexed, 1);
+        assert!(response.chunks_created > 0);
+        assert!(response.embeddings_generated > 0);
+        assert!(response.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_do_index_multiple_files() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("file1.rs"), "fn foo() {}").unwrap();
+        std::fs::write(data_dir.join("file2.rs"), "fn bar() {}").unwrap();
+        std::fs::write(data_dir.join("file3.rs"), "fn baz() {}").unwrap();
+
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.files_indexed, 3);
+        assert!(response.chunks_created >= 3);
+    }
+
+    #[tokio::test]
+    async fn test_do_index_with_exclude_patterns() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("include.rs"), "fn included() {}").unwrap();
+        std::fs::write(data_dir.join("exclude.txt"), "excluded").unwrap();
+
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec!["**/*.txt".to_string()],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        // Should only index .rs files
+        assert!(response.files_indexed >= 1);
+    }
+
+    // ===== do_incremental_update Tests =====
+
+    #[tokio::test]
+    async fn test_incremental_update_no_changes() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
+
+        // Initial index
+        do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Incremental update with no changes
+        let result = do_incremental_update(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.mode, crate::types::IndexingMode::Incremental);
+        assert_eq!(response.files_indexed, 0); // files_added
+        assert_eq!(response.files_updated, 0);
+        assert_eq!(response.files_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_update_new_file() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("file1.rs"), "fn foo() {}").unwrap();
+
+        // Initial index
+        do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Add new file
+        std::fs::write(data_dir.join("file2.rs"), "fn bar() {}").unwrap();
+
+        // Incremental update
+        let result = do_incremental_update(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.files_indexed, 1); // 1 new file
+        assert_eq!(response.files_updated, 0);
+        assert_eq!(response.files_removed, 0);
+        assert!(response.chunks_created > 0);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_update_modified_file() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("test.rs"), "fn foo() {}").unwrap();
+
+        // Initial index
+        do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Modify file
+        std::fs::write(data_dir.join("test.rs"), "fn bar() { /* modified */ }").unwrap();
+
+        // Incremental update
+        let result = do_incremental_update(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.files_indexed, 0); // no new files
+        assert_eq!(response.files_updated, 1); // 1 modified
+        assert_eq!(response.files_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_update_removed_file() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("file1.rs"), "fn foo() {}").unwrap();
+        std::fs::write(data_dir.join("file2.rs"), "fn bar() {}").unwrap();
+
+        // Initial index
+        do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Remove a file
+        std::fs::remove_file(data_dir.join("file2.rs")).unwrap();
+
+        // Incremental update
+        let result = do_incremental_update(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.files_indexed, 0);
+        assert_eq!(response.files_updated, 0);
+        assert_eq!(response.files_removed, 1); // 1 removed
+    }
+
+    #[tokio::test]
+    async fn test_incremental_update_mixed_changes() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("existing.rs"), "fn existing() {}").unwrap();
+        std::fs::write(data_dir.join("to_modify.rs"), "fn old() {}").unwrap();
+        std::fs::write(data_dir.join("to_remove.rs"), "fn remove() {}").unwrap();
+
+        // Initial index
+        do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Make mixed changes
+        std::fs::write(data_dir.join("new.rs"), "fn new() {}").unwrap(); // Add
+        std::fs::write(data_dir.join("to_modify.rs"), "fn modified() {}").unwrap(); // Modify
+        std::fs::remove_file(data_dir.join("to_remove.rs")).unwrap(); // Remove
+
+        // Incremental update
+        let result = do_incremental_update(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.files_indexed, 1); // 1 new
+        assert_eq!(response.files_updated, 1); // 1 modified
+        assert_eq!(response.files_removed, 1); // 1 removed
+    }
+
+    // ===== do_index_smart Tests =====
+
+    #[tokio::test]
+    async fn test_smart_index_first_time_full() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
+
+        let result = do_index_smart(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        // First time should be Full
+        assert_eq!(response.mode, crate::types::IndexingMode::Full);
+    }
+
+    #[tokio::test]
+    async fn test_smart_index_second_time_incremental() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
+
+        // First index (full)
+        let result1 = do_index_smart(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result1.mode, crate::types::IndexingMode::Full);
+
+        // Second index (should be incremental)
+        let result2 = do_index_smart(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result2.mode, crate::types::IndexingMode::Incremental);
+    }
+
+    #[tokio::test]
+    async fn test_smart_index_path_normalization() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
+
+        let path = data_dir.to_string_lossy().to_string();
+
+        // First index
+        do_index_smart(&client, path.clone(), None, vec![], vec![], 1024 * 1024, None, None)
+            .await
+            .unwrap();
+
+        // Second index with trailing slash (should still detect as incremental)
+        let path_with_slash = format!("{}/", path);
+        let result = do_index_smart(
+            &client,
+            path_with_slash,
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        // Should succeed (path normalization handles this)
+        assert!(result.is_ok());
+    }
+
+    // ===== Edge Case Tests =====
+
+    #[tokio::test]
+    async fn test_index_with_project_name() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
+
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            Some("my-project".to_string()),
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.files_indexed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_index_preserves_cache_across_operations() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
+
+        // Full index
+        do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Verify cache was saved
+        let cache = client.hash_cache.read().await;
+        let cached_hashes = cache.get_root(&data_dir.to_string_lossy().to_string());
+        assert!(cached_hashes.is_some());
+        assert!(!cached_hashes.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_incremental_update_empty_directory() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+
+        // Incremental update on empty directory (no cache)
+        let result = do_incremental_update(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.mode, crate::types::IndexingMode::Incremental);
+        assert_eq!(response.files_indexed, 0);
+    }
+}
