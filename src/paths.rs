@@ -127,6 +127,59 @@ impl PlatformPaths {
     pub fn default_config_path() -> PathBuf {
         Self::project_config_dir().join("config.toml")
     }
+
+    /// Migrate data from old project-rag directories to new brainwires directories
+    ///
+    /// OLD locations:
+    /// - ~/.local/share/project-rag/
+    /// - ~/.cache/project-rag/
+    /// - ~/.config/project-rag/
+    ///
+    /// NEW locations:
+    /// - ~/.local/share/brainwires/
+    /// - ~/.cache/brainwires/
+    /// - ~/.config/brainwires/
+    pub fn migrate_from_project_rag() -> Result<(), std::io::Error> {
+        let old_data_dir = Self::data_dir().join("project-rag");
+        let old_cache_dir = Self::cache_dir().join("project-rag");
+        let old_config_dir = Self::config_dir().join("project-rag");
+
+        let new_data_dir = Self::project_data_dir();
+        let new_cache_dir = Self::project_cache_dir();
+        let new_config_dir = Self::project_config_dir();
+
+        let mut migrated = false;
+
+        // Migrate data directory
+        if old_data_dir.exists() && !new_data_dir.exists() {
+            std::fs::create_dir_all(new_data_dir.parent().unwrap())?;
+            std::fs::rename(&old_data_dir, &new_data_dir)?;
+            eprintln!("Migrated: {} -> {}", old_data_dir.display(), new_data_dir.display());
+            migrated = true;
+        }
+
+        // Migrate cache directory
+        if old_cache_dir.exists() && !new_cache_dir.exists() {
+            std::fs::create_dir_all(new_cache_dir.parent().unwrap())?;
+            std::fs::rename(&old_cache_dir, &new_cache_dir)?;
+            eprintln!("Migrated: {} -> {}", old_cache_dir.display(), new_cache_dir.display());
+            migrated = true;
+        }
+
+        // Migrate config directory
+        if old_config_dir.exists() && !new_config_dir.exists() {
+            std::fs::create_dir_all(new_config_dir.parent().unwrap())?;
+            std::fs::rename(&old_config_dir, &new_config_dir)?;
+            eprintln!("Migrated: {} -> {}", old_config_dir.display(), new_config_dir.display());
+            migrated = true;
+        }
+
+        if migrated {
+            eprintln!("Migration from project-rag to brainwires complete");
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
