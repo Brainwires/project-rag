@@ -1,3 +1,7 @@
+//! Git history searching functionality
+//!
+//! This module provides semantic search over git commit history with on-demand indexing.
+
 use crate::embedding::EmbeddingProvider;
 use crate::git::{CommitChunker, GitWalker};
 use crate::git_cache::GitCache;

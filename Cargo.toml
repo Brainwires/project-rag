@@ -2,6 +2,7 @@
 name = "project-rag"
 version = "0.1.0"
 edition = "2024"
+description = "RAG-based codebase indexing and semantic search - dual purpose library and MCP server"
 
 [dependencies]
 rmcp = { version = "0.8", features = ["server", "transport-io", "macros"] }
@@ -58,9 +59,16 @@ filetime = "0.2"
 chrono = "0.4"
 
 [features]
+# Vector database backend selection (choose one)
 default = ["lancedb-backend"]
-lancedb-backend = []
-qdrant-backend = ["qdrant-client"]
+lancedb-backend = []  # Embedded LanceDB (no external server required)
+qdrant-backend = ["qdrant-client"]  # External Qdrant server
+
+# Note: There is no "mcp" feature - both library and MCP server are always built together
+# This is a dual-purpose crate that provides:
+# - RagClient: Core library API for embedding in Rust applications
+# - RagMcpServer: MCP protocol server that wraps RagClient
+# - Binary: MCP server that can be run standalone
 
 [lib]
 name = "project_rag"
