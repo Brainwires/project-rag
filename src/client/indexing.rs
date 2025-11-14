@@ -1104,4 +1104,341 @@ mod tests {
         assert_eq!(response.mode, crate::types::IndexingMode::Incremental);
         assert_eq!(response.files_indexed, 0);
     }
+
+    // ===== Error Path Tests =====
+
+    #[tokio::test]
+    async fn test_do_index_nonexistent_path() {
+        let (client, _temp_dir) = create_test_client().await;
+
+        let result = do_index(
+            &client,
+            "/nonexistent/path/12345".to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "Should fail with nonexistent path");
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("Failed to walk directory") || error.contains("Failed to spawn"),
+            "Error should mention directory walking failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_do_index_with_very_large_file() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+
+        // Create a file that exceeds max_file_size
+        let large_content = "x".repeat(2000); // 2KB
+        std::fs::write(data_dir.join("large.rs"), &large_content).unwrap();
+
+        // Also create a small file to ensure indexing doesn't completely fail
+        std::fs::write(data_dir.join("small.rs"), "fn main() {}").unwrap();
+
+        // Set max_file_size to 1KB (1024 bytes)
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024, // 1KB limit
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        // large.rs should be skipped, only small.rs indexed
+        assert_eq!(response.files_indexed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_do_index_with_empty_file() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+
+        // Create an empty file
+        std::fs::write(data_dir.join("empty.rs"), "").unwrap();
+
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        // Empty file might be indexed but produce 0 chunks
+        assert!(response.chunks_created == 0 || response.files_indexed == 0);
+    }
+
+    #[tokio::test]
+    async fn test_do_index_with_binary_file() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+
+        // Create a binary file (mostly non-printable bytes)
+        let binary_content: Vec<u8> = (0..100).map(|i| i as u8).collect();
+        std::fs::write(data_dir.join("binary.bin"), binary_content).unwrap();
+
+        // Also create a valid text file
+        std::fs::write(data_dir.join("text.rs"), "fn main() {}").unwrap();
+
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        // Binary file should be skipped
+        assert!(response.files_indexed >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_do_index_with_include_patterns() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+
+        std::fs::write(data_dir.join("include.rs"), "fn test() {}").unwrap();
+        std::fs::write(data_dir.join("exclude.txt"), "should not be indexed").unwrap();
+
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec!["rs".to_string()], // Only include .rs files
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.files_indexed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_do_index_with_special_characters_in_filename() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+
+        // Create files with special characters (that are allowed by filesystem)
+        std::fs::write(data_dir.join("file-with-dashes.rs"), "fn main() {}").unwrap();
+        std::fs::write(data_dir.join("file_with_underscores.rs"), "fn test() {}").unwrap();
+        std::fs::write(data_dir.join("file.with.dots.rs"), "fn foo() {}").unwrap();
+
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.files_indexed, 3);
+        assert!(response.chunks_created >= 3);
+    }
+
+    #[tokio::test]
+    async fn test_do_index_with_nested_directories() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+
+        let nested_dir = data_dir.join("nested");
+        std::fs::create_dir(&nested_dir).unwrap();
+        let deep_nested = nested_dir.join("deep");
+        std::fs::create_dir(&deep_nested).unwrap();
+
+        std::fs::write(data_dir.join("root.rs"), "fn root() {}").unwrap();
+        std::fs::write(nested_dir.join("nested.rs"), "fn nested() {}").unwrap();
+        std::fs::write(deep_nested.join("deep.rs"), "fn deep() {}").unwrap();
+
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.files_indexed, 3);
+        assert!(response.chunks_created >= 3);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_update_nonexistent_path() {
+        let (client, _temp_dir) = create_test_client().await;
+
+        let result = do_incremental_update(
+            &client,
+            "/nonexistent/path/12345".to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "Should fail with nonexistent path");
+    }
+
+    #[tokio::test]
+    async fn test_smart_index_with_invalid_path() {
+        let (client, _temp_dir) = create_test_client().await;
+
+        let result = do_index_smart(
+            &client,
+            "/nonexistent/path/12345".to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "Smart index should fail with invalid path");
+    }
+
+    #[tokio::test]
+    async fn test_do_index_respects_duration_tracking() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
+
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert!(response.duration_ms > 0, "Duration should be tracked");
+    }
+
+    #[tokio::test]
+    async fn test_do_index_with_whitespace_only_file() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+
+        // Create file with only whitespace
+        std::fs::write(data_dir.join("whitespace.rs"), "   \n\n\t\t  \n  ").unwrap();
+        // Also add a normal file
+        std::fs::write(data_dir.join("normal.rs"), "fn main() {}").unwrap();
+
+        let result = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        // Whitespace file might produce 0 chunks
+        assert!(response.files_indexed >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_update_with_concurrent_file_changes() {
+        let (client, temp_dir) = create_test_client().await;
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("file.rs"), "fn original() {}").unwrap();
+
+        // Initial index
+        let _ = do_index(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Modify file
+        std::fs::write(data_dir.join("file.rs"), "fn modified() {}").unwrap();
+
+        // Incremental update should detect the change
+        let result = do_incremental_update(
+            &client,
+            data_dir.to_string_lossy().to_string(),
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.files_updated, 1, "Should detect 1 modified file");
+    }
 }
