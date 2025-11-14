@@ -18,6 +18,7 @@ This MCP server enables AI assistants to efficiently search and understand large
 - **Git History Search**: Search commit history with smart on-demand indexing (default: 10 commits, only indexes deeper as needed)
 - **Multi-Project Support**: Index and query multiple codebases simultaneously with project filtering
 - **Smart Indexing**: Automatically performs full indexing for new codebases or incremental updates for previously indexed ones
+- **Concurrent Access Protection**: Safe lock management prevents index corruption when multiple agents try to index simultaneously
 - **Stable Embedded Database**: LanceDB vector database (default, no external dependencies) with optional Qdrant support
 - **Language Detection**: Automatic detection of 30+ programming languages
 - **Advanced Filtering**: Search by file type, language, or path patterns
@@ -308,6 +309,34 @@ project-rag/
 - **Ranking**: RRF combines both rankings using 1/(k+rank) formula
 - **Performance**: Both indexes queried in parallel for fast results
 
+### Concurrent Access & Lock Safety
+
+The BM25 (Tantivy) index uses file-based locks to prevent concurrent writes. The system includes smart lock management to handle multiple agents safely:
+
+**Stale Lock Detection:**
+- Lock files are checked for staleness (>5 minutes old)
+- Uses file modification timestamps to detect crashed processes
+- Fresh locks (<5 minutes) are treated as active
+
+**Automatic Recovery:**
+- When indexing fails with a lock error, the system checks if locks are stale
+- **Stale locks** (from crashes): Automatically cleaned up and indexing retries
+- **Active locks** (from running agents): Returns clear error message asking to wait
+
+**Error Messages:**
+- Active indexing detected: `"BM25 index is currently being used by another process. Please wait and try again later."`
+- Stale locks cleaned: Logs warnings and retries automatically
+
+**Thread Safety:**
+- In-process synchronization: Mutex prevents concurrent writers within the same process
+- Cross-process safety: File-based locks prevent concurrent writers across different processes
+- Read operations are always safe and never blocked
+
+**Best Practices:**
+- If you see the "currently being used" error, wait for the other indexing operation to complete
+- Indexing operations typically complete in seconds to minutes depending on codebase size
+- Multiple agents can safely perform search operations simultaneously (reads are never locked)
+
 ### Code Chunking
 - **Default**: Hybrid AST-based chunking
 - **AST Support**: Rust, Python, JavaScript, TypeScript, Go, Java, Swift, C, C++, C#, Ruby, PHP
@@ -325,12 +354,13 @@ project-rag/
 ### Running Tests
 
 ```bash
-# Run all unit tests (10 tests)
+# Run all unit tests (225 tests)
 cargo test --lib
 
 # Run specific module tests
 cargo test --lib types::tests
 cargo test --lib chunker::tests
+cargo test --lib bm25_search::tests  # Includes lock safety tests
 
 # Run with output
 cargo test --lib -- --nocapture
@@ -411,12 +441,13 @@ RUST_LOG=trace cargo run
 - **AST-based chunking** - Semantic code extraction for 12 languages
 - **Multi-project support** - Index and query multiple codebases
 - **Persistent hash cache** - Fast incremental updates across restarts
+- **Concurrent access protection** - Smart lock management prevents index corruption
 - FastEmbed integration for local embeddings
 - Qdrant vector database integration
 - File walking with .gitignore support
 - Language detection (30+ languages)
 - SHA256-based change detection
-- 33 unit tests passing (including 8 BM25/RRF hybrid search tests)
+- 225 unit tests passing (including 11 BM25/RRF/lock safety tests)
 - Comprehensive documentation
 - **Full MCP prompts support enabled**
 - **Hybrid search with Tantivy BM25 + LanceDB vector using RRF**
@@ -460,6 +491,22 @@ RUST_LOG=trace cargo run
   - Typical project (5k files) uses <500MB total
 
 ## Troubleshooting
+
+### Index Lock Errors
+
+**Error: "BM25 index is currently being used by another process"**
+
+This means another agent or process is actively indexing. This is expected behavior to prevent index corruption.
+
+**Solutions:**
+1. **Wait**: Let the current indexing operation complete (typically seconds to minutes)
+2. **Check processes**: Verify no other Claude Code/Desktop instances are running indexing operations
+3. **Force cleanup** (last resort): If you're certain no other process is running, manually remove stale locks:
+   ```bash
+   rm ~/.local/share/project-rag/lancedb/lancedb_bm25/.tantivy-*.lock
+   ```
+
+**Note:** The system automatically detects and cleans up stale locks (>5 minutes old) from crashed processes. You should rarely need manual intervention.
 
 ### Qdrant Connection Fails
 ```bash
