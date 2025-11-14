@@ -225,6 +225,7 @@ impl VectorDatabase for QdrantVectorDB {
         embeddings: Vec<Vec<f32>>,
         metadata: Vec<ChunkMetadata>,
         contents: Vec<String>,
+        _root_path: &str,
     ) -> Result<usize> {
         if embeddings.is_empty() {
             return Ok(0);

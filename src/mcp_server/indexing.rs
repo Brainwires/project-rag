@@ -166,12 +166,12 @@ impl RagMcpServer {
                 .await;
         }
 
-        // Store in vector database
+        // Store in vector database (pass normalized root path for per-project BM25)
         let metadata: Vec<ChunkMetadata> = all_chunks.iter().map(|c| c.metadata.clone()).collect();
         let contents: Vec<String> = all_chunks.iter().map(|c| c.content.clone()).collect();
 
         self.vector_db
-            .store_embeddings(all_embeddings, metadata, contents)
+            .store_embeddings(all_embeddings, metadata, contents, &path)
             .await
             .context("Failed to store embeddings")?;
 
@@ -442,13 +442,13 @@ impl RagMcpServer {
                     .await;
             }
 
-            // Store all embeddings
+            // Store all embeddings (pass normalized root path for per-project BM25)
             let metadata: Vec<ChunkMetadata> =
                 all_chunks.iter().map(|c| c.metadata.clone()).collect();
             let contents: Vec<String> = all_chunks.iter().map(|c| c.content.clone()).collect();
 
             self.vector_db
-                .store_embeddings(all_embeddings.clone(), metadata, contents)
+                .store_embeddings(all_embeddings.clone(), metadata, contents, &path)
                 .await
                 .context("Failed to store embeddings")?;
 

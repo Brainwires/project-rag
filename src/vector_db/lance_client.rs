@@ -21,17 +21,19 @@ use futures::stream::TryStreamExt;
 use lancedb::Table;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// LanceDB vector database implementation (embedded, no server required)
-/// Includes BM25 hybrid search support using Tantivy
+/// Includes BM25 hybrid search support using Tantivy with per-project indexes
 pub struct LanceVectorDB {
     connection: Connection,
     table_name: String,
     db_path: String,
-    /// BM25 search index for keyword matching
-    bm25_index: Arc<RwLock<Option<BM25Search>>>,
+    /// Per-project BM25 search indexes for keyword matching
+    /// Key: hashed root path, Value: BM25Search instance
+    bm25_indexes: Arc<RwLock<HashMap<String, BM25Search>>>,
 }
 
 impl LanceVectorDB {
@@ -50,15 +52,15 @@ impl LanceVectorDB {
             .await
             .context("Failed to connect to LanceDB")?;
 
-        // Initialize BM25 index
-        let bm25_path = format!("{}/lancedb_bm25", db_path);
-        let bm25_index = BM25Search::new(&bm25_path).context("Failed to initialize BM25 index")?;
+        // Initialize empty per-project BM25 index map
+        // BM25 indexes are created on-demand per root path
+        let bm25_indexes = Arc::new(RwLock::new(HashMap::new()));
 
         Ok(Self {
             connection,
             table_name: "code_embeddings".to_string(),
             db_path: db_path.to_string(),
-            bm25_index: Arc::new(RwLock::new(Some(bm25_index))),
+            bm25_indexes,
         })
     }
 
@@ -67,6 +69,61 @@ impl LanceVectorDB {
         crate::paths::PlatformPaths::default_lancedb_path()
             .to_string_lossy()
             .to_string()
+    }
+
+    /// Hash a root path to create a unique identifier for per-project BM25 indexes
+    fn hash_root_path(root_path: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(root_path.as_bytes());
+        let result = hasher.finalize();
+        // Use first 16 characters of hex hash for brevity
+        format!("{:x}", result)[..16].to_string()
+    }
+
+    /// Get the BM25 index path for a specific root path
+    fn bm25_path_for_root(&self, root_path: &str) -> String {
+        let hash = Self::hash_root_path(root_path);
+        format!("{}/bm25_{}", self.db_path, hash)
+    }
+
+    /// Get or create a BM25 index for a specific root path
+    fn get_or_create_bm25(&self, root_path: &str) -> Result<()> {
+        let hash = Self::hash_root_path(root_path);
+
+        // Check if already exists (read lock)
+        {
+            let indexes = self.bm25_indexes.read().map_err(|e| {
+                anyhow::anyhow!("Failed to acquire read lock on BM25 indexes: {}", e)
+            })?;
+            if indexes.contains_key(&hash) {
+                return Ok(()); // Already exists
+            }
+        }
+
+        // Need to create new index (write lock)
+        let mut indexes = self
+            .bm25_indexes
+            .write()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire write lock on BM25 indexes: {}", e))?;
+
+        // Double-check after acquiring write lock (another thread might have created it)
+        if indexes.contains_key(&hash) {
+            return Ok(());
+        }
+
+        let bm25_path = self.bm25_path_for_root(root_path);
+        tracing::info!(
+            "Creating BM25 index for root path '{}' at: {}",
+            root_path,
+            bm25_path
+        );
+
+        let bm25_index = BM25Search::new(&bm25_path)
+            .with_context(|| format!("Failed to initialize BM25 index for root: {}", root_path))?;
+
+        indexes.insert(hash, bm25_index);
+
+        Ok(())
     }
 
     /// Create schema for the embeddings table
@@ -244,6 +301,7 @@ impl VectorDatabase for LanceVectorDB {
         embeddings: Vec<Vec<f32>>,
         metadata: Vec<ChunkMetadata>,
         contents: Vec<String>,
+        root_path: &str,
     ) -> Result<usize> {
         if embeddings.is_empty() {
             return Ok(0);
@@ -272,7 +330,10 @@ impl VectorDatabase for LanceVectorDB {
             .await
             .context("Failed to add records to table")?;
 
-        // Add documents to BM25 index with file_path for deletion tracking
+        // Ensure BM25 index exists for this root path
+        self.get_or_create_bm25(root_path)?;
+
+        // Add documents to per-project BM25 index with file_path for deletion tracking
         let bm25_docs: Vec<_> = (0..count)
             .map(|i| {
                 let id = current_count + i as u64;
@@ -280,17 +341,23 @@ impl VectorDatabase for LanceVectorDB {
             })
             .collect();
 
-        let bm25_lock = self
-            .bm25_index
+        let hash = Self::hash_root_path(root_path);
+        let bm25_indexes = self
+            .bm25_indexes
             .read()
             .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
-        if let Some(bm25) = bm25_lock.as_ref() {
+
+        if let Some(bm25) = bm25_indexes.get(&hash) {
             bm25.add_documents(bm25_docs)
                 .context("Failed to add documents to BM25 index")?;
         }
-        drop(bm25_lock);
+        drop(bm25_indexes);
 
-        tracing::info!("Stored {} embeddings with BM25 indexing", count);
+        tracing::info!(
+            "Stored {} embeddings with BM25 indexing for root: {}",
+            count,
+            root_path
+        );
         Ok(count)
     }
 
@@ -360,30 +427,33 @@ impl VectorDatabase for LanceVectorDB {
                 row_offset += batch.num_rows() as u64;
             }
 
-            // BM25 keyword search
-            let bm25_lock = self
-                .bm25_index
+            // BM25 keyword search across all per-project indexes
+            let bm25_indexes = self
+                .bm25_indexes
                 .read()
                 .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
-            let bm25_results = if let Some(bm25) = bm25_lock.as_ref() {
-                let all_bm25_results = bm25
+
+            let mut all_bm25_results = Vec::new();
+            for (root_hash, bm25) in bm25_indexes.iter() {
+                tracing::debug!("Searching BM25 index for root hash: {}", root_hash);
+                let results = bm25
                     .search(query_text, search_limit)
                     .context("Failed to search BM25 index")?;
 
                 // Store BM25 scores (don't filter - let RRF combine them)
                 // BM25 scores are not normalized to 0-1 range, so min_score doesn't apply
-                for result in &all_bm25_results {
+                for result in &results {
                     original_scores
                         .entry(result.id)
                         .and_modify(|e| e.1 = Some(result.score))
                         .or_insert((0.0, Some(result.score))); // No vector score, only keyword
                 }
 
-                all_bm25_results
-            } else {
-                Vec::new()
-            };
-            drop(bm25_lock);
+                all_bm25_results.extend(results);
+            }
+            drop(bm25_indexes);
+
+            let bm25_results = all_bm25_results;
 
             // Combine results with Reciprocal Rank Fusion
             // RRF produces scores ~0.01-0.03, so don't apply min_score to combined scores
@@ -638,18 +708,24 @@ impl VectorDatabase for LanceVectorDB {
 
     async fn delete_by_file(&self, file_path: &str) -> Result<usize> {
         // Delete from BM25 index first (using file_path field)
+        // Delete from all per-project BM25 indexes
         // Must be done in a scope to drop lock before await
         {
-            let bm25_lock = self
-                .bm25_index
+            let bm25_indexes = self
+                .bm25_indexes
                 .read()
                 .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
-            if let Some(bm25) = bm25_lock.as_ref() {
+
+            for (root_hash, bm25) in bm25_indexes.iter() {
                 bm25.delete_by_file_path(file_path)
                     .context("Failed to delete from BM25 index")?;
-                tracing::debug!("Deleted BM25 entries for file: {}", file_path);
+                tracing::debug!(
+                    "Deleted BM25 entries for file: {} in index: {}",
+                    file_path,
+                    root_hash
+                );
             }
-        } // bm25_lock dropped here
+        } // bm25_indexes dropped here
 
         let table = self.get_table().await?;
 
@@ -674,17 +750,19 @@ impl VectorDatabase for LanceVectorDB {
             .await
             .context("Failed to drop table")?;
 
-        // Clear BM25 index
-        let bm25_lock = self
-            .bm25_index
+        // Clear all per-project BM25 indexes
+        let bm25_indexes = self
+            .bm25_indexes
             .read()
             .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
-        if let Some(bm25) = bm25_lock.as_ref() {
-            bm25.clear().context("Failed to clear BM25 index")?;
-        }
-        drop(bm25_lock);
 
-        tracing::info!("Cleared all embeddings and BM25 index");
+        for (root_hash, bm25) in bm25_indexes.iter() {
+            bm25.clear().context("Failed to clear BM25 index")?;
+            tracing::info!("Cleared BM25 index for root hash: {}", root_hash);
+        }
+        drop(bm25_indexes);
+
+        tracing::info!("Cleared all embeddings and all per-project BM25 indexes");
         Ok(())
     }
 
@@ -747,7 +825,7 @@ impl VectorDatabase for LanceVectorDB {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use tempfile::{TempDir, tempdir};
 
     fn create_test_metadata(file_path: &str, start_line: usize, end_line: usize) -> ChunkMetadata {
         ChunkMetadata {
@@ -832,7 +910,9 @@ mod tests {
         let db = LanceVectorDB::with_path(&db_path).await.unwrap();
         db.initialize(384).await.unwrap();
 
-        let result = db.store_embeddings(vec![], vec![], vec![]).await;
+        let result = db
+            .store_embeddings(vec![], vec![], vec![], "/test/root")
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
     }
@@ -857,7 +937,7 @@ mod tests {
         let contents = vec!["fn main() {}".to_string(), "fn test() {}".to_string()];
 
         let count = db
-            .store_embeddings(embeddings.clone(), metadata, contents)
+            .store_embeddings(embeddings.clone(), metadata, contents, "/test/root")
             .await
             .unwrap();
         assert_eq!(count, 2);
@@ -886,7 +966,7 @@ mod tests {
         let embeddings = vec![vec![0.1; 384]];
         let metadata = vec![create_test_metadata("test.rs", 1, 10)];
         let contents = vec!["fn main() {}".to_string()];
-        db.store_embeddings(embeddings, metadata, contents)
+        db.store_embeddings(embeddings, metadata, contents, "/test/root")
             .await
             .unwrap();
 
@@ -919,7 +999,7 @@ mod tests {
         let embeddings = vec![vec![0.1; 384]];
         let metadata = vec![create_test_metadata("test.rs", 1, 10)];
         let contents = vec!["fn main() { println!(\"hello\"); }".to_string()];
-        db.store_embeddings(embeddings, metadata, contents)
+        db.store_embeddings(embeddings, metadata, contents, "/test/root")
             .await
             .unwrap();
 
@@ -951,7 +1031,7 @@ mod tests {
         let embeddings = vec![vec![0.1; 384]];
         let metadata = vec![create_test_metadata("test.rs", 1, 10)];
         let contents = vec!["fn main() {}".to_string()];
-        db.store_embeddings(embeddings, metadata, contents)
+        db.store_embeddings(embeddings, metadata, contents, "/test/root")
             .await
             .unwrap();
 
@@ -986,7 +1066,7 @@ mod tests {
         let metadata = vec![meta1, meta2];
         let contents = vec!["fn main() {}".to_string(), "fn test() {}".to_string()];
 
-        db.store_embeddings(embeddings, metadata, contents)
+        db.store_embeddings(embeddings, metadata, contents, "/test/root")
             .await
             .unwrap();
 
@@ -1022,7 +1102,7 @@ mod tests {
         ];
         let contents = vec!["fn main() {}".to_string(), "[package]".to_string()];
 
-        db.store_embeddings(embeddings, metadata, contents)
+        db.store_embeddings(embeddings, metadata, contents, "/test/root")
             .await
             .unwrap();
 
@@ -1065,7 +1145,7 @@ mod tests {
         let metadata = vec![create_test_metadata("test.rs", 1, 10)];
         let contents = vec!["fn main() {}".to_string()];
 
-        db.store_embeddings(embeddings, metadata, contents)
+        db.store_embeddings(embeddings, metadata, contents, "/test/root")
             .await
             .unwrap();
 
@@ -1111,7 +1191,7 @@ mod tests {
         ];
         let contents = vec!["fn main() {}".to_string(), "fn test() {}".to_string()];
 
-        db.store_embeddings(embeddings, metadata, contents)
+        db.store_embeddings(embeddings, metadata, contents, "/test/root")
             .await
             .unwrap();
 
@@ -1157,7 +1237,7 @@ mod tests {
         ];
         let contents = vec!["fn main() {}".to_string(), "fn test() {}".to_string()];
 
-        db.store_embeddings(embeddings, metadata, contents)
+        db.store_embeddings(embeddings, metadata, contents, "/test/root")
             .await
             .unwrap();
 
@@ -1194,7 +1274,7 @@ mod tests {
         let metadata = vec![create_test_metadata("test.rs", 1, 10)];
         let contents = vec!["fn main() {}".to_string()];
 
-        db.store_embeddings(embeddings, metadata, contents)
+        db.store_embeddings(embeddings, metadata, contents, "/test/root")
             .await
             .unwrap();
 
@@ -1251,7 +1331,7 @@ mod tests {
             "def main(): pass".to_string(),
         ];
 
-        db.store_embeddings(embeddings, metadata, contents)
+        db.store_embeddings(embeddings, metadata, contents, "/test/root")
             .await
             .unwrap();
 
@@ -1334,7 +1414,7 @@ mod tests {
         let embeddings = vec![vec![0.1; 384]];
         let metadata = vec![create_test_metadata("test.rs", 1, 10)];
         let contents = vec!["fn main() {}".to_string()];
-        db.store_embeddings(embeddings, metadata, contents)
+        db.store_embeddings(embeddings, metadata, contents, "/test/root")
             .await
             .unwrap();
 
@@ -1347,5 +1427,86 @@ mod tests {
                 .unwrap();
             assert_eq!(results.len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn test_per_project_bm25_isolation() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("lancedb")
+            .to_string_lossy()
+            .to_string();
+        let db = LanceVectorDB::with_path(&db_path).await.unwrap();
+        db.initialize(384).await.unwrap();
+
+        // Index first project
+        let project1_embeddings = vec![vec![0.1; 384], vec![0.2; 384]];
+        let project1_metadata = vec![
+            create_test_metadata("/project1/main.rs", 1, 10),
+            create_test_metadata("/project1/lib.rs", 1, 20),
+        ];
+        let project1_contents = vec![
+            "fn main() { println!(\"Project 1\"); }".to_string(),
+            "pub fn lib_func() {}".to_string(),
+        ];
+        db.store_embeddings(
+            project1_embeddings,
+            project1_metadata,
+            project1_contents,
+            "/normalized/project1",
+        )
+        .await
+        .unwrap();
+
+        // Index second project with different root
+        let project2_embeddings = vec![vec![0.3; 384], vec![0.4; 384]];
+        let project2_metadata = vec![
+            create_test_metadata("/project2/main.rs", 1, 10),
+            create_test_metadata("/project2/utils.rs", 1, 15),
+        ];
+        let project2_contents = vec![
+            "fn main() { println!(\"Project 2\"); }".to_string(),
+            "pub fn util_func() {}".to_string(),
+        ];
+        db.store_embeddings(
+            project2_embeddings,
+            project2_metadata,
+            project2_contents,
+            "/normalized/project2",
+        )
+        .await
+        .unwrap();
+
+        // Verify both projects can be searched (hybrid search across all BM25 indexes)
+        let query = vec![0.15; 384];
+        let results = db
+            .search(query.clone(), "main", 10, 0.0, None, true)
+            .await
+            .unwrap();
+
+        // Should find results from both projects
+        assert!(results.len() >= 2, "Should find results from both projects");
+
+        // Verify BM25 indexes were created for both projects
+        let bm25_indexes = db.bm25_indexes.read().unwrap();
+        assert_eq!(bm25_indexes.len(), 2, "Should have 2 separate BM25 indexes");
+
+        // Verify the hashes are different for different root paths
+        let hash1 = LanceVectorDB::hash_root_path("/normalized/project1");
+        let hash2 = LanceVectorDB::hash_root_path("/normalized/project2");
+        assert_ne!(
+            hash1, hash2,
+            "Different root paths should have different hashes"
+        );
+
+        assert!(
+            bm25_indexes.contains_key(&hash1),
+            "Should have index for project1"
+        );
+        assert!(
+            bm25_indexes.contains_key(&hash2),
+            "Should have index for project2"
+        );
     }
 }

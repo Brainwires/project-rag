@@ -13,6 +13,8 @@ pub struct BM25Search {
     id_field: Field,
     content_field: Field,
     file_path_field: Field,
+    /// Path to the index directory (needed for lock cleanup)
+    index_path: std::path::PathBuf,
     /// Mutex to ensure only one IndexWriter is created at a time
     writer_lock: Mutex<()>,
 }
@@ -51,8 +53,59 @@ impl BM25Search {
             id_field,
             content_field,
             file_path_field,
+            index_path,
             writer_lock: Mutex::new(()),
         })
+    }
+
+    /// Check if a lock file is stale (older than 5 minutes with no recent activity)
+    fn is_lock_stale(lock_path: &Path) -> bool {
+        if !lock_path.exists() {
+            return false;
+        }
+
+        // Check file modification time
+        if let Ok(metadata) = std::fs::metadata(lock_path)
+            && let Ok(modified) = metadata.modified()
+            && let Ok(elapsed) = modified.elapsed()
+        {
+            // Consider lock stale if older than 5 minutes
+            return elapsed.as_secs() > 300;
+        }
+
+        false
+    }
+
+    /// Try to clean up stale lock files only if they appear to be from crashed processes
+    fn try_cleanup_stale_locks(index_path: &Path) -> Result<bool> {
+        let writer_lock = index_path.join(".tantivy-writer.lock");
+        let meta_lock = index_path.join(".tantivy-meta.lock");
+
+        let writer_stale = Self::is_lock_stale(&writer_lock);
+        let meta_stale = Self::is_lock_stale(&meta_lock);
+
+        if !writer_stale && !meta_stale {
+            return Ok(false); // Locks appear to be active
+        }
+
+        if writer_stale && writer_lock.exists() {
+            tracing::warn!(
+                "Removing stale Tantivy writer lock file (>5min old): {:?}",
+                writer_lock
+            );
+            std::fs::remove_file(&writer_lock)
+                .context("Failed to remove stale writer lock file")?;
+        }
+
+        if meta_stale && meta_lock.exists() {
+            tracing::warn!(
+                "Removing stale Tantivy meta lock file (>5min old): {:?}",
+                meta_lock
+            );
+            std::fs::remove_file(&meta_lock).context("Failed to remove stale meta lock file")?;
+        }
+
+        Ok(true) // Cleaned up stale locks
     }
 
     /// Add documents to the index
@@ -60,16 +113,53 @@ impl BM25Search {
     /// Arguments:
     /// * `documents` - Vec of (id, content, file_path) tuples
     pub fn add_documents(&self, documents: Vec<(u64, String, String)>) -> Result<()> {
-        // Lock to ensure only one writer at a time
+        // Lock to ensure only one writer at a time (within this process)
         let _guard = self
             .writer_lock
             .lock()
             .map_err(|e| anyhow::anyhow!("Failed to acquire writer lock: {}", e))?;
 
-        let mut index_writer: IndexWriter<TantivyDocument> = self
-            .index
-            .writer(50_000_000)
-            .context("Failed to create index writer")?;
+        // Try to create the index writer
+        let mut index_writer: IndexWriter<TantivyDocument> = match self.index.writer(50_000_000) {
+            Ok(writer) => writer,
+            Err(e) => {
+                // Check if this is a lock error
+                let error_msg = format!("{}", e);
+                if error_msg.contains("lock") || error_msg.contains("Lock") {
+                    tracing::warn!(
+                        "Index writer creation failed (possibly locked), checking for stale locks..."
+                    );
+
+                    // Try to cleanup stale locks
+                    match Self::try_cleanup_stale_locks(&self.index_path) {
+                        Ok(true) => {
+                            // Stale locks were cleaned up, retry once
+                            tracing::info!("Stale locks cleaned up, retrying writer creation...");
+                            self.index.writer(50_000_000).context(
+                                "Failed to create index writer after cleaning stale locks",
+                            )?
+                        }
+                        Ok(false) => {
+                            // Locks exist but are not stale (another process is actively using the index)
+                            return Err(anyhow::anyhow!(
+                                "BM25 index is currently being used by another process. Please wait and try again later."
+                            ));
+                        }
+                        Err(cleanup_err) => {
+                            // Failed to cleanup locks
+                            return Err(anyhow::anyhow!(
+                                "Failed to create index writer (locked) and failed to cleanup stale locks: {}. Original error: {}",
+                                cleanup_err,
+                                e
+                            ));
+                        }
+                    }
+                } else {
+                    // Not a lock error, propagate original error
+                    return Err(e).context("Failed to create index writer");
+                }
+            }
+        };
 
         for (id, content, file_path) in documents {
             let doc = doc!(
@@ -489,6 +579,77 @@ mod tests {
         assert!(
             combined[0].1 > combined[1].1,
             "ID 1 should have highest score"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_stale_locks() {
+        use std::fs::File;
+        use std::time::{Duration, SystemTime};
+
+        let temp_dir = tempdir().unwrap();
+        let index_path = temp_dir.path();
+
+        // Create an index first
+        let bm25 = BM25Search::new(index_path).unwrap();
+
+        // Create fake stale lock files (simulating a crash from 10 minutes ago)
+        let writer_lock = index_path.join(".tantivy-writer.lock");
+        let meta_lock = index_path.join(".tantivy-meta.lock");
+        File::create(&writer_lock).unwrap();
+        File::create(&meta_lock).unwrap();
+
+        // Make the lock files appear old (more than 5 minutes)
+        // Note: On some systems, we can't modify file times backwards, so we test the logic differently
+        let old_time = SystemTime::now() - Duration::from_secs(400);
+        let _ =
+            filetime::set_file_mtime(&writer_lock, filetime::FileTime::from_system_time(old_time));
+        let _ =
+            filetime::set_file_mtime(&meta_lock, filetime::FileTime::from_system_time(old_time));
+
+        // Try to add documents - should detect stale locks and clean them up
+        let docs = vec![(1, "test document".to_string(), "/test.txt".to_string())];
+        let result = bm25.add_documents(docs);
+
+        // Should succeed after cleaning up stale locks
+        assert!(
+            result.is_ok(),
+            "Should clean up stale locks and succeed: {:?}",
+            result.err()
+        );
+
+        // Verify the index works
+        let results = bm25.search("test", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_is_lock_stale() {
+        use std::fs::File;
+        use std::time::{Duration, SystemTime};
+
+        let temp_dir = tempdir().unwrap();
+        let lock_path = temp_dir.path().join("test.lock");
+
+        // Non-existent file is not stale
+        assert!(!BM25Search::is_lock_stale(&lock_path));
+
+        // Create a fresh lock file
+        File::create(&lock_path).unwrap();
+        assert!(
+            !BM25Search::is_lock_stale(&lock_path),
+            "Fresh lock should not be stale"
+        );
+
+        // Make the lock file old (simulate 10 minutes ago)
+        let old_time = SystemTime::now() - Duration::from_secs(600);
+        filetime::set_file_mtime(&lock_path, filetime::FileTime::from_system_time(old_time))
+            .unwrap();
+
+        // Now it should be stale
+        assert!(
+            BM25Search::is_lock_stale(&lock_path),
+            "Old lock should be stale"
         );
     }
 }

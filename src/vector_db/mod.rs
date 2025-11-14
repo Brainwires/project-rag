@@ -18,11 +18,13 @@ pub trait VectorDatabase: Send + Sync {
     async fn initialize(&self, dimension: usize) -> Result<()>;
 
     /// Store embeddings with metadata
+    /// root_path: The normalized root path being indexed (for per-project BM25 isolation)
     async fn store_embeddings(
         &self,
         embeddings: Vec<Vec<f32>>,
         metadata: Vec<ChunkMetadata>,
         contents: Vec<String>,
+        root_path: &str,
     ) -> Result<usize>;
 
     /// Search for similar vectors

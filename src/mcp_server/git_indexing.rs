@@ -114,9 +114,9 @@ where
 
             tracing::info!("Generated {} embeddings", embeddings.len());
 
-            // Store in vector database
+            // Store in vector database (use repo_path for per-project BM25)
             let stored = vector_db
-                .store_embeddings(embeddings, metadatas, contents)
+                .store_embeddings(embeddings, metadatas, contents, &repo_path)
                 .await
                 .context("Failed to store commit embeddings")?;
 

@@ -51,6 +51,7 @@ rayon = "1.10"
 [dev-dependencies]
 tempfile = "3.0"
 criterion = { version = "0.5", features = ["async_tokio"] }
+filetime = "0.2"
 
 [build-dependencies]
 chrono = "0.4"
