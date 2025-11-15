@@ -63,6 +63,9 @@ pub struct IndexResponse {
 pub struct QueryRequest {
     /// The question or search query
     pub query: String,
+    /// Optional path to filter by specific indexed codebase
+    #[serde(default)]
+    pub path: Option<String>,
     /// Optional project name to filter by
     #[serde(default)]
     pub project: Option<String>,
@@ -94,6 +97,9 @@ fn default_min_score() -> f32 {
 pub struct SearchResult {
     /// File path relative to the indexed root
     pub file_path: String,
+    /// Absolute path to the indexed root directory
+    #[serde(default)]
+    pub root_path: Option<String>,
     /// The code chunk content
     pub content: String,
     /// Combined similarity score (0.0 to 1.0)
@@ -202,6 +208,9 @@ pub struct IncrementalUpdateResponse {
 pub struct AdvancedSearchRequest {
     /// The search query
     pub query: String,
+    /// Optional path to filter by specific indexed codebase
+    #[serde(default)]
+    pub path: Option<String>,
     /// Optional project name to filter by
     #[serde(default)]
     pub project: Option<String>,
@@ -310,6 +319,9 @@ pub struct SearchGitHistoryResponse {
 pub struct ChunkMetadata {
     /// File path relative to indexed root
     pub file_path: String,
+    /// Absolute path to the indexed root directory
+    #[serde(default)]
+    pub root_path: Option<String>,
     /// Project name (for multi-project support)
     pub project: Option<String>,
     /// Starting line number
@@ -435,6 +447,7 @@ impl AdvancedSearchRequest {
         // Reuse QueryRequest validation logic
         let query_req = QueryRequest {
             query: self.query.clone(),
+            path: None,
             project: self.project.clone(),
             limit: self.limit,
             min_score: self.min_score,
@@ -535,170 +548,6 @@ impl SearchGitHistoryRequest {
     }
 }
 
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_index_request_defaults() {
-        let req = IndexRequest {
-            path: "/test".to_string(),
-            project: None,
-            include_patterns: vec![],
-            exclude_patterns: vec![],
-            max_file_size: default_max_file_size(),
-        };
-
-        assert_eq!(req.max_file_size, 1_048_576);
-        assert!(req.include_patterns.is_empty());
-        assert!(req.exclude_patterns.is_empty());
-    }
-
-    #[test]
-    fn test_index_response_full_mode() {
-        let response = IndexResponse {
-            mode: IndexingMode::Full,
-            files_indexed: 100,
-            chunks_created: 500,
-            embeddings_generated: 500,
-            duration_ms: 1000,
-            errors: vec![],
-            files_updated: 0,
-            files_removed: 0,
-        };
-
-        assert!(matches!(response.mode, IndexingMode::Full));
-        assert_eq!(response.files_indexed, 100);
-        assert_eq!(response.files_updated, 0);
-        assert_eq!(response.files_removed, 0);
-    }
-
-    #[test]
-    fn test_index_response_incremental_mode() {
-        let response = IndexResponse {
-            mode: IndexingMode::Incremental,
-            files_indexed: 10,
-            chunks_created: 50,
-            embeddings_generated: 50,
-            duration_ms: 500,
-            errors: vec![],
-            files_updated: 5,
-            files_removed: 2,
-        };
-
-        assert!(matches!(response.mode, IndexingMode::Incremental));
-        assert_eq!(response.files_indexed, 10);
-        assert_eq!(response.files_updated, 5);
-        assert_eq!(response.files_removed, 2);
-    }
-
-    #[test]
-    fn test_query_request_defaults() {
-        let req = QueryRequest {
-            query: "test".to_string(),
-            project: None,
-            limit: default_limit(),
-            min_score: default_min_score(),
-            hybrid: default_hybrid(),
-        };
-
-        assert_eq!(req.limit, 10);
-        assert_eq!(req.min_score, 0.7);
-        assert!(req.hybrid);
-    }
-
-    #[test]
-    fn test_serialization_roundtrip() {
-        let req = IndexRequest {
-            path: "/test/path".to_string(),
-            project: Some("my-project".to_string()),
-            include_patterns: vec!["**/*.rs".to_string()],
-            exclude_patterns: vec!["**/target/**".to_string()],
-            max_file_size: 2_000_000,
-        };
-
-        let json = serde_json::to_string(&req).unwrap();
-        let deserialized: IndexRequest = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(req.path, deserialized.path);
-        assert_eq!(req.include_patterns, deserialized.include_patterns);
-        assert_eq!(req.exclude_patterns, deserialized.exclude_patterns);
-        assert_eq!(req.max_file_size, deserialized.max_file_size);
-    }
-
-    #[test]
-    fn test_search_result_creation() {
-        let result = SearchResult {
-            file_path: "src/main.rs".to_string(),
-            content: "fn main() {}".to_string(),
-            score: 0.95,
-            vector_score: 0.92,
-            keyword_score: Some(0.85),
-            start_line: 1,
-            end_line: 10,
-            language: "Rust".to_string(),
-            project: None,
-        };
-
-        assert_eq!(result.score, 0.95);
-        assert_eq!(result.vector_score, 0.92);
-        assert_eq!(result.keyword_score, Some(0.85));
-        assert_eq!(result.language, "Rust");
-    }
-
-    #[test]
-    fn test_chunk_metadata_creation() {
-        let metadata = ChunkMetadata {
-            file_path: "src/lib.rs".to_string(),
-            project: Some("test-project".to_string()),
-            start_line: 1,
-            end_line: 50,
-            language: Some("Rust".to_string()),
-            extension: Some("rs".to_string()),
-            file_hash: "abc123".to_string(),
-            indexed_at: 1234567890,
-        };
-
-        assert_eq!(metadata.start_line, 1);
-        assert_eq!(metadata.end_line, 50);
-        assert_eq!(metadata.file_hash, "abc123");
-        assert_eq!(metadata.project, Some("test-project".to_string()));
-    }
-
-    #[test]
-    fn test_clear_response() {
-        let response = ClearResponse {
-            success: true,
-            message: "Cleared successfully".to_string(),
-        };
-
-        assert!(response.success);
-        assert!(!response.message.is_empty());
-    }
-
-    #[test]
-    fn test_statistics_response() {
-        let stats = StatisticsResponse {
-            total_files: 100,
-            total_chunks: 500,
-            total_embeddings: 500,
-            database_size_bytes: 1024 * 1024,
-            language_breakdown: vec![
-                LanguageStats {
-                    language: "Rust".to_string(),
-                    file_count: 80,
-                    chunk_count: 400,
-                },
-                LanguageStats {
-                    language: "TOML".to_string(),
-                    file_count: 20,
-                    chunk_count: 100,
-                },
-            ],
-        };
-
-        assert_eq!(stats.total_files, 100);
-        assert_eq!(stats.language_breakdown.len(), 2);
-        assert_eq!(stats.language_breakdown[0].language, "Rust");
-    }
-}
+mod tests;

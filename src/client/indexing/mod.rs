@@ -1,4 +1,4 @@
-use super::RagMcpServer;
+use super::RagClient;
 use crate::embedding::EmbeddingProvider;
 use crate::indexer::FileWalker;
 use crate::types::{ChunkMetadata, IndexResponse};
@@ -9,11 +9,10 @@ use rmcp::{Peer, RoleServer, model::ProgressNotificationParam, model::ProgressTo
 use std::collections::HashMap;
 use std::time::Instant;
 
-impl RagMcpServer {
-    /// Index a complete codebase
-    #[allow(clippy::too_many_arguments)]
-    pub async fn do_index(
-        &self,
+/// Index a complete codebase
+#[allow(clippy::too_many_arguments)]
+pub async fn do_index(
+        client: &RagClient,
         path: String,
         project: Option<String>,
         include_patterns: Vec<String>,
@@ -61,7 +60,7 @@ impl RagMcpServer {
         }
 
         // Chunk all files in parallel for better performance
-        let chunker = self.chunker.clone();
+        let chunker = client.chunker.clone();
         let all_chunks: Vec<_> = files
             .par_iter()
             .flat_map(|file| chunker.chunk_file(file))
@@ -98,8 +97,8 @@ impl RagMcpServer {
         }
 
         // Generate embeddings in batches (using config values)
-        let batch_size = self.config.embedding.batch_size;
-        let timeout_secs = self.config.embedding.timeout_secs;
+        let batch_size = client.config.embedding.batch_size;
+        let timeout_secs = client.config.embedding.timeout_secs;
         let mut all_embeddings = Vec::with_capacity(all_chunks.len());
         let total_batches = all_chunks.len().div_ceil(batch_size);
 
@@ -107,7 +106,7 @@ impl RagMcpServer {
             let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
 
             // Generate embeddings with timeout protection (configurable)
-            let provider = self.embedding_provider.clone();
+            let provider = client.embedding_provider.clone();
             let embed_future = tokio::task::spawn_blocking(move || provider.embed_batch(texts));
 
             match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), embed_future)
@@ -170,7 +169,7 @@ impl RagMcpServer {
         let metadata: Vec<ChunkMetadata> = all_chunks.iter().map(|c| c.metadata.clone()).collect();
         let contents: Vec<String> = all_chunks.iter().map(|c| c.content.clone()).collect();
 
-        self.vector_db
+        client.vector_db
             .store_embeddings(all_embeddings, metadata, contents, &path)
             .await
             .context("Failed to store embeddings")?;
@@ -193,11 +192,11 @@ impl RagMcpServer {
             .map(|f| (f.relative_path.clone(), f.hash.clone()))
             .collect();
 
-        let mut cache = self.hash_cache.write().await;
+        let mut cache = client.hash_cache.write().await;
         cache.update_root(path, file_hashes);
 
         // Persist to disk
-        if let Err(e) = cache.save(&self.cache_path) {
+        if let Err(e) = cache.save(&client.cache_path) {
             tracing::warn!("Failed to save hash cache: {}", e);
         }
 
@@ -214,7 +213,7 @@ impl RagMcpServer {
         }
 
         // Flush the index to disk
-        self.vector_db
+        client.vector_db
             .flush()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to flush index to disk: {}", e))?;
@@ -243,10 +242,10 @@ impl RagMcpServer {
         })
     }
 
-    /// Perform incremental update (only changed files)
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn do_incremental_update(
-        &self,
+/// Perform incremental update (only changed files)
+#[allow(clippy::too_many_arguments)]
+pub async fn do_incremental_update(
+        client: &RagClient,
         path: String,
         project: Option<String>,
         include_patterns: Vec<String>,
@@ -270,7 +269,7 @@ impl RagMcpServer {
         }
 
         // Get existing file hashes from persistent cache
-        let cache = self.hash_cache.read().await;
+        let cache = client.hash_cache.read().await;
         let existing_hashes = cache.get_root(&path).cloned().unwrap_or_default();
         drop(cache);
 
@@ -334,7 +333,7 @@ impl RagMcpServer {
                 }
                 Some(old_hash) if old_hash != &file.hash => {
                     // Modified file - delete old embeddings first
-                    if let Err(e) = self.vector_db.delete_by_file(&file.relative_path).await {
+                    if let Err(e) = client.vector_db.delete_by_file(&file.relative_path).await {
                         tracing::warn!("Failed to delete old embeddings: {}", e);
                     }
                     files_updated += 1;
@@ -350,7 +349,7 @@ impl RagMcpServer {
         for old_file in existing_hashes.keys() {
             if !new_hashes.contains_key(old_file) {
                 files_removed += 1;
-                if let Err(e) = self.vector_db.delete_by_file(old_file).await {
+                if let Err(e) = client.vector_db.delete_by_file(old_file).await {
                     tracing::warn!("Failed to delete embeddings for removed file: {}", e);
                 }
             }
@@ -374,7 +373,7 @@ impl RagMcpServer {
         // Index new/modified files
         let embeddings_generated = if !files_to_index.is_empty() {
             // Chunk files in parallel for better performance
-            let chunker = self.chunker.clone();
+            let chunker = client.chunker.clone();
             let all_chunks: Vec<_> = files_to_index
                 .par_iter()
                 .flat_map(|file| chunker.chunk_file(file))
@@ -398,14 +397,14 @@ impl RagMcpServer {
             }
 
             // Generate embeddings in batches (using config values)
-            let batch_size = self.config.embedding.batch_size;
+            let batch_size = client.config.embedding.batch_size;
             let mut all_embeddings = Vec::with_capacity(all_chunks.len());
             let total_batches = all_chunks.len().div_ceil(batch_size);
 
             for (batch_idx, chunk_batch) in all_chunks.chunks(batch_size).enumerate() {
                 let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
 
-                let embeddings = self
+                let embeddings = client
                     .embedding_provider
                     .embed_batch(texts)
                     .context("Failed to generate embeddings")?;
@@ -447,7 +446,7 @@ impl RagMcpServer {
                 all_chunks.iter().map(|c| c.metadata.clone()).collect();
             let contents: Vec<String> = all_chunks.iter().map(|c| c.content.clone()).collect();
 
-            self.vector_db
+            client.vector_db
                 .store_embeddings(all_embeddings.clone(), metadata, contents, &path)
                 .await
                 .context("Failed to store embeddings")?;
@@ -470,11 +469,11 @@ impl RagMcpServer {
         }
 
         // Update persistent cache
-        let mut cache = self.hash_cache.write().await;
+        let mut cache = client.hash_cache.write().await;
         cache.update_root(path, new_hashes);
 
         // Persist to disk
-        if let Err(e) = cache.save(&self.cache_path) {
+        if let Err(e) = cache.save(&client.cache_path) {
             tracing::warn!("Failed to save hash cache: {}", e);
         }
         drop(cache);
@@ -492,7 +491,7 @@ impl RagMcpServer {
         }
 
         // Flush the vector database to disk
-        self.vector_db
+        client.vector_db
             .flush()
             .await
             .context("Failed to flush index to disk")?;
@@ -521,10 +520,10 @@ impl RagMcpServer {
         })
     }
 
-    /// Smart index that automatically chooses between full and incremental based on existing cache
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn do_index_smart(
-        &self,
+/// Smart index that automatically chooses between full and incremental based on existing cache
+#[allow(clippy::too_many_arguments)]
+pub async fn do_index_smart(
+        client: &RagClient,
         path: String,
         project: Option<String>,
         include_patterns: Vec<String>,
@@ -534,10 +533,10 @@ impl RagMcpServer {
         progress_token: Option<ProgressToken>,
     ) -> Result<IndexResponse> {
         // Normalize path to canonical form for consistent cache lookups
-        let normalized_path = Self::normalize_path(&path)?;
+        let normalized_path = RagClient::normalize_path(&path)?;
 
         // Check if we have an existing cache for this path
-        let cache = self.hash_cache.read().await;
+        let cache = client.hash_cache.read().await;
         let has_existing_index = cache.get_root(&normalized_path).is_some();
         drop(cache);
 
@@ -547,7 +546,8 @@ impl RagMcpServer {
                 path,
                 normalized_path
             );
-            self.do_incremental_update(
+            do_incremental_update(
+                client,
                 normalized_path,
                 project,
                 include_patterns,
@@ -563,7 +563,8 @@ impl RagMcpServer {
                 path,
                 normalized_path
             );
-            self.do_index(
+            do_index(
+                client,
                 normalized_path,
                 project,
                 include_patterns,
@@ -575,4 +576,6 @@ impl RagMcpServer {
             .await
         }
     }
-}
+
+#[cfg(test)]
+mod tests;

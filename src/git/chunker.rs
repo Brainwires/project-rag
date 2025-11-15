@@ -74,6 +74,7 @@ impl CommitChunker {
         // Note: Git commits don't have line numbers, so we use 0
         let metadata = ChunkMetadata {
             file_path: format!("git://{}", repo_path),
+            root_path: None,
             project,
             start_line: 0,
             end_line: 0,

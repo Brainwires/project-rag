@@ -1,5 +1,9 @@
 # Project RAG - MCP Server for Code Understanding
 
+[![Tests](https://img.shields.io/badge/tests-396%20passing-brightgreen)](https://github.com/nightness/project-rag)
+[![Coverage](https://img.shields.io/badge/coverage-93.56%25-brightgreen)](https://github.com/nightness/project-rag)
+[![Rust](https://img.shields.io/badge/rust-2024%20edition-orange)](https://www.rust-lang.org/)
+
 A Rust-based Model Context Protocol (MCP) server that provides AI assistants with powerful RAG (Retrieval-Augmented Generation) capabilities for understanding massive codebases.
 
 ## Overview
@@ -354,16 +358,22 @@ The BM25 (Tantivy) index uses file-based locks to prevent concurrent writes. The
 ### Running Tests
 
 ```bash
-# Run all unit tests (225 tests)
+# Run all unit tests (396 tests with 93.56% coverage)
 cargo test --lib
 
 # Run specific module tests
 cargo test --lib types::tests
 cargo test --lib chunker::tests
-cargo test --lib bm25_search::tests  # Includes lock safety tests
+cargo test --lib bm25_search::tests  # Includes concurrent access & lock safety tests
+cargo test --lib config::tests       # Includes validation & env override tests
+cargo test --lib indexing::tests     # Includes error path & edge case tests
 
 # Run with output
 cargo test --lib -- --nocapture
+
+# Run with code coverage
+cargo llvm-cov --lib --html
+# Open target/llvm-cov/html/index.html to view coverage report
 ```
 
 ### Building

@@ -164,6 +164,7 @@ impl GitWalker {
     fn extract_diff(&self, commit: &git2::Commit) -> Result<(Vec<String>, String)> {
         let mut files_changed = Vec::new();
         let mut diff_content = String::new();
+        let mut diff_truncated = false;
 
         let tree = commit.tree()?;
 
@@ -198,37 +199,51 @@ impl GitWalker {
 
         // Generate diff text
         diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            // Stop adding content if already truncated (but continue processing - return true)
+            if diff_truncated {
+                return true;
+            }
+
             // Skip binary files
             if line.origin() == 'B' {
                 return true;
             }
 
-            // Build diff content string
-            let origin = line.origin();
-            let content = std::str::from_utf8(line.content()).unwrap_or("");
-
-            match origin {
-                '+' | '-' | ' ' => {
-                    diff_content.push(origin);
-                    diff_content.push_str(content);
-                }
-                'F' => {
-                    // File header
-                    diff_content.push_str("--- ");
-                    diff_content.push_str(content);
-                }
-                'H' => {
-                    // Hunk header
-                    diff_content.push_str(content);
-                }
-                _ => {}
+            // Check if we're approaching the size limit before processing
+            if diff_content.len() >= 100_000 {
+                diff_truncated = true;
+                return true; // Continue processing, just stop adding content
             }
 
-            // Limit diff size to prevent massive strings
-            diff_content.len() < 100_000 // ~100KB limit
+            // Build diff content string - only if valid UTF-8
+            let origin = line.origin();
+            if let Ok(content) = std::str::from_utf8(line.content()) {
+                match origin {
+                    '+' | '-' | ' ' => {
+                        diff_content.push(origin);
+                        diff_content.push_str(content);
+                    }
+                    'F' => {
+                        // File header
+                        diff_content.push_str("--- ");
+                        diff_content.push_str(content);
+                    }
+                    'H' => {
+                        // Hunk header
+                        diff_content.push_str(content);
+                    }
+                    _ => {}
+                }
+            } else {
+                // Invalid UTF-8 - skip this line but continue processing
+                tracing::debug!("Skipping diff line with invalid UTF-8");
+            }
+
+            // Always return true to continue processing (don't signal error to git2)
+            true
         })?;
 
-        // Truncate if too large
+        // Truncate if too large and add marker
         if diff_content.len() > 8000 {
             diff_content.truncate(8000);
             diff_content.push_str("\n\n[... diff truncated ...]");

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 pub struct FileInfo {
     pub path: PathBuf,
     pub relative_path: String,
+    pub root_path: String,
     pub project: Option<String>,
     pub extension: Option<String>,
     pub language: Option<String>,
@@ -135,6 +136,7 @@ impl FileWalker {
             files.push(FileInfo {
                 path: path.to_path_buf(),
                 relative_path,
+                root_path: self.root.to_string_lossy().to_string(),
                 project: self.project.clone(),
                 extension,
                 language,

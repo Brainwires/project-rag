@@ -28,6 +28,7 @@ pub trait VectorDatabase: Send + Sync {
     ) -> Result<usize>;
 
     /// Search for similar vectors
+    #[allow(clippy::too_many_arguments)]
     async fn search(
         &self,
         query_vector: Vec<f32>,
@@ -35,6 +36,7 @@ pub trait VectorDatabase: Send + Sync {
         limit: usize,
         min_score: f32,
         project: Option<String>,
+        root_path: Option<String>,
         hybrid: bool,
     ) -> Result<Vec<SearchResult>>;
 
@@ -47,6 +49,7 @@ pub trait VectorDatabase: Send + Sync {
         limit: usize,
         min_score: f32,
         project: Option<String>,
+        root_path: Option<String>,
         hybrid: bool,
         file_extensions: Vec<String>,
         languages: Vec<String>,

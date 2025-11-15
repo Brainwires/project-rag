@@ -78,6 +78,7 @@ impl CodeChunker {
 
             let metadata = ChunkMetadata {
                 file_path: file_info.relative_path.clone(),
+                root_path: Some(file_info.root_path.clone()),
                 project: file_info.project.clone(),
                 start_line,
                 end_line,
@@ -131,6 +132,7 @@ impl CodeChunker {
 
             let metadata = ChunkMetadata {
                 file_path: file_info.relative_path.clone(),
+                root_path: Some(file_info.root_path.clone()),
                 project: file_info.project.clone(),
                 start_line,
                 end_line,
@@ -209,6 +211,7 @@ impl CodeChunker {
 
             let metadata = ChunkMetadata {
                 file_path: file_info.relative_path.clone(),
+                root_path: Some(file_info.root_path.clone()),
                 project: file_info.project.clone(),
                 start_line: ast_node.start_line,
                 end_line: ast_node.end_line,
@@ -245,6 +248,7 @@ mod tests {
         FileInfo {
             path: PathBuf::from("test.rs"),
             relative_path: "test.rs".to_string(),
+            root_path: "/test/root".to_string(),
             project: None,
             extension: Some("rs".to_string()),
             language: Some("Rust".to_string()),
