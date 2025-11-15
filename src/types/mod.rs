@@ -548,6 +548,5 @@ impl SearchGitHistoryRequest {
     }
 }
 
-
 #[cfg(test)]
 mod tests;

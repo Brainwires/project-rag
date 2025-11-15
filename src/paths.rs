@@ -154,7 +154,11 @@ impl PlatformPaths {
         if old_data_dir.exists() && !new_data_dir.exists() {
             std::fs::create_dir_all(new_data_dir.parent().unwrap())?;
             std::fs::rename(&old_data_dir, &new_data_dir)?;
-            eprintln!("Migrated: {} -> {}", old_data_dir.display(), new_data_dir.display());
+            eprintln!(
+                "Migrated: {} -> {}",
+                old_data_dir.display(),
+                new_data_dir.display()
+            );
             migrated = true;
         }
 
@@ -162,7 +166,11 @@ impl PlatformPaths {
         if old_cache_dir.exists() && !new_cache_dir.exists() {
             std::fs::create_dir_all(new_cache_dir.parent().unwrap())?;
             std::fs::rename(&old_cache_dir, &new_cache_dir)?;
-            eprintln!("Migrated: {} -> {}", old_cache_dir.display(), new_cache_dir.display());
+            eprintln!(
+                "Migrated: {} -> {}",
+                old_cache_dir.display(),
+                new_cache_dir.display()
+            );
             migrated = true;
         }
 
@@ -170,7 +178,11 @@ impl PlatformPaths {
         if old_config_dir.exists() && !new_config_dir.exists() {
             std::fs::create_dir_all(new_config_dir.parent().unwrap())?;
             std::fs::rename(&old_config_dir, &new_config_dir)?;
-            eprintln!("Migrated: {} -> {}", old_config_dir.display(), new_config_dir.display());
+            eprintln!(
+                "Migrated: {} -> {}",
+                old_config_dir.display(),
+                new_config_dir.display()
+            );
             migrated = true;
         }
 
@@ -427,7 +439,12 @@ mod tests {
         let config_path = PlatformPaths::default_config_path();
 
         // All should contain project name
-        for path in [&lancedb_path, &hash_cache_path, &git_cache_path, &config_path] {
+        for path in [
+            &lancedb_path,
+            &hash_cache_path,
+            &git_cache_path,
+            &config_path,
+        ] {
             assert!(
                 path.to_string_lossy().contains("brainwires"),
                 "Path {:?} should contain 'brainwires'",

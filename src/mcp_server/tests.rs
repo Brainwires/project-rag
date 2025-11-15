@@ -76,16 +76,16 @@ async fn test_do_index_empty_directory() {
     std::fs::create_dir(&data_dir).unwrap();
 
     let result = crate::client::indexing::do_index(
-            &client,
-            data_dir.to_string_lossy().to_string(),
-            None,
-            vec![],
-            vec![],
-            1024 * 1024,
-            None,
-            None,
-        )
-        .await;
+        &client,
+        data_dir.to_string_lossy().to_string(),
+        None,
+        vec![],
+        vec![],
+        1024 * 1024,
+        None,
+        None,
+    )
+    .await;
 
     assert!(result.is_ok());
     let response = result.unwrap();
@@ -111,16 +111,16 @@ async fn test_do_index_with_files() {
     std::fs::write(&test_file, "fn main() { println!(\"test\"); }").unwrap();
 
     let result = crate::client::indexing::do_index(
-            &client,
-            data_dir.to_string_lossy().to_string(),
-            Some("test-project".to_string()),
-            vec![],
-            vec![],
-            1024 * 1024,
-            None,
-            None,
-        )
-        .await;
+        &client,
+        data_dir.to_string_lossy().to_string(),
+        Some("test-project".to_string()),
+        vec![],
+        vec![],
+        1024 * 1024,
+        None,
+        None,
+    )
+    .await;
 
     assert!(result.is_ok());
     let response = result.unwrap();
@@ -147,16 +147,16 @@ async fn test_do_index_with_exclude_patterns() {
     std::fs::write(data_dir.join("exclude.txt"), "exclude this").unwrap();
 
     let result = crate::client::indexing::do_index(
-            &client,
-            data_dir.to_string_lossy().to_string(),
-            None,
-            vec![],
-            vec!["**/*.txt".to_string()],
-            1024 * 1024,
-            None,
-            None,
-        )
-        .await;
+        &client,
+        data_dir.to_string_lossy().to_string(),
+        None,
+        vec![],
+        vec!["**/*.txt".to_string()],
+        1024 * 1024,
+        None,
+        None,
+    )
+    .await;
 
     assert!(result.is_ok());
     let response = result.unwrap();
@@ -182,16 +182,16 @@ async fn test_do_incremental_update_no_cache() {
     std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
 
     let result = crate::client::indexing::do_incremental_update(
-            &client,
-            data_dir.to_string_lossy().to_string(),
-            None,
-            vec![],
-            vec![],
-            1024 * 1024,
-            None,
-            None,
-        )
-        .await;
+        &client,
+        data_dir.to_string_lossy().to_string(),
+        None,
+        vec![],
+        vec![],
+        1024 * 1024,
+        None,
+        None,
+    )
+    .await;
 
     assert!(result.is_ok());
     let response = result.unwrap();
@@ -213,16 +213,16 @@ async fn test_do_index_smart_new_codebase() {
     std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
 
     let result = crate::client::indexing::do_index_smart(
-            &client,
-            data_dir.to_string_lossy().to_string(),
-            None,
-            vec![],
-            vec![],
-            1024 * 1024,
-            None,
-            None,
-        )
-        .await;
+        &client,
+        data_dir.to_string_lossy().to_string(),
+        None,
+        vec![],
+        vec![],
+        1024 * 1024,
+        None,
+        None,
+    )
+    .await;
 
     assert!(result.is_ok());
     let response = result.unwrap();
@@ -265,10 +265,7 @@ async fn test_tool_query_codebase_with_empty_index() {
     };
 
     // This should succeed even with empty index (just return no results)
-    let result = server
-        .client()
-        .query_codebase(req)
-        .await;
+    let result = server.client().query_codebase(req).await;
 
     assert!(result.is_ok());
     let response = result.unwrap();
@@ -421,7 +418,11 @@ async fn test_tool_search_by_filters_validation_failure() {
 
     let result = req.validate();
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("file extension cannot be empty"));
+    assert!(
+        result
+            .unwrap_err()
+            .contains("file extension cannot be empty")
+    );
 }
 
 #[tokio::test]

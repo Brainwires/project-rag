@@ -46,7 +46,11 @@ async fn test_do_index_single_file() {
     let (client, temp_dir) = create_test_client().await;
     let data_dir = temp_dir.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
-    std::fs::write(data_dir.join("test.rs"), "fn main() {\n    println!(\"Hello\");\n}").unwrap();
+    std::fs::write(
+        data_dir.join("test.rs"),
+        "fn main() {\n    println!(\"Hello\");\n}",
+    )
+    .unwrap();
 
     let result = do_index(
         &client,
@@ -423,9 +427,18 @@ async fn test_smart_index_path_normalization() {
     let path = data_dir.to_string_lossy().to_string();
 
     // First index
-    do_index_smart(&client, path.clone(), None, vec![], vec![], 1024 * 1024, None, None)
-        .await
-        .unwrap();
+    do_index_smart(
+        &client,
+        path.clone(),
+        None,
+        vec![],
+        vec![],
+        1024 * 1024,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     // Second index with trailing slash (should still detect as incremental)
     let path_with_slash = format!("{}/", path);

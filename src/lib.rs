@@ -164,8 +164,9 @@ pub mod mcp_server;
 // Re-export commonly used types for convenience
 pub use types::{
     AdvancedSearchRequest, ClearRequest, ClearResponse, GitSearchResult, IndexRequest,
-    IndexResponse, IndexingMode, LanguageStats, QueryRequest, QueryResponse, SearchGitHistoryRequest,
-    SearchGitHistoryResponse, SearchResult, StatisticsRequest, StatisticsResponse,
+    IndexResponse, IndexingMode, LanguageStats, QueryRequest, QueryResponse,
+    SearchGitHistoryRequest, SearchGitHistoryResponse, SearchResult, StatisticsRequest,
+    StatisticsResponse,
 };
 
 pub use config::Config;
