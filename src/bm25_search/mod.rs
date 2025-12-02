@@ -190,11 +190,10 @@ impl BM25Search {
 
         let searcher = reader.searcher();
 
-        // Parse query
+        // Parse query using lenient mode to handle special characters like :: in code
+        // (e.g., "Tool::new" would fail strict parsing since : is a field separator)
         let query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
-        let query = query_parser
-            .parse_query(query_text)
-            .context("Failed to parse query")?;
+        let (query, _errors) = query_parser.parse_query_lenient(query_text);
 
         // Search with BM25
         let top_docs = searcher
