@@ -97,9 +97,11 @@ pub async fn do_index(
     }
 
     // Generate embeddings in batches (using config values)
+    // Track which chunks successfully got embeddings to ensure array lengths match
     let batch_size = client.config.embedding.batch_size;
     let timeout_secs = client.config.embedding.timeout_secs;
     let mut all_embeddings = Vec::with_capacity(all_chunks.len());
+    let mut successful_chunks = Vec::with_capacity(all_chunks.len());
     let total_batches = all_chunks.len().div_ceil(batch_size);
 
     for (batch_idx, chunk_batch) in all_chunks.chunks(batch_size).enumerate() {
@@ -111,7 +113,11 @@ pub async fn do_index(
 
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), embed_future).await
         {
-            Ok(Ok(Ok(embeddings))) => all_embeddings.extend(embeddings),
+            Ok(Ok(Ok(embeddings))) => {
+                // Only add chunks that successfully got embeddings
+                all_embeddings.extend(embeddings);
+                successful_chunks.extend(chunk_batch.iter().cloned());
+            }
             Ok(Ok(Err(e))) => {
                 errors.push(format!("Failed to generate embeddings: {}", e));
                 continue;
@@ -165,14 +171,32 @@ pub async fn do_index(
     }
 
     // Store in vector database (pass normalized root path for per-project BM25)
-    let metadata: Vec<ChunkMetadata> = all_chunks.iter().map(|c| c.metadata.clone()).collect();
-    let contents: Vec<String> = all_chunks.iter().map(|c| c.content.clone()).collect();
+    // Use successful_chunks to ensure metadata/contents match embeddings count
+    let metadata: Vec<ChunkMetadata> = successful_chunks
+        .iter()
+        .map(|c| c.metadata.clone())
+        .collect();
+    let contents: Vec<String> = successful_chunks.iter().map(|c| c.content.clone()).collect();
 
-    client
-        .vector_db
-        .store_embeddings(all_embeddings, metadata, contents, &path)
-        .await
-        .context("Failed to store embeddings")?;
+    // Sanity check: ensure all arrays have the same length to prevent RecordBatch errors
+    debug_assert_eq!(
+        all_embeddings.len(),
+        metadata.len(),
+        "Embeddings and metadata count mismatch"
+    );
+    debug_assert_eq!(
+        all_embeddings.len(),
+        contents.len(),
+        "Embeddings and contents count mismatch"
+    );
+
+    if !all_embeddings.is_empty() {
+        client
+            .vector_db
+            .store_embeddings(all_embeddings, metadata, contents, &path)
+            .await
+            .context("Failed to store embeddings")?;
+    }
 
     // Send progress before saving cache
     if let (Some(peer), Some(token)) = (&peer, &progress_token) {
