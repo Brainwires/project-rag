@@ -1,10 +1,11 @@
 mod tests {
-    use super::*;
+    use crate::types::ChunkMetadata;
+    use crate::vector_db::{LanceVectorDB, VectorDatabase};
     use tempfile::{TempDir, tempdir};
 
     fn create_test_metadata(file_path: &str, start_line: usize, end_line: usize) -> ChunkMetadata {
         ChunkMetadata {
-                root_path: None,
+            root_path: None,
             file_path: file_path.to_string(),
             project: Some("test-project".to_string()),
             start_line,
@@ -249,7 +250,15 @@ mod tests {
         // Search with project filter
         let query = vec![0.15; 384];
         let results = db
-            .search(query, "main", 10, 0.0, Some("project-a".to_string()), None, false)
+            .search(
+                query,
+                "main",
+                10,
+                0.0,
+                Some("project-a".to_string()),
+                None,
+                false,
+            )
             .await
             .unwrap();
 
@@ -689,3 +698,4 @@ mod tests {
             "Should have index for project2"
         );
     }
+}

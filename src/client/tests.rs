@@ -62,7 +62,12 @@ fn test_normalize_path_valid() {
 fn test_normalize_path_nonexistent() {
     let result = RagClient::normalize_path("/nonexistent/path/12345");
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Failed to canonicalize"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to canonicalize")
+    );
 }
 
 #[test]
@@ -296,10 +301,12 @@ async fn test_search_with_filters_validation_failure() {
 
     let result = client.search_with_filters(request).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("file extension cannot be empty"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("file extension cannot be empty")
+    );
 }
 
 // ===== get_statistics Tests =====

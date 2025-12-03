@@ -1,3 +1,4 @@
+use super::pdf_extractor::extract_pdf_to_markdown;
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
@@ -95,8 +96,14 @@ impl FileWalker {
                 continue;
             }
 
-            // Check if file is text (binary detection)
-            if !self.is_text_file(path)? {
+            // Check if file is text (binary detection), but allow PDFs
+            let is_pdf = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase() == "pdf")
+                .unwrap_or(false);
+
+            if !is_pdf && !self.is_text_file(path)? {
                 tracing::debug!("Skipping binary file: {:?}", path);
                 continue;
             }
@@ -106,16 +113,26 @@ impl FileWalker {
                 continue;
             }
 
-            // Read file content (skip files that can't be read as UTF-8)
-            let content = match fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!(
-                        "Skipping file that can't be read as UTF-8: {:?}: {}",
-                        path,
-                        e
-                    );
-                    continue;
+            // Read file content - extract text from PDFs or read as UTF-8
+            let content = if is_pdf {
+                match extract_pdf_to_markdown(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("Failed to extract PDF {:?}: {}", path, e);
+                        continue;
+                    }
+                }
+            } else {
+                match fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(
+                            "Skipping file that can't be read as UTF-8: {:?}: {}",
+                            path,
+                            e
+                        );
+                        continue;
+                    }
                 }
             };
 
@@ -199,6 +216,7 @@ impl FileWalker {
 /// Detect programming language from file extension
 fn detect_language(extension: &str) -> Option<String> {
     let lang = match extension.to_lowercase().as_str() {
+        // Programming languages
         "rs" => "Rust",
         "py" => "Python",
         "js" | "mjs" | "cjs" => "JavaScript",
@@ -217,15 +235,31 @@ fn detect_language(extension: &str) -> Option<String> {
         "scala" => "Scala",
         "sh" | "bash" => "Shell",
         "sql" => "SQL",
+
+        // Web technologies
         "html" | "htm" => "HTML",
         "css" => "CSS",
         "scss" | "sass" => "SCSS",
+
+        // Data formats and config files
         "json" => "JSON",
         "yaml" | "yml" => "YAML",
         "toml" => "TOML",
         "xml" => "XML",
+        "ini" => "INI",
+        "conf" | "config" | "cfg" => "Config",
+        "properties" => "Properties",
+        "env" => "Environment",
+
+        // Documentation formats
         "md" | "markdown" => "Markdown",
+        "rst" => "reStructuredText",
+        "adoc" | "asciidoc" => "AsciiDoc",
+        "org" => "Org Mode",
         "txt" => "Text",
+        "log" => "Log",
+        "pdf" => "PDF",
+
         _ => return None,
     };
 
@@ -718,10 +752,35 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_language_config_files() {
+        assert_eq!(detect_language("ini"), Some("INI".to_string()));
+        assert_eq!(detect_language("conf"), Some("Config".to_string()));
+        assert_eq!(detect_language("config"), Some("Config".to_string()));
+        assert_eq!(detect_language("cfg"), Some("Config".to_string()));
+        assert_eq!(
+            detect_language("properties"),
+            Some("Properties".to_string())
+        );
+        assert_eq!(detect_language("env"), Some("Environment".to_string()));
+    }
+
+    #[test]
+    fn test_detect_language_documentation() {
+        assert_eq!(detect_language("rst"), Some("reStructuredText".to_string()));
+        assert_eq!(detect_language("adoc"), Some("AsciiDoc".to_string()));
+        assert_eq!(detect_language("asciidoc"), Some("AsciiDoc".to_string()));
+        assert_eq!(detect_language("org"), Some("Org Mode".to_string()));
+        assert_eq!(detect_language("log"), Some("Log".to_string()));
+        assert_eq!(detect_language("pdf"), Some("PDF".to_string()));
+    }
+
+    #[test]
     fn test_detect_language_case_insensitive() {
         assert_eq!(detect_language("RS"), Some("Rust".to_string()));
         assert_eq!(detect_language("Py"), Some("Python".to_string()));
         assert_eq!(detect_language("JS"), Some("JavaScript".to_string()));
+        assert_eq!(detect_language("TOML"), Some("TOML".to_string()));
+        assert_eq!(detect_language("CONF"), Some("Config".to_string()));
     }
 
     #[test]

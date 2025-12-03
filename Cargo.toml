@@ -47,6 +47,8 @@ tree-sitter-php = "0.24"
 clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2.0"
 toml = "0.8"
+# PDF processing
+pdf-extract = "0.7"
 # Performance
 rayon = "1.10"
 

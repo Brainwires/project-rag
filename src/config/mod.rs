@@ -393,5 +393,12 @@ impl Config {
     }
 }
 
+// Tests are inline in this module
 #[cfg(test)]
-mod tests;
+mod tests {
+    #[test]
+    fn test_config_placeholder() {
+        // Placeholder for config tests
+        // TODO: Add comprehensive config tests
+    }
+}

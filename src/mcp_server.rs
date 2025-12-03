@@ -59,17 +59,17 @@ impl RagMcpServer {
         let progress_token = meta.get_progress_token();
 
         let response = crate::client::indexing::do_index_smart(
-                &self.client,
-                req.path,
-                req.project,
-                req.include_patterns,
-                req.exclude_patterns,
-                req.max_file_size,
-                Some(peer),
-                progress_token,
-            )
-            .await
-            .map_err(|e| format!("{:#}", e))?; // Use alternate display to show full error chain
+            &self.client,
+            req.path,
+            req.project,
+            req.include_patterns,
+            req.exclude_patterns,
+            req.max_file_size,
+            Some(peer),
+            progress_token,
+        )
+        .await
+        .map_err(|e| format!("{:#}", e))?; // Use alternate display to show full error chain
 
         serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
     }

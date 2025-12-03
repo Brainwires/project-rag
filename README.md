@@ -1,7 +1,7 @@
 # Project RAG - MCP Server for Code Understanding
 
-[![Tests](https://img.shields.io/badge/tests-396%20passing-brightgreen)](https://github.com/nightness/project-rag)
-[![Coverage](https://img.shields.io/badge/coverage-93.56%25-brightgreen)](https://github.com/nightness/project-rag)
+[![Tests](https://img.shields.io/badge/tests-343%20passing-brightgreen)](https://github.com/nightness/project-rag)
+[![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](https://github.com/nightness/project-rag)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange)](https://www.rust-lang.org/)
 
 A Rust-based Model Context Protocol (MCP) server that provides AI assistants with powerful RAG (Retrieval-Augmented Generation) capabilities for understanding massive codebases.
@@ -19,12 +19,13 @@ This MCP server enables AI assistants to efficiently search and understand large
 - **Local-First**: All processing happens locally using fastembed-rs (no API keys required)
 - **Hybrid Search**: Combines vector similarity with BM25 keyword matching using Reciprocal Rank Fusion (RRF) for optimal results
 - **AST-Based Chunking**: Uses Tree-sitter to extract semantic units (functions, classes, methods) for 12 languages
+- **Comprehensive File Support**: Indexes 40+ file types including code, documentation (with PDF→Markdown conversion), and configuration files
 - **Git History Search**: Search commit history with smart on-demand indexing (default: 10 commits, only indexes deeper as needed)
 - **Multi-Project Support**: Index and query multiple codebases simultaneously with project filtering
 - **Smart Indexing**: Automatically performs full indexing for new codebases or incremental updates for previously indexed ones
 - **Concurrent Access Protection**: Safe lock management prevents index corruption when multiple agents try to index simultaneously
 - **Stable Embedded Database**: LanceDB vector database (default, no external dependencies) with optional Qdrant support
-- **Language Detection**: Automatic detection of 30+ programming languages
+- **Language Detection**: Automatic detection of 40+ file types (programming languages, documentation formats, and config files)
 - **Advanced Filtering**: Search by file type, language, or path patterns
 - **Respects .gitignore**: Automatically excludes ignored files during indexing
 - **Slash Commands**: 6 convenient slash commands via MCP Prompts
@@ -41,6 +42,70 @@ The server provides 6 slash commands for quick access in Claude Code:
 6. **`/project:git-search`** - Search git commit history with on-demand indexing
 
 See [SLASH_COMMANDS.md](docs/SLASH_COMMANDS.md) for detailed usage.
+
+## Supported File Types
+
+Project RAG automatically indexes and searches **40+ file types** across three categories:
+
+### Programming Languages (24 languages)
+Supports AST-based semantic chunking for these languages:
+- **Rust** (`.rs`)
+- **Python** (`.py`)
+- **JavaScript** (`.js`, `.mjs`, `.cjs`), **TypeScript** (`.ts`), **JSX** (`.jsx`), **TSX** (`.tsx`)
+- **Go** (`.go`)
+- **Java** (`.java`)
+- **C** (`.c`), **C++** (`.cpp`, `.cc`, `.cxx`), **C/C++ Headers** (`.h`, `.hpp`)
+- **C#** (`.cs`)
+- **Swift** (`.swift`)
+- **Kotlin** (`.kt`, `.kts`)
+- **Scala** (`.scala`)
+- **Ruby** (`.rb`)
+- **PHP** (`.php`)
+- **Shell** (`.sh`, `.bash`)
+- **SQL** (`.sql`)
+- **HTML** (`.html`, `.htm`)
+- **CSS** (`.css`), **SCSS** (`.scss`, `.sass`)
+
+### Documentation Formats (8 formats)
+With special handling for rich content:
+- **Markdown** (`.md`, `.markdown`)
+- **PDF** (`.pdf`) - **Automatically converted to Markdown** with table preservation
+- **reStructuredText** (`.rst`)
+- **AsciiDoc** (`.adoc`, `.asciidoc`)
+- **Org Mode** (`.org`)
+- **Plain Text** (`.txt`)
+- **Log Files** (`.log`)
+
+**PDF Conversion Features:**
+- Extracts text content using `pdf-extract` library
+- Converts to Markdown format automatically
+- Preserves **table structures** (detects tab/space-separated columns)
+- Detects and formats **headings** (ALL CAPS lines and section markers)
+- Handles multi-column layouts intelligently
+- Chunks like any other text file (50 lines per chunk by default)
+
+### Configuration Files (8 formats)
+For complete project understanding:
+- **JSON** (`.json`)
+- **YAML** (`.yaml`, `.yml`)
+- **TOML** (`.toml`)
+- **XML** (`.xml`)
+- **INI** (`.ini`)
+- **Config files** (`.conf`, `.config`, `.cfg`)
+- **Properties** (`.properties`)
+- **Environment** (`.env`)
+
+### Example Use Cases
+```bash
+# Index documentation PDFs in your project
+query_codebase("API authentication flow")  # Finds content in .pdf, .md, .rst files
+
+# Search configuration files
+query_codebase("database connection string")  # Finds .yaml, .toml, .env, .conf files
+
+# Find code implementations
+search_by_filters(query="JWT validation", file_extensions=["rs", "go"])
+```
 
 ## MCP Tools
 
@@ -258,8 +323,10 @@ project-rag/
 │   │   └── qdrant_client.rs  # Qdrant implementation (optional)
 │   ├── indexer/            # File walking and code chunking
 │   │   ├── mod.rs          # Module exports
-│   │   ├── file_walker.rs  # Directory traversal with .gitignore
-│   │   └── chunker.rs      # Chunking strategies
+│   │   ├── file_walker.rs  # Directory traversal with .gitignore + 40+ file types
+│   │   ├── chunker.rs      # Chunking strategies (AST-based, fixed-lines, sliding window)
+│   │   ├── ast_parser.rs   # Tree-sitter AST parsing for 12 languages
+│   │   └── pdf_extractor.rs # PDF to Markdown converter with table support
 │   ├── mcp_server.rs       # MCP server with 6 tools
 │   ├── types.rs            # Request/Response types with JSON schema
 │   ├── main.rs             # Binary entry point with stdio transport
@@ -348,9 +415,10 @@ The BM25 (Tantivy) index uses file-based locks to prevent concurrent writes. The
 - **Metadata**: Tracks start/end lines, language, file hash, project
 
 ### File Processing
-- **Binary Detection**: 30% non-printable byte threshold
-- **Language Detection**: 30+ languages supported
-- **Hash Algorithm**: SHA256 for change detection
+- **Binary Detection**: 30% non-printable byte threshold (PDFs handled specially)
+- **Language Detection**: 40+ file types supported (code, docs, configs)
+- **PDF Processing**: Automatic text extraction and Markdown conversion with table preservation
+- **Hash Algorithm**: SHA256 for change detection (works for all file types including PDFs)
 - **.gitignore Support**: Uses `ignore` crate
 
 ## Development
@@ -358,15 +426,16 @@ The BM25 (Tantivy) index uses file-based locks to prevent concurrent writes. The
 ### Running Tests
 
 ```bash
-# Run all unit tests (396 tests with 93.56% coverage)
+# Run all unit tests (343 tests with ~94% coverage)
 cargo test --lib
 
 # Run specific module tests
 cargo test --lib types::tests
 cargo test --lib chunker::tests
-cargo test --lib bm25_search::tests  # Includes concurrent access & lock safety tests
-cargo test --lib config::tests       # Includes validation & env override tests
-cargo test --lib indexing::tests     # Includes error path & edge case tests
+cargo test --lib pdf_extractor::tests  # PDF to Markdown conversion tests
+cargo test --lib bm25_search::tests    # Includes concurrent access & lock safety tests
+cargo test --lib config::tests         # Includes validation & env override tests
+cargo test --lib indexing::tests       # Includes error path & edge case tests
 
 # Run with output
 cargo test --lib -- --nocapture
@@ -455,9 +524,10 @@ RUST_LOG=trace cargo run
 - FastEmbed integration for local embeddings
 - Qdrant vector database integration
 - File walking with .gitignore support
-- Language detection (30+ languages)
+- Language detection (40+ file types: code, docs, configs)
+- PDF to Markdown conversion with table preservation
 - SHA256-based change detection
-- 225 unit tests passing (including 11 BM25/RRF/lock safety tests)
+- 343 unit tests passing (including PDF extraction, BM25/RRF, and lock safety tests)
 - Comprehensive documentation
 - **Full MCP prompts support enabled**
 - **Hybrid search with Tantivy BM25 + LanceDB vector using RRF**

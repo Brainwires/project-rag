@@ -6,10 +6,12 @@
 mod ast_parser;
 mod chunker;
 mod file_walker;
+mod pdf_extractor;
 
 pub use ast_parser::AstParser;
 pub use chunker::{ChunkStrategy, CodeChunker};
 pub use file_walker::FileWalker;
+pub use pdf_extractor::extract_pdf_to_markdown;
 
 use crate::types::ChunkMetadata;
 

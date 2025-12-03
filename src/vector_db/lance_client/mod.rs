@@ -504,7 +504,15 @@ impl VectorDatabase for LanceVectorDB {
                             .column_by_name("project")
                             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
-                        if let (Some(fp), Some(rp), Some(sl), Some(el), Some(lang), Some(cont), Some(proj)) = (
+                        if let (
+                            Some(fp),
+                            Some(rp),
+                            Some(sl),
+                            Some(el),
+                            Some(lang),
+                            Some(cont),
+                            Some(proj),
+                        ) = (
                             file_path_array,
                             root_path_array,
                             start_line_array,
@@ -870,7 +878,6 @@ impl VectorDatabase for LanceVectorDB {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests;
