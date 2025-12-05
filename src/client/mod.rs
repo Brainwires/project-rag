@@ -19,10 +19,33 @@ use crate::vector_db::QdrantVectorDB;
 use crate::vector_db::LanceVectorDB;
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
+
+/// Guard for index locks that cleans up the lock when dropped
+pub(crate) struct IndexLockGuard {
+    _lock: Arc<tokio::sync::Mutex<()>>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    path: String,
+    locks_map: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl Drop for IndexLockGuard {
+    fn drop(&mut self) {
+        // Cleanup the lock from the map when the guard is dropped
+        let path = self.path.clone();
+        let locks_map = self.locks_map.clone();
+
+        // Spawn a task to clean up the lock asynchronously
+        tokio::spawn(async move {
+            let mut locks = locks_map.write().await;
+            locks.remove(&path);
+        });
+    }
+}
 
 /// Main client for interacting with the RAG system
 ///
@@ -70,6 +93,8 @@ pub struct RagClient {
     pub(crate) git_cache_path: PathBuf,
     // Configuration (for accessing batch sizes, timeouts, etc.)
     pub(crate) config: Arc<Config>,
+    // Locks for paths currently being indexed (prevents concurrent indexing of same directory)
+    pub(crate) indexing_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl RagClient {
@@ -185,6 +210,7 @@ impl RagClient {
             git_cache: Arc::new(RwLock::new(git_cache)),
             git_cache_path,
             config: Arc::new(config),
+            indexing_locks: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -206,6 +232,47 @@ impl RagClient {
         let canonical = std::fs::canonicalize(&path_buf)
             .with_context(|| format!("Failed to canonicalize path: {}", path))?;
         Ok(canonical.to_string_lossy().to_string())
+    }
+
+    /// Try to acquire an indexing lock for a given path
+    ///
+    /// Returns an error if indexing is already in progress for this path.
+    /// The lock is automatically released when the returned guard is dropped.
+    pub(crate) async fn try_acquire_index_lock(&self, path: &str) -> Result<IndexLockGuard> {
+        // Normalize the path to ensure consistent locking across different path formats
+        let normalized_path = Self::normalize_path(path)?;
+
+        // Acquire write lock on the locks map
+        let mut locks = self.indexing_locks.write().await;
+
+        // Check if a lock already exists for this path
+        if let Some(existing_lock) = locks.get(&normalized_path) {
+            // Try to acquire the mutex non-blocking
+            if existing_lock.try_lock().is_err() {
+                return Err(anyhow::anyhow!(
+                    "Indexing already in progress for: {}",
+                    normalized_path
+                ));
+            }
+            // If we got the lock, someone else finished and we can proceed
+            // Remove the old lock and create a new one
+            locks.remove(&normalized_path);
+        }
+
+        // Create a new lock for this path
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = lock.clone().lock_owned().await;
+        locks.insert(normalized_path.clone(), lock.clone());
+
+        // Drop the write lock on the map
+        drop(locks);
+
+        Ok(IndexLockGuard {
+            _lock: lock,
+            _guard: guard,
+            path: normalized_path,
+            locks_map: self.indexing_locks.clone(),
+        })
     }
 
     /// Index a codebase directory

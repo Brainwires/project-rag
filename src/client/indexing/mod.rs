@@ -558,6 +558,12 @@ pub async fn do_index_smart(
     peer: Option<Peer<RoleServer>>,
     progress_token: Option<ProgressToken>,
 ) -> Result<IndexResponse> {
+    // Acquire indexing lock to prevent concurrent indexing of the same path
+    let _lock = client
+        .try_acquire_index_lock(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     // Normalize path to canonical form for consistent cache lookups
     let normalized_path = RagClient::normalize_path(&path)?;
 
