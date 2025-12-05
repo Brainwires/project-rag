@@ -25,12 +25,36 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
+use tokio::sync::broadcast;
+
+/// State for an in-progress indexing operation
+pub(crate) struct IndexingOperation {
+    /// Sender to broadcast the result to all waiters
+    result_tx: broadcast::Sender<IndexResponse>,
+}
+
+/// Result of trying to acquire an index lock
+pub(crate) enum IndexLockResult {
+    /// We acquired the lock and should perform indexing
+    Acquired(IndexLockGuard),
+    /// Another operation is in progress, wait for its result
+    WaitForResult(broadcast::Receiver<IndexResponse>),
+}
+
 /// Guard for index locks that cleans up the lock when dropped
 pub(crate) struct IndexLockGuard {
-    _lock: Arc<tokio::sync::Mutex<()>>,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
     path: String,
-    locks_map: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    locks_map: Arc<RwLock<HashMap<String, IndexingOperation>>>,
+    /// Sender to broadcast the result when indexing completes
+    pub(crate) result_tx: broadcast::Sender<IndexResponse>,
+}
+
+impl IndexLockGuard {
+    /// Broadcast the indexing result to all waiters
+    pub(crate) fn broadcast_result(&self, result: &IndexResponse) {
+        // Ignore send errors (no receivers is fine)
+        let _ = self.result_tx.send(result.clone());
+    }
 }
 
 impl Drop for IndexLockGuard {
@@ -93,8 +117,8 @@ pub struct RagClient {
     pub(crate) git_cache_path: PathBuf,
     // Configuration (for accessing batch sizes, timeouts, etc.)
     pub(crate) config: Arc<Config>,
-    // Locks for paths currently being indexed (prevents concurrent indexing of same directory)
-    pub(crate) indexing_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    // In-progress indexing operations (prevents concurrent indexing and allows result sharing)
+    pub(crate) indexing_ops: Arc<RwLock<HashMap<String, IndexingOperation>>>,
 }
 
 impl RagClient {
@@ -210,7 +234,7 @@ impl RagClient {
             git_cache: Arc::new(RwLock::new(git_cache)),
             git_cache_path,
             config: Arc::new(config),
-            indexing_locks: Arc::new(RwLock::new(HashMap::new())),
+            indexing_ops: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -236,43 +260,62 @@ impl RagClient {
 
     /// Try to acquire an indexing lock for a given path
     ///
-    /// Returns an error if indexing is already in progress for this path.
+    /// Returns either:
+    /// - `IndexLockResult::Acquired(guard)` if we should perform the indexing
+    /// - `IndexLockResult::WaitForResult(receiver)` if another operation is in progress
+    ///
     /// The lock is automatically released when the returned guard is dropped.
-    pub(crate) async fn try_acquire_index_lock(&self, path: &str) -> Result<IndexLockGuard> {
+    pub(crate) async fn try_acquire_index_lock(&self, path: &str) -> Result<IndexLockResult> {
         // Normalize the path to ensure consistent locking across different path formats
         let normalized_path = Self::normalize_path(path)?;
 
-        // Acquire write lock on the locks map
-        let mut locks = self.indexing_locks.write().await;
+        // Acquire write lock on the ops map
+        let mut ops = self.indexing_ops.write().await;
 
-        // Check if a lock already exists for this path
-        if let Some(existing_lock) = locks.get(&normalized_path) {
-            // Try to acquire the mutex non-blocking
-            if existing_lock.try_lock().is_err() {
-                return Err(anyhow::anyhow!(
-                    "Indexing already in progress for: {}",
+        // Check if an operation is already in progress for this path
+        if let Some(existing_op) = ops.get(&normalized_path) {
+            // Check if the operation is still active by looking at receiver count
+            // If receiver_count() == 0, the indexing has completed but cleanup hasn't
+            // happened yet (the async Drop task is pending). In this case, treat it
+            // as if no operation exists and start a new one.
+            if existing_op.result_tx.receiver_count() > 0 {
+                // Operation is still active, subscribe to receive the result
+                let receiver = existing_op.result_tx.subscribe();
+                tracing::info!(
+                    "Indexing already in progress for {}, waiting for result",
                     normalized_path
-                ));
+                );
+                return Ok(IndexLockResult::WaitForResult(receiver));
+            } else {
+                // Stale entry - remove it and proceed to create a new operation
+                tracing::debug!(
+                    "Removing stale indexing lock for {} (operation completed)",
+                    normalized_path
+                );
+                ops.remove(&normalized_path);
             }
-            // If we got the lock, someone else finished and we can proceed
-            // Remove the old lock and create a new one
-            locks.remove(&normalized_path);
         }
 
-        // Create a new lock for this path
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = lock.clone().lock_owned().await;
-        locks.insert(normalized_path.clone(), lock.clone());
+        // Create a new broadcast channel for this operation
+        // Capacity of 1 is enough since we only send one result
+        let (result_tx, _) = broadcast::channel(1);
+
+        // Register this operation
+        ops.insert(
+            normalized_path.clone(),
+            IndexingOperation {
+                result_tx: result_tx.clone(),
+            },
+        );
 
         // Drop the write lock on the map
-        drop(locks);
+        drop(ops);
 
-        Ok(IndexLockGuard {
-            _lock: lock,
-            _guard: guard,
+        Ok(IndexLockResult::Acquired(IndexLockGuard {
             path: normalized_path,
-            locks_map: self.indexing_locks.clone(),
-        })
+            locks_map: self.indexing_ops.clone(),
+            result_tx,
+        }))
     }
 
     /// Index a codebase directory

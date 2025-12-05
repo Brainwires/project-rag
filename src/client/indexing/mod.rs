@@ -558,12 +558,79 @@ pub async fn do_index_smart(
     peer: Option<Peer<RoleServer>>,
     progress_token: Option<ProgressToken>,
 ) -> Result<IndexResponse> {
-    // Acquire indexing lock to prevent concurrent indexing of the same path
-    let _lock = client
-        .try_acquire_index_lock(&path)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
+    use super::IndexLockResult;
 
+    // Try to acquire indexing lock
+    let lock_result = client.try_acquire_index_lock(&path).await?;
+
+    match lock_result {
+        IndexLockResult::WaitForResult(mut receiver) => {
+            // Another operation is in progress, wait for its result
+            tracing::info!("Waiting for existing indexing operation to complete for: {}", path);
+
+            // Send progress notification if we have a peer
+            if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+                let _ = peer
+                    .notify_progress(ProgressNotificationParam {
+                        progress_token: token.clone(),
+                        progress: 0.0,
+                        total: Some(100.0),
+                        message: Some("Waiting for existing indexing operation to complete...".into()),
+                    })
+                    .await;
+            }
+
+            // Wait for the result from the other operation
+            match receiver.recv().await {
+                Ok(result) => {
+                    tracing::info!("Received result from existing indexing operation");
+                    Ok(result)
+                }
+                Err(e) => {
+                    // The sender was dropped without sending a result (error case)
+                    Err(anyhow::anyhow!(
+                        "Indexing operation failed or was cancelled: {}",
+                        e
+                    ))
+                }
+            }
+        }
+        IndexLockResult::Acquired(lock) => {
+            // We acquired the lock, perform the actual indexing
+            let result = do_index_smart_inner(
+                client,
+                path,
+                project,
+                include_patterns,
+                exclude_patterns,
+                max_file_size,
+                peer,
+                progress_token,
+            )
+            .await;
+
+            // Broadcast the result to any waiters
+            if let Ok(ref response) = result {
+                lock.broadcast_result(response);
+            }
+
+            result
+        }
+    }
+}
+
+/// Inner implementation of smart indexing (called when we have the lock)
+#[allow(clippy::too_many_arguments)]
+async fn do_index_smart_inner(
+    client: &RagClient,
+    path: String,
+    project: Option<String>,
+    include_patterns: Vec<String>,
+    exclude_patterns: Vec<String>,
+    max_file_size: usize,
+    peer: Option<Peer<RoleServer>>,
+    progress_token: Option<ProgressToken>,
+) -> Result<IndexResponse> {
     // Normalize path to canonical form for consistent cache lookups
     let normalized_path = RagClient::normalize_path(&path)?;
 
