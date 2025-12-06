@@ -41,12 +41,14 @@ pub(crate) enum IndexLockResult {
     WaitForResult(broadcast::Receiver<IndexResponse>),
 }
 
-/// Guard for index locks that cleans up the lock when dropped
+/// Guard for index locks that cleans up the lock when released
 pub(crate) struct IndexLockGuard {
     path: String,
     locks_map: Arc<RwLock<HashMap<String, IndexingOperation>>>,
     /// Sender to broadcast the result when indexing completes
     pub(crate) result_tx: broadcast::Sender<IndexResponse>,
+    /// Flag to track if the lock has been properly released
+    released: bool,
 }
 
 impl IndexLockGuard {
@@ -55,19 +57,35 @@ impl IndexLockGuard {
         // Ignore send errors (no receivers is fine)
         let _ = self.result_tx.send(result.clone());
     }
+
+    /// Release the lock explicitly - MUST be called after broadcasting result
+    /// This ensures synchronous cleanup before the guard is dropped
+    pub(crate) async fn release(mut self) {
+        let mut locks = self.locks_map.write().await;
+        locks.remove(&self.path);
+        self.released = true;
+        // Drop self here, but released=true prevents the Drop impl from spawning cleanup
+    }
 }
 
 impl Drop for IndexLockGuard {
     fn drop(&mut self) {
-        // Cleanup the lock from the map when the guard is dropped
-        let path = self.path.clone();
-        let locks_map = self.locks_map.clone();
+        if !self.released {
+            // Lock wasn't properly released - this is a fallback for error cases
+            // Spawn a task to clean up the lock asynchronously
+            let path = self.path.clone();
+            let locks_map = self.locks_map.clone();
 
-        // Spawn a task to clean up the lock asynchronously
-        tokio::spawn(async move {
-            let mut locks = locks_map.write().await;
-            locks.remove(&path);
-        });
+            tracing::warn!(
+                "IndexLockGuard for '{}' dropped without explicit release - spawning cleanup task",
+                path
+            );
+
+            tokio::spawn(async move {
+                let mut locks = locks_map.write().await;
+                locks.remove(&path);
+            });
+        }
     }
 }
 
@@ -315,6 +333,7 @@ impl RagClient {
             path: normalized_path,
             locks_map: self.indexing_ops.clone(),
             result_tx,
+            released: false,
         }))
     }
 

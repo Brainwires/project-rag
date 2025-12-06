@@ -599,7 +599,7 @@ pub async fn do_index_smart(
             // We acquired the lock, perform the actual indexing
             let result = do_index_smart_inner(
                 client,
-                path,
+                path.clone(),
                 project,
                 include_patterns,
                 exclude_patterns,
@@ -609,10 +609,31 @@ pub async fn do_index_smart(
             )
             .await;
 
-            // Broadcast the result to any waiters
-            if let Ok(ref response) = result {
-                lock.broadcast_result(response);
+            // Broadcast the result to any waiters (even on error, so they don't hang)
+            match &result {
+                Ok(response) => {
+                    lock.broadcast_result(response);
+                }
+                Err(e) => {
+                    // On error, broadcast an error response so waiters don't hang
+                    tracing::error!("Indexing failed for {}: {}", path, e);
+                    let error_response = IndexResponse {
+                        mode: crate::types::IndexingMode::Full,
+                        files_indexed: 0,
+                        chunks_created: 0,
+                        embeddings_generated: 0,
+                        duration_ms: 0,
+                        errors: vec![format!("Indexing failed: {}", e)],
+                        files_updated: 0,
+                        files_removed: 0,
+                    };
+                    lock.broadcast_result(&error_response);
+                }
             }
+
+            // Release the lock synchronously to avoid race conditions
+            // This ensures the lock is removed from the map before we return
+            lock.release().await;
 
             result
         }
