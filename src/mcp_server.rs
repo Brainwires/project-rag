@@ -39,6 +39,42 @@ impl RagMcpServer {
     pub fn client(&self) -> &RagClient {
         &self.client
     }
+
+    /// Create a new RAG MCP server with custom configuration
+    pub async fn with_config(config: crate::config::Config) -> Result<Self> {
+        let client = RagClient::with_config(config).await?;
+        Self::with_client(Arc::new(client))
+    }
+
+    /// Normalize a path to a canonical absolute form for consistent cache lookups
+    pub fn normalize_path(path: &str) -> Result<String> {
+        RagClient::normalize_path(path)
+    }
+
+    /// Index a codebase directory (convenience method for testing)
+    #[allow(clippy::too_many_arguments)]
+    pub async fn do_index(
+        &self,
+        path: String,
+        project: Option<String>,
+        include_patterns: Vec<String>,
+        exclude_patterns: Vec<String>,
+        max_file_size: usize,
+        peer: Option<Peer<RoleServer>>,
+        progress_token: Option<ProgressToken>,
+    ) -> Result<IndexResponse> {
+        crate::client::indexing::do_index_smart(
+            &self.client,
+            path,
+            project,
+            include_patterns,
+            exclude_patterns,
+            max_file_size,
+            peer,
+            progress_token,
+        )
+        .await
+    }
 }
 
 #[tool_router(router = tool_router)]

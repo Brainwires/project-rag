@@ -873,3 +873,127 @@ async fn test_incremental_update_with_concurrent_file_changes() {
     let response = result.unwrap();
     assert_eq!(response.files_updated, 1, "Should detect 1 modified file");
 }
+
+// ===== Concurrent Indexing Tests =====
+
+#[tokio::test]
+async fn test_concurrent_index_same_path_waits_for_result() {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    let (client, temp_dir) = create_test_client().await;
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::write(data_dir.join("file.rs"), "fn test() {}").unwrap();
+
+    let client = Arc::new(client);
+    let path = data_dir.to_string_lossy().to_string();
+    let barrier = Arc::new(Barrier::new(2));
+
+    // Spawn two concurrent indexing operations on the same path
+    let client1 = client.clone();
+    let path1 = path.clone();
+    let barrier1 = barrier.clone();
+    let handle1 = tokio::spawn(async move {
+        barrier1.wait().await;
+        do_index_smart(
+            &client1,
+            path1,
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+    });
+
+    let client2 = client.clone();
+    let path2 = path.clone();
+    let barrier2 = barrier.clone();
+    let handle2 = tokio::spawn(async move {
+        barrier2.wait().await;
+        do_index_smart(
+            &client2,
+            path2,
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+    });
+
+    // Both should succeed (one does the work, other waits for result)
+    let (result1, result2) = tokio::join!(handle1, handle2);
+    let response1 = result1.unwrap().unwrap();
+    let response2 = result2.unwrap().unwrap();
+
+    // Both should report the same number of files indexed
+    assert_eq!(response1.files_indexed, response2.files_indexed);
+    assert_eq!(response1.chunks_created, response2.chunks_created);
+}
+
+#[tokio::test]
+async fn test_concurrent_index_different_paths_both_run() {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    let (client, temp_dir) = create_test_client().await;
+
+    // Create two separate directories
+    let data_dir1 = temp_dir.path().join("data1");
+    let data_dir2 = temp_dir.path().join("data2");
+    std::fs::create_dir(&data_dir1).unwrap();
+    std::fs::create_dir(&data_dir2).unwrap();
+    std::fs::write(data_dir1.join("file1.rs"), "fn test1() {}").unwrap();
+    std::fs::write(data_dir2.join("file2.rs"), "fn test2() {}").unwrap();
+
+    let client = Arc::new(client);
+    let barrier = Arc::new(Barrier::new(2));
+
+    // Spawn two concurrent indexing operations on different paths
+    let client1 = client.clone();
+    let path1 = data_dir1.to_string_lossy().to_string();
+    let barrier1 = barrier.clone();
+    let handle1 = tokio::spawn(async move {
+        barrier1.wait().await;
+        do_index_smart(
+            &client1,
+            path1,
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+    });
+
+    let client2 = client.clone();
+    let path2 = data_dir2.to_string_lossy().to_string();
+    let barrier2 = barrier.clone();
+    let handle2 = tokio::spawn(async move {
+        barrier2.wait().await;
+        do_index_smart(
+            &client2,
+            path2,
+            None,
+            vec![],
+            vec![],
+            1024 * 1024,
+            None,
+            None,
+        )
+        .await
+    });
+
+    // Both should succeed independently
+    let (result1, result2) = tokio::join!(handle1, handle2);
+    assert!(result1.unwrap().is_ok(), "First path should index successfully");
+    assert!(result2.unwrap().is_ok(), "Second path should index successfully");
+}

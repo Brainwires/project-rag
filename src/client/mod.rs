@@ -19,10 +19,75 @@ use crate::vector_db::QdrantVectorDB;
 use crate::vector_db::LanceVectorDB;
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
+
+use tokio::sync::broadcast;
+
+/// State for an in-progress indexing operation
+pub(crate) struct IndexingOperation {
+    /// Sender to broadcast the result to all waiters
+    result_tx: broadcast::Sender<IndexResponse>,
+}
+
+/// Result of trying to acquire an index lock
+pub(crate) enum IndexLockResult {
+    /// We acquired the lock and should perform indexing
+    Acquired(IndexLockGuard),
+    /// Another operation is in progress, wait for its result
+    WaitForResult(broadcast::Receiver<IndexResponse>),
+}
+
+/// Guard for index locks that cleans up the lock when released
+pub(crate) struct IndexLockGuard {
+    path: String,
+    locks_map: Arc<RwLock<HashMap<String, IndexingOperation>>>,
+    /// Sender to broadcast the result when indexing completes
+    pub(crate) result_tx: broadcast::Sender<IndexResponse>,
+    /// Flag to track if the lock has been properly released
+    released: bool,
+}
+
+impl IndexLockGuard {
+    /// Broadcast the indexing result to all waiters
+    pub(crate) fn broadcast_result(&self, result: &IndexResponse) {
+        // Ignore send errors (no receivers is fine)
+        let _ = self.result_tx.send(result.clone());
+    }
+
+    /// Release the lock explicitly - MUST be called after broadcasting result
+    /// This ensures synchronous cleanup before the guard is dropped
+    pub(crate) async fn release(mut self) {
+        let mut locks = self.locks_map.write().await;
+        locks.remove(&self.path);
+        self.released = true;
+        // Drop self here, but released=true prevents the Drop impl from spawning cleanup
+    }
+}
+
+impl Drop for IndexLockGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            // Lock wasn't properly released - this is a fallback for error cases
+            // Spawn a task to clean up the lock asynchronously
+            let path = self.path.clone();
+            let locks_map = self.locks_map.clone();
+
+            tracing::warn!(
+                "IndexLockGuard for '{}' dropped without explicit release - spawning cleanup task",
+                path
+            );
+
+            tokio::spawn(async move {
+                let mut locks = locks_map.write().await;
+                locks.remove(&path);
+            });
+        }
+    }
+}
 
 /// Main client for interacting with the RAG system
 ///
@@ -70,6 +135,8 @@ pub struct RagClient {
     pub(crate) git_cache_path: PathBuf,
     // Configuration (for accessing batch sizes, timeouts, etc.)
     pub(crate) config: Arc<Config>,
+    // In-progress indexing operations (prevents concurrent indexing and allows result sharing)
+    pub(crate) indexing_ops: Arc<RwLock<HashMap<String, IndexingOperation>>>,
 }
 
 impl RagClient {
@@ -185,6 +252,7 @@ impl RagClient {
             git_cache: Arc::new(RwLock::new(git_cache)),
             git_cache_path,
             config: Arc::new(config),
+            indexing_ops: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -206,6 +274,67 @@ impl RagClient {
         let canonical = std::fs::canonicalize(&path_buf)
             .with_context(|| format!("Failed to canonicalize path: {}", path))?;
         Ok(canonical.to_string_lossy().to_string())
+    }
+
+    /// Try to acquire an indexing lock for a given path
+    ///
+    /// Returns either:
+    /// - `IndexLockResult::Acquired(guard)` if we should perform the indexing
+    /// - `IndexLockResult::WaitForResult(receiver)` if another operation is in progress
+    ///
+    /// The lock is automatically released when the returned guard is dropped.
+    pub(crate) async fn try_acquire_index_lock(&self, path: &str) -> Result<IndexLockResult> {
+        // Normalize the path to ensure consistent locking across different path formats
+        let normalized_path = Self::normalize_path(path)?;
+
+        // Acquire write lock on the ops map
+        let mut ops = self.indexing_ops.write().await;
+
+        // Check if an operation is already in progress for this path
+        if let Some(existing_op) = ops.get(&normalized_path) {
+            // Check if the operation is still active by looking at receiver count
+            // If receiver_count() == 0, the indexing has completed but cleanup hasn't
+            // happened yet (the async Drop task is pending). In this case, treat it
+            // as if no operation exists and start a new one.
+            if existing_op.result_tx.receiver_count() > 0 {
+                // Operation is still active, subscribe to receive the result
+                let receiver = existing_op.result_tx.subscribe();
+                tracing::info!(
+                    "Indexing already in progress for {}, waiting for result",
+                    normalized_path
+                );
+                return Ok(IndexLockResult::WaitForResult(receiver));
+            } else {
+                // Stale entry - remove it and proceed to create a new operation
+                tracing::debug!(
+                    "Removing stale indexing lock for {} (operation completed)",
+                    normalized_path
+                );
+                ops.remove(&normalized_path);
+            }
+        }
+
+        // Create a new broadcast channel for this operation
+        // Capacity of 1 is enough since we only send one result
+        let (result_tx, _) = broadcast::channel(1);
+
+        // Register this operation
+        ops.insert(
+            normalized_path.clone(),
+            IndexingOperation {
+                result_tx: result_tx.clone(),
+            },
+        );
+
+        // Drop the write lock on the map
+        drop(ops);
+
+        Ok(IndexLockResult::Acquired(IndexLockGuard {
+            path: normalized_path,
+            locks_map: self.indexing_ops.clone(),
+            result_tx,
+            released: false,
+        }))
     }
 
     /// Index a codebase directory
