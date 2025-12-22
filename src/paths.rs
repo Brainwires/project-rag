@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 /// The folder name used for data storage.
 /// Default: "project-rag"
-/// With `alt-folder-name` feature: Value set by consuming crate
+/// With `alt-folder-name` feature: Uses alternative folder name "brainwires" instead of "project-rag".
 #[cfg(not(feature = "alt-folder-name"))]
 const PROJECT_FOLDER_NAME: &str = "project-rag";
 
