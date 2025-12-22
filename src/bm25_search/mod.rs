@@ -314,33 +314,19 @@ pub struct BM25Stats {
 pub const RRF_K_CONSTANT: f32 = 60.0;
 
 /// Reciprocal Rank Fusion (RRF) for combining vector and BM25 results
+///
+/// This is a convenience wrapper around `reciprocal_rank_fusion_generic` for the common case
+/// of combining vector search results (u64 IDs) with BM25 results.
 pub fn reciprocal_rank_fusion(
     vector_results: Vec<(u64, f32)>,
     bm25_results: Vec<BM25Result>,
     k: usize,
 ) -> Vec<(u64, f32)> {
-    let mut score_map: HashMap<u64, f32> = HashMap::new();
+    // Convert BM25 results to the same format as vector results
+    let bm25_tuples: Vec<(u64, f32)> = bm25_results.into_iter().map(|r| (r.id, r.score)).collect();
 
-    // Add vector scores with RRF formula: 1 / (k + rank)
-    for (rank, (id, _score)) in vector_results.iter().enumerate() {
-        let rrf_score = 1.0 / (RRF_K_CONSTANT + (rank + 1) as f32);
-        *score_map.entry(*id).or_insert(0.0) += rrf_score;
-    }
-
-    // Add BM25 scores with RRF formula
-    for (rank, result) in bm25_results.iter().enumerate() {
-        let rrf_score = 1.0 / (RRF_K_CONSTANT + (rank + 1) as f32);
-        *score_map.entry(result.id).or_insert(0.0) += rrf_score;
-    }
-
-    // Convert to vec and sort by combined score
-    let mut combined: Vec<(u64, f32)> = score_map.into_iter().collect();
-    combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-    // Take top k results
-    combined.truncate(k);
-
-    combined
+    // Use the generic implementation
+    reciprocal_rank_fusion_generic([vector_results, bm25_tuples], k)
 }
 
 /// Generic Reciprocal Rank Fusion (RRF) for combining arbitrary ranked lists
