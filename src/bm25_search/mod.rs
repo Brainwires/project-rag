@@ -310,34 +310,54 @@ pub struct BM25Stats {
     pub total_documents: usize,
 }
 
+/// Standard RRF constant (60.0 is the commonly used value from the RRF paper)
+pub const RRF_K_CONSTANT: f32 = 60.0;
+
 /// Reciprocal Rank Fusion (RRF) for combining vector and BM25 results
+///
+/// This is a convenience wrapper around `reciprocal_rank_fusion_generic` for the common case
+/// of combining vector search results (u64 IDs) with BM25 results.
 pub fn reciprocal_rank_fusion(
     vector_results: Vec<(u64, f32)>,
     bm25_results: Vec<BM25Result>,
     k: usize,
 ) -> Vec<(u64, f32)> {
-    const K_CONSTANT: f32 = 60.0; // Standard RRF constant
+    // Convert BM25 results to the same format as vector results
+    let bm25_tuples: Vec<(u64, f32)> = bm25_results.into_iter().map(|r| (r.id, r.score)).collect();
 
-    let mut score_map: HashMap<u64, f32> = HashMap::new();
+    // Use the generic implementation
+    reciprocal_rank_fusion_generic([vector_results, bm25_tuples], k)
+}
 
-    // Add vector scores with RRF formula: 1 / (k + rank)
-    for (rank, (id, _score)) in vector_results.iter().enumerate() {
-        let rrf_score = 1.0 / (K_CONSTANT + (rank + 1) as f32);
-        *score_map.entry(*id).or_insert(0.0) += rrf_score;
+/// Generic Reciprocal Rank Fusion (RRF) for combining arbitrary ranked lists
+///
+/// This is a generic version that works with any type that implements Eq + Hash + Clone.
+/// Useful for combining results from different search systems.
+///
+/// # Arguments
+/// * `ranked_lists` - Iterator of ranked result lists, each containing (id, original_score)
+/// * `limit` - Maximum results to return
+///
+/// # Returns
+/// Vec of (id, combined_rrf_score) sorted by score descending
+pub fn reciprocal_rank_fusion_generic<T, I, L>(ranked_lists: I, limit: usize) -> Vec<(T, f32)>
+where
+    T: Eq + std::hash::Hash + Clone,
+    I: IntoIterator<Item = L>,
+    L: IntoIterator<Item = (T, f32)>,
+{
+    let mut score_map: HashMap<T, f32> = HashMap::new();
+
+    for list in ranked_lists {
+        for (rank, (id, _score)) in list.into_iter().enumerate() {
+            let rrf_score = 1.0 / (RRF_K_CONSTANT + (rank + 1) as f32);
+            *score_map.entry(id).or_insert(0.0) += rrf_score;
+        }
     }
 
-    // Add BM25 scores with RRF formula
-    for (rank, result) in bm25_results.iter().enumerate() {
-        let rrf_score = 1.0 / (K_CONSTANT + (rank + 1) as f32);
-        *score_map.entry(result.id).or_insert(0.0) += rrf_score;
-    }
-
-    // Convert to vec and sort by combined score
-    let mut combined: Vec<(u64, f32)> = score_map.into_iter().collect();
-    combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-    // Take top k results
-    combined.truncate(k);
+    let mut combined: Vec<(T, f32)> = score_map.into_iter().collect();
+    combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    combined.truncate(limit);
 
     combined
 }

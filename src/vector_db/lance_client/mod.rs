@@ -801,7 +801,7 @@ impl VectorDatabase for LanceVectorDB {
     }
 
     async fn clear(&self) -> Result<()> {
-        // Drop and recreate table (empty namespace for default)
+        // Drop and recreate table (empty namespace array for default namespace)
         self.connection
             .drop_table(&self.table_name, &[])
             .await

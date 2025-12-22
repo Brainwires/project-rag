@@ -152,11 +152,6 @@ impl RagClient {
     /// - Embedding model cannot be initialized
     /// - Vector database cannot be initialized
     pub async fn new() -> Result<Self> {
-        // Migrate from old project-rag directories if they exist
-        if let Err(e) = crate::paths::PlatformPaths::migrate_from_project_rag() {
-            eprintln!("Warning: Migration failed: {}", e);
-        }
-
         let config = Config::new().context("Failed to load configuration")?;
         Self::with_config(config).await
     }
@@ -370,6 +365,8 @@ impl RagClient {
         request.validate().map_err(|e| anyhow::anyhow!(e))?;
 
         // Use the smart indexing logic without progress notifications
+        // Default cancellation token - not cancellable from this API
+        let cancel_token = tokio_util::sync::CancellationToken::new();
         indexing::do_index_smart(
             self,
             request.path,
@@ -379,6 +376,7 @@ impl RagClient {
             request.max_file_size,
             None, // No peer
             None, // No progress token
+            cancel_token,
         )
         .await
     }

@@ -1,6 +1,7 @@
 use super::*;
 use crate::client::RagClient;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn test_new_creates_server() {
@@ -84,6 +85,7 @@ async fn test_do_index_empty_directory() {
         1024 * 1024,
         None,
         None,
+        CancellationToken::new(),
     )
     .await;
 
@@ -119,6 +121,7 @@ async fn test_do_index_with_files() {
         1024 * 1024,
         None,
         None,
+        CancellationToken::new(),
     )
     .await;
 
@@ -155,6 +158,7 @@ async fn test_do_index_with_exclude_patterns() {
         1024 * 1024,
         None,
         None,
+        CancellationToken::new(),
     )
     .await;
 
@@ -190,6 +194,7 @@ async fn test_do_incremental_update_no_cache() {
         1024 * 1024,
         None,
         None,
+        CancellationToken::new(),
     )
     .await;
 
@@ -221,6 +226,7 @@ async fn test_do_index_smart_new_codebase() {
         1024 * 1024,
         None,
         None,
+        CancellationToken::new(),
     )
     .await;
 
@@ -339,6 +345,7 @@ async fn test_tool_get_statistics_with_data() {
         1024 * 1024,
         None,
         None,
+        CancellationToken::new(),
     )
     .await
     .unwrap();
@@ -376,6 +383,7 @@ async fn test_tool_clear_index() {
         1024 * 1024,
         None,
         None,
+        CancellationToken::new(),
     )
     .await
     .unwrap();
