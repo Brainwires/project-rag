@@ -4,6 +4,15 @@
 /// XDG Base Directory specification on Unix-like systems.
 use std::path::PathBuf;
 
+/// The folder name used for data storage.
+/// Default: "project-rag"
+/// With `alt-folder-name` feature: Value set by consuming crate
+#[cfg(not(feature = "alt-folder-name"))]
+const PROJECT_FOLDER_NAME: &str = "project-rag";
+
+#[cfg(feature = "alt-folder-name")]
+const PROJECT_FOLDER_NAME: &str = "brainwires";
+
 /// Platform-agnostic path utilities
 pub struct PlatformPaths;
 
@@ -79,118 +88,60 @@ impl PlatformPaths {
         }
     }
 
+    /// Get the project folder name
+    ///
+    /// Returns: "project-rag"
+    pub fn project_folder_name() -> &'static str {
+        PROJECT_FOLDER_NAME
+    }
+
     /// Get default project-specific data directory
     ///
-    /// Returns: {data_dir}/brainwires
+    /// Returns: {data_dir}/{project_folder_name}
     pub fn project_data_dir() -> PathBuf {
-        Self::data_dir().join("brainwires")
+        Self::data_dir().join(PROJECT_FOLDER_NAME)
     }
 
     /// Get default project-specific cache directory
     ///
-    /// Returns: {cache_dir}/brainwires
+    /// Returns: {cache_dir}/{project_folder_name}
     pub fn project_cache_dir() -> PathBuf {
-        Self::cache_dir().join("brainwires")
+        Self::cache_dir().join(PROJECT_FOLDER_NAME)
     }
 
     /// Get default project-specific config directory
     ///
-    /// Returns: {config_dir}/brainwires
+    /// Returns: {config_dir}/{project_folder_name}
     pub fn project_config_dir() -> PathBuf {
-        Self::config_dir().join("brainwires")
+        Self::config_dir().join(PROJECT_FOLDER_NAME)
     }
 
     /// Get default LanceDB database path
     ///
-    /// Returns: {data_dir}/brainwires/lancedb
+    /// Returns: {data_dir}/{project_folder_name}/lancedb
     pub fn default_lancedb_path() -> PathBuf {
         Self::project_data_dir().join("lancedb")
     }
 
     /// Get default hash cache path
     ///
-    /// Returns: {cache_dir}/brainwires/hash_cache.json
+    /// Returns: {cache_dir}/{project_folder_name}/hash_cache.json
     pub fn default_hash_cache_path() -> PathBuf {
         Self::project_cache_dir().join("hash_cache.json")
     }
 
     /// Get default git cache path
     ///
-    /// Returns: {cache_dir}/brainwires/git_cache.json
+    /// Returns: {cache_dir}/{project_folder_name}/git_cache.json
     pub fn default_git_cache_path() -> PathBuf {
         Self::project_cache_dir().join("git_cache.json")
     }
 
     /// Get default config file path
     ///
-    /// Returns: {config_dir}/brainwires/config.toml
+    /// Returns: {config_dir}/{project_folder_name}/config.toml
     pub fn default_config_path() -> PathBuf {
         Self::project_config_dir().join("config.toml")
-    }
-
-    /// Migrate data from old project-rag directories to new brainwires directories
-    ///
-    /// OLD locations:
-    /// - ~/.local/share/project-rag/
-    /// - ~/.cache/project-rag/
-    /// - ~/.config/project-rag/
-    ///
-    /// NEW locations:
-    /// - ~/.local/share/brainwires/
-    /// - ~/.cache/brainwires/
-    /// - ~/.config/brainwires/
-    pub fn migrate_from_project_rag() -> Result<(), std::io::Error> {
-        let old_data_dir = Self::data_dir().join("project-rag");
-        let old_cache_dir = Self::cache_dir().join("project-rag");
-        let old_config_dir = Self::config_dir().join("project-rag");
-
-        let new_data_dir = Self::project_data_dir();
-        let new_cache_dir = Self::project_cache_dir();
-        let new_config_dir = Self::project_config_dir();
-
-        let mut migrated = false;
-
-        // Migrate data directory
-        if old_data_dir.exists() && !new_data_dir.exists() {
-            std::fs::create_dir_all(new_data_dir.parent().unwrap())?;
-            std::fs::rename(&old_data_dir, &new_data_dir)?;
-            eprintln!(
-                "Migrated: {} -> {}",
-                old_data_dir.display(),
-                new_data_dir.display()
-            );
-            migrated = true;
-        }
-
-        // Migrate cache directory
-        if old_cache_dir.exists() && !new_cache_dir.exists() {
-            std::fs::create_dir_all(new_cache_dir.parent().unwrap())?;
-            std::fs::rename(&old_cache_dir, &new_cache_dir)?;
-            eprintln!(
-                "Migrated: {} -> {}",
-                old_cache_dir.display(),
-                new_cache_dir.display()
-            );
-            migrated = true;
-        }
-
-        // Migrate config directory
-        if old_config_dir.exists() && !new_config_dir.exists() {
-            std::fs::create_dir_all(new_config_dir.parent().unwrap())?;
-            std::fs::rename(&old_config_dir, &new_config_dir)?;
-            eprintln!(
-                "Migrated: {} -> {}",
-                old_config_dir.display(),
-                new_config_dir.display()
-            );
-            migrated = true;
-        }
-
-        if migrated {
-            eprintln!("Migration from project-rag to brainwires complete");
-        }
-
-        Ok(())
     }
 }
 
@@ -223,36 +174,36 @@ mod tests {
         let cache_dir = PlatformPaths::project_cache_dir();
         let config_dir = PlatformPaths::project_config_dir();
 
-        assert!(data_dir.to_string_lossy().contains("brainwires"));
-        assert!(cache_dir.to_string_lossy().contains("brainwires"));
-        assert!(config_dir.to_string_lossy().contains("brainwires"));
+        assert!(data_dir.to_string_lossy().contains("project-rag"));
+        assert!(cache_dir.to_string_lossy().contains("project-rag"));
+        assert!(config_dir.to_string_lossy().contains("project-rag"));
     }
 
     #[test]
     fn test_default_lancedb_path() {
         let path = PlatformPaths::default_lancedb_path();
-        assert!(path.to_string_lossy().contains("brainwires"));
+        assert!(path.to_string_lossy().contains("project-rag"));
         assert!(path.to_string_lossy().contains("lancedb"));
     }
 
     #[test]
     fn test_default_hash_cache_path() {
         let path = PlatformPaths::default_hash_cache_path();
-        assert!(path.to_string_lossy().contains("brainwires"));
+        assert!(path.to_string_lossy().contains("project-rag"));
         assert!(path.to_string_lossy().contains("hash_cache.json"));
     }
 
     #[test]
     fn test_default_git_cache_path() {
         let path = PlatformPaths::default_git_cache_path();
-        assert!(path.to_string_lossy().contains("brainwires"));
+        assert!(path.to_string_lossy().contains("project-rag"));
         assert!(path.to_string_lossy().contains("git_cache.json"));
     }
 
     #[test]
     fn test_default_config_path() {
         let path = PlatformPaths::default_config_path();
-        assert!(path.to_string_lossy().contains("brainwires"));
+        assert!(path.to_string_lossy().contains("project-rag"));
         assert!(path.to_string_lossy().contains("config.toml"));
     }
 
@@ -446,8 +397,8 @@ mod tests {
             &config_path,
         ] {
             assert!(
-                path.to_string_lossy().contains("brainwires"),
-                "Path {:?} should contain 'brainwires'",
+                path.to_string_lossy().contains("project-rag"),
+                "Path {:?} should contain 'project-rag'",
                 path
             );
         }

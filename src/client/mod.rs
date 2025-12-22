@@ -152,11 +152,6 @@ impl RagClient {
     /// - Embedding model cannot be initialized
     /// - Vector database cannot be initialized
     pub async fn new() -> Result<Self> {
-        // Migrate from old project-rag directories if they exist
-        if let Err(e) = crate::paths::PlatformPaths::migrate_from_project_rag() {
-            eprintln!("Warning: Migration failed: {}", e);
-        }
-
         let config = Config::new().context("Failed to load configuration")?;
         Self::with_config(config).await
     }
