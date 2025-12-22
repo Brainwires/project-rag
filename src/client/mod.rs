@@ -370,6 +370,8 @@ impl RagClient {
         request.validate().map_err(|e| anyhow::anyhow!(e))?;
 
         // Use the smart indexing logic without progress notifications
+        // Default cancellation token - not cancellable from this API
+        let cancel_token = tokio_util::sync::CancellationToken::new();
         indexing::do_index_smart(
             self,
             request.path,
@@ -379,6 +381,7 @@ impl RagClient {
             request.max_file_size,
             None, // No peer
             None, // No progress token
+            cancel_token,
         )
         .await
     }

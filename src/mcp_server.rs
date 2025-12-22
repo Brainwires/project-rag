@@ -11,6 +11,29 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+/// Guard that cancels a CancellationToken when dropped.
+/// This ensures that if the async handler's future is dropped (e.g., due to client disconnect),
+/// the cancellation token is triggered, allowing cooperative cancellation of long-running operations.
+struct CancelOnDropGuard {
+    token: CancellationToken,
+}
+
+impl CancelOnDropGuard {
+    fn new(token: CancellationToken) -> Self {
+        Self { token }
+    }
+}
+
+impl Drop for CancelOnDropGuard {
+    fn drop(&mut self) {
+        if !self.token.is_cancelled() {
+            tracing::info!("Tool handler dropped, triggering cancellation");
+            self.token.cancel();
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct RagMcpServer {
@@ -62,7 +85,9 @@ impl RagMcpServer {
         max_file_size: usize,
         peer: Option<Peer<RoleServer>>,
         progress_token: Option<ProgressToken>,
+        cancel_token: Option<CancellationToken>,
     ) -> Result<IndexResponse> {
+        let cancel_token = cancel_token.unwrap_or_default();
         crate::client::indexing::do_index_smart(
             &self.client,
             path,
@@ -72,6 +97,7 @@ impl RagMcpServer {
             max_file_size,
             peer,
             progress_token,
+            cancel_token,
         )
         .await
     }
@@ -94,6 +120,15 @@ impl RagMcpServer {
         // Get progress token if provided
         let progress_token = meta.get_progress_token();
 
+        // Create a cancellation token for this indexing operation
+        // When this handler's future is dropped (e.g., client disconnects),
+        // the CancellationToken will be dropped and signal cancellation
+        let cancel_token = CancellationToken::new();
+        let cancel_token_for_index = cancel_token.clone();
+
+        // Use a guard to cancel on drop
+        let _cancel_guard = CancelOnDropGuard::new(cancel_token);
+
         let response = crate::client::indexing::do_index_smart(
             &self.client,
             req.path,
@@ -103,6 +138,7 @@ impl RagMcpServer {
             req.max_file_size,
             Some(peer),
             progress_token,
+            cancel_token_for_index,
         )
         .await
         .map_err(|e| format!("{:#}", e))?; // Use alternate display to show full error chain

@@ -4,6 +4,8 @@ use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Information about a discovered file
 #[derive(Debug, Clone)]
@@ -24,6 +26,8 @@ pub struct FileWalker {
     max_file_size: usize,
     include_patterns: Vec<String>,
     exclude_patterns: Vec<String>,
+    /// Optional cancellation flag - if set to true, walk() will exit early
+    cancelled: Option<Arc<AtomicBool>>,
 }
 
 impl FileWalker {
@@ -34,7 +38,22 @@ impl FileWalker {
             max_file_size,
             include_patterns: vec![],
             exclude_patterns: vec![],
+            cancelled: None,
         }
+    }
+
+    /// Set a cancellation flag that will be checked during the walk.
+    /// If the flag is set to true, the walk will exit early.
+    pub fn with_cancellation_flag(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.cancelled = Some(cancelled);
+        self
+    }
+
+    /// Check if cancellation has been requested
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
     pub fn with_project(mut self, project: Option<String>) -> Self {
@@ -74,6 +93,12 @@ impl FileWalker {
             .build();
 
         for entry in walker {
+            // Check for cancellation at the start of each iteration
+            if self.is_cancelled() {
+                tracing::info!("File walk cancelled after {} files", files.len());
+                anyhow::bail!("Indexing was cancelled");
+            }
+
             let entry = entry.context("Failed to read directory entry")?;
             let path = entry.path();
 

@@ -1,5 +1,11 @@
 use super::*;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
+
+// Helper to create default cancel token for tests
+fn test_cancel_token() -> CancellationToken {
+    CancellationToken::new()
+}
 
 // Helper to create test client
 async fn create_test_client() -> (RagClient, TempDir) {
@@ -29,6 +35,7 @@ async fn test_do_index_empty_directory() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -61,6 +68,7 @@ async fn test_do_index_single_file() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -91,6 +99,7 @@ async fn test_do_index_multiple_files() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -117,6 +126,7 @@ async fn test_do_index_with_exclude_patterns() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -145,6 +155,7 @@ async fn test_incremental_update_no_changes() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await
     .unwrap();
@@ -159,6 +170,7 @@ async fn test_incremental_update_no_changes() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -187,6 +199,7 @@ async fn test_incremental_update_new_file() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await
     .unwrap();
@@ -204,6 +217,7 @@ async fn test_incremental_update_new_file() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -232,6 +246,7 @@ async fn test_incremental_update_modified_file() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await
     .unwrap();
@@ -249,6 +264,7 @@ async fn test_incremental_update_modified_file() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -277,6 +293,7 @@ async fn test_incremental_update_removed_file() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await
     .unwrap();
@@ -294,6 +311,7 @@ async fn test_incremental_update_removed_file() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -323,6 +341,7 @@ async fn test_incremental_update_mixed_changes() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await
     .unwrap();
@@ -342,6 +361,7 @@ async fn test_incremental_update_mixed_changes() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -370,6 +390,7 @@ async fn test_smart_index_first_time_full() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -396,6 +417,7 @@ async fn test_smart_index_second_time_incremental() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await
     .unwrap();
@@ -411,6 +433,7 @@ async fn test_smart_index_second_time_incremental() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await
     .unwrap();
@@ -436,6 +459,7 @@ async fn test_smart_index_path_normalization() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await
     .unwrap();
@@ -451,6 +475,7 @@ async fn test_smart_index_path_normalization() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -476,6 +501,7 @@ async fn test_index_with_project_name() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -501,6 +527,7 @@ async fn test_index_preserves_cache_across_operations() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await
     .unwrap();
@@ -528,6 +555,7 @@ async fn test_incremental_update_empty_directory() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -552,6 +580,7 @@ async fn test_do_index_nonexistent_path() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -586,6 +615,7 @@ async fn test_do_index_with_very_large_file() {
         1024, // 1KB limit
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -613,6 +643,7 @@ async fn test_do_index_with_empty_file() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -644,6 +675,7 @@ async fn test_do_index_with_binary_file() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -671,6 +703,7 @@ async fn test_do_index_with_include_patterns() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -699,6 +732,7 @@ async fn test_do_index_with_special_characters_in_filename() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -732,6 +766,7 @@ async fn test_do_index_with_nested_directories() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -754,6 +789,7 @@ async fn test_incremental_update_nonexistent_path() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -773,6 +809,7 @@ async fn test_smart_index_with_invalid_path() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -795,6 +832,7 @@ async fn test_do_index_respects_duration_tracking() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -823,6 +861,7 @@ async fn test_do_index_with_whitespace_only_file() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -849,6 +888,7 @@ async fn test_incremental_update_with_concurrent_file_changes() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await
     .unwrap();
@@ -866,6 +906,7 @@ async fn test_incremental_update_with_concurrent_file_changes() {
         1024 * 1024,
         None,
         None,
+        test_cancel_token(),
     )
     .await;
 
@@ -905,6 +946,7 @@ async fn test_concurrent_index_same_path_waits_for_result() {
             1024 * 1024,
             None,
             None,
+            CancellationToken::new(),
         )
         .await
     });
@@ -923,6 +965,7 @@ async fn test_concurrent_index_same_path_waits_for_result() {
             1024 * 1024,
             None,
             None,
+            CancellationToken::new(),
         )
         .await
     });
@@ -970,6 +1013,7 @@ async fn test_concurrent_index_different_paths_both_run() {
             1024 * 1024,
             None,
             None,
+            CancellationToken::new(),
         )
         .await
     });
@@ -988,6 +1032,7 @@ async fn test_concurrent_index_different_paths_both_run() {
             1024 * 1024,
             None,
             None,
+            CancellationToken::new(),
         )
         .await
     });
@@ -996,4 +1041,289 @@ async fn test_concurrent_index_different_paths_both_run() {
     let (result1, result2) = tokio::join!(handle1, handle2);
     assert!(result1.unwrap().is_ok(), "First path should index successfully");
     assert!(result2.unwrap().is_ok(), "Second path should index successfully");
+}
+
+// ===== Cancellation Tests =====
+
+#[tokio::test]
+async fn test_cancellation_before_indexing_starts() {
+    let (client, temp_dir) = create_test_client().await;
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
+
+    // Create a pre-cancelled token
+    let cancel_token = CancellationToken::new();
+    cancel_token.cancel();
+
+    let result = do_index(
+        &client,
+        data_dir.to_string_lossy().to_string(),
+        None,
+        vec![],
+        vec![],
+        1024 * 1024,
+        None,
+        None,
+        cancel_token,
+    )
+    .await;
+
+    assert!(result.is_err(), "Should fail when cancelled before start");
+    // Use {:#} format to see full error chain (anyhow wraps errors with context)
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(
+        error.contains("cancelled"),
+        "Error should mention cancellation: {}",
+        error
+    );
+}
+
+#[tokio::test]
+async fn test_cancellation_during_file_walk() {
+    let (client, temp_dir) = create_test_client().await;
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+
+    // Create many files to ensure file walk takes some time
+    for i in 0..100 {
+        let subdir = data_dir.join(format!("dir{}", i));
+        std::fs::create_dir(&subdir).unwrap();
+        for j in 0..10 {
+            std::fs::write(
+                subdir.join(format!("file{}.rs", j)),
+                format!("fn func_{}_{} () {{ let x = {}; }}", i, j, i * j),
+            )
+            .unwrap();
+        }
+    }
+
+    let cancel_token = CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+
+    // Cancel after a very short delay
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        cancel_token_clone.cancel();
+    });
+
+    let result = do_index(
+        &client,
+        data_dir.to_string_lossy().to_string(),
+        None,
+        vec![],
+        vec![],
+        1024 * 1024,
+        None,
+        None,
+        cancel_token,
+    )
+    .await;
+
+    // Should either succeed quickly (if file walk completed before cancel)
+    // or fail with cancellation error
+    if result.is_err() {
+        // Use {:#} format to see full error chain (anyhow wraps errors with context)
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("cancelled"),
+            "Error should mention cancellation: {}",
+            error
+        );
+    }
+    // If it succeeded, that's also OK - it just means file walk completed before cancellation
+}
+
+#[tokio::test]
+async fn test_cancellation_stops_early_incremental() {
+    let (client, temp_dir) = create_test_client().await;
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+
+    // Create some files for initial index
+    for i in 0..10 {
+        std::fs::write(
+            data_dir.join(format!("file{}.rs", i)),
+            format!("fn func_{} () {{}}", i),
+        )
+        .unwrap();
+    }
+
+    // Initial full index
+    do_index(
+        &client,
+        data_dir.to_string_lossy().to_string(),
+        None,
+        vec![],
+        vec![],
+        1024 * 1024,
+        None,
+        None,
+        test_cancel_token(),
+    )
+    .await
+    .unwrap();
+
+    // Modify all files to force re-indexing
+    for i in 0..10 {
+        std::fs::write(
+            data_dir.join(format!("file{}.rs", i)),
+            format!("fn modified_func_{} () {{ /* modified */ }}", i),
+        )
+        .unwrap();
+    }
+
+    // Create a pre-cancelled token for incremental update
+    let cancel_token = CancellationToken::new();
+    cancel_token.cancel();
+
+    let result = do_incremental_update(
+        &client,
+        data_dir.to_string_lossy().to_string(),
+        None,
+        vec![],
+        vec![],
+        1024 * 1024,
+        None,
+        None,
+        cancel_token,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "Incremental update should fail when cancelled"
+    );
+    // Use {:#} format to see full error chain (anyhow wraps errors with context)
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(
+        error.contains("cancelled"),
+        "Error should mention cancellation: {}",
+        error
+    );
+}
+
+#[tokio::test]
+async fn test_cancellation_stops_smart_index() {
+    let (client, temp_dir) = create_test_client().await;
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
+
+    // Pre-cancelled token
+    let cancel_token = CancellationToken::new();
+    cancel_token.cancel();
+
+    let result = do_index_smart(
+        &client,
+        data_dir.to_string_lossy().to_string(),
+        None,
+        vec![],
+        vec![],
+        1024 * 1024,
+        None,
+        None,
+        cancel_token,
+    )
+    .await;
+
+    assert!(result.is_err(), "Smart index should fail when cancelled");
+    // Use {:#} format to see full error chain (anyhow wraps errors with context)
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(
+        error.contains("cancelled"),
+        "Error should mention cancellation: {}",
+        error
+    );
+}
+
+#[tokio::test]
+async fn test_uncancelled_token_completes_normally() {
+    let (client, temp_dir) = create_test_client().await;
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
+
+    // Token that is never cancelled
+    let cancel_token = CancellationToken::new();
+
+    let result = do_index(
+        &client,
+        data_dir.to_string_lossy().to_string(),
+        None,
+        vec![],
+        vec![],
+        1024 * 1024,
+        None,
+        None,
+        cancel_token,
+    )
+    .await;
+
+    assert!(result.is_ok(), "Should succeed when not cancelled");
+    let response = result.unwrap();
+    assert_eq!(response.files_indexed, 1);
+}
+
+#[tokio::test]
+async fn test_cancel_token_cancellation_is_detected() {
+    // Test that our check_cancelled macro works correctly
+    let cancel_token = CancellationToken::new();
+    assert!(!cancel_token.is_cancelled(), "Should not be cancelled initially");
+
+    cancel_token.cancel();
+    assert!(cancel_token.is_cancelled(), "Should be cancelled after cancel()");
+}
+
+#[tokio::test]
+async fn test_cancellation_during_embedding_batch() {
+    let (client, temp_dir) = create_test_client().await;
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+
+    // Create many files to ensure there are multiple embedding batches
+    // Default batch size is 32, so we need 50+ chunks
+    for i in 0..60 {
+        std::fs::write(
+            data_dir.join(format!("file{}.rs", i)),
+            format!(
+                "fn func_{} () {{\n    let x = {};\n    let y = {};\n    println!(\"test\");\n}}",
+                i, i, i * 2
+            ),
+        )
+        .unwrap();
+    }
+
+    let cancel_token = CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+
+    // Cancel after a delay to allow file walk to complete but during embedding
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        cancel_token_clone.cancel();
+    });
+
+    let result = do_index(
+        &client,
+        data_dir.to_string_lossy().to_string(),
+        None,
+        vec![],
+        vec![],
+        1024 * 1024,
+        None,
+        None,
+        cancel_token,
+    )
+    .await;
+
+    // Either succeeds (if embedding finished before cancel) or fails with cancellation
+    if result.is_err() {
+        // Use {:#} format to see full error chain (anyhow wraps errors with context)
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("cancelled"),
+            "Error should mention cancellation: {}",
+            error
+        );
+    }
 }

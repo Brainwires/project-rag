@@ -9,9 +9,9 @@ rmcp = { version = "0.8", features = ["server", "transport-io", "macros"] }
 schemars = "1.0"
 tokio = { version = "1.43", features = ["full"] }
 # Vector databases - LanceDB is default (embedded, stable), Qdrant is optional (external)
-lancedb = "0.10"
-arrow-array = "52.2"
-arrow-schema = "52.2"
+lancedb = "0.22"
+arrow-array = "56.2"
+arrow-schema = "56.2"
 futures = "0.3"
 qdrant-client = { version = "1.15", optional = true }
 fastembed = "5.1"
@@ -51,6 +51,8 @@ toml = "0.8"
 pdf-extract = "0.7"
 # Performance
 rayon = "1.10"
+# Async utilities for cancellation
+tokio-util = "0.7"
 
 [dev-dependencies]
 tempfile = "3.0"

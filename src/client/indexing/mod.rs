@@ -7,7 +7,20 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rmcp::{Peer, RoleServer, model::ProgressNotificationParam, model::ProgressToken};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
+
+/// Helper macro to check for cancellation and return early if cancelled
+macro_rules! check_cancelled {
+    ($cancel_token:expr) => {
+        if $cancel_token.is_cancelled() {
+            tracing::info!("Indexing operation cancelled");
+            anyhow::bail!("Indexing was cancelled");
+        }
+    };
+}
 
 /// Index a complete codebase
 #[allow(clippy::too_many_arguments)]
@@ -20,6 +33,7 @@ pub async fn do_index(
     max_file_size: usize,
     peer: Option<Peer<RoleServer>>,
     progress_token: Option<ProgressToken>,
+    cancel_token: CancellationToken,
 ) -> Result<IndexResponse> {
     let start = Instant::now();
     let mut errors = Vec::new();
@@ -37,15 +51,31 @@ pub async fn do_index(
     }
 
     // Walk the directory (on a blocking thread since it's CPU-intensive)
+    // Create a cancellation flag for the blocking file walker
+    let cancelled_flag = Arc::new(AtomicBool::new(false));
+    let cancelled_flag_clone = cancelled_flag.clone();
+    let cancel_token_clone = cancel_token.clone();
+
+    // Spawn a task to set the flag when cancellation is requested
+    let _cancel_watcher = tokio::spawn(async move {
+        cancel_token_clone.cancelled().await;
+        cancelled_flag_clone.store(true, Ordering::Relaxed);
+        tracing::debug!("Cancellation flag set for file walker");
+    });
+
     let walker = FileWalker::new(&path, max_file_size)
         .with_project(project.clone())
-        .with_patterns(include_patterns.clone(), exclude_patterns.clone());
+        .with_patterns(include_patterns.clone(), exclude_patterns.clone())
+        .with_cancellation_flag(cancelled_flag);
 
     let files = tokio::task::spawn_blocking(move || walker.walk())
         .await
         .context("Failed to spawn file walker task")?
         .context("Failed to walk directory")?;
     let files_indexed = files.len();
+
+    // Check for cancellation after file walk
+    check_cancelled!(cancel_token);
 
     // Send progress after file walk
     if let (Some(peer), Some(token)) = (&peer, &progress_token) {
@@ -105,6 +135,9 @@ pub async fn do_index(
     let total_batches = all_chunks.len().div_ceil(batch_size);
 
     for (batch_idx, chunk_batch) in all_chunks.chunks(batch_size).enumerate() {
+        // Check for cancellation at start of each batch
+        check_cancelled!(cancel_token);
+
         let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
 
         // Generate embeddings with timeout protection (configurable)
@@ -189,6 +222,9 @@ pub async fn do_index(
         contents.len(),
         "Embeddings and contents count mismatch"
     );
+
+    // Check for cancellation before storing
+    check_cancelled!(cancel_token);
 
     if !all_embeddings.is_empty() {
         client
@@ -278,6 +314,7 @@ pub async fn do_incremental_update(
     max_file_size: usize,
     peer: Option<Peer<RoleServer>>,
     progress_token: Option<ProgressToken>,
+    cancel_token: CancellationToken,
 ) -> Result<IndexResponse> {
     let start = Instant::now();
 
@@ -314,14 +351,30 @@ pub async fn do_incremental_update(
     }
 
     // Walk directory to find current files (on a blocking thread)
+    // Create a cancellation flag for the blocking file walker
+    let cancelled_flag = Arc::new(AtomicBool::new(false));
+    let cancelled_flag_clone = cancelled_flag.clone();
+    let cancel_token_clone = cancel_token.clone();
+
+    // Spawn a task to set the flag when cancellation is requested
+    let _cancel_watcher = tokio::spawn(async move {
+        cancel_token_clone.cancelled().await;
+        cancelled_flag_clone.store(true, Ordering::Relaxed);
+        tracing::debug!("Cancellation flag set for file walker");
+    });
+
     let walker = FileWalker::new(&path, max_file_size)
         .with_project(project.clone())
-        .with_patterns(include_patterns.clone(), exclude_patterns.clone());
+        .with_patterns(include_patterns.clone(), exclude_patterns.clone())
+        .with_cancellation_flag(cancelled_flag);
 
     let current_files = tokio::task::spawn_blocking(move || walker.walk())
         .await
         .context("Failed to spawn file walker task")?
         .context("Failed to walk directory")?;
+
+    // Check for cancellation after file walk
+    check_cancelled!(cancel_token);
 
     let mut files_added = 0;
     let mut files_updated = 0;
@@ -427,6 +480,9 @@ pub async fn do_incremental_update(
         let total_batches = all_chunks.len().div_ceil(batch_size);
 
         for (batch_idx, chunk_batch) in all_chunks.chunks(batch_size).enumerate() {
+            // Check for cancellation at start of each batch
+            check_cancelled!(cancel_token);
+
             let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
 
             let embeddings = client
@@ -465,6 +521,9 @@ pub async fn do_incremental_update(
                 })
                 .await;
         }
+
+        // Check for cancellation before storing
+        check_cancelled!(cancel_token);
 
         // Store all embeddings (pass normalized root path for per-project BM25)
         let metadata: Vec<ChunkMetadata> = all_chunks.iter().map(|c| c.metadata.clone()).collect();
@@ -557,6 +616,7 @@ pub async fn do_index_smart(
     max_file_size: usize,
     peer: Option<Peer<RoleServer>>,
     progress_token: Option<ProgressToken>,
+    cancel_token: CancellationToken,
 ) -> Result<IndexResponse> {
     use super::IndexLockResult;
 
@@ -606,6 +666,7 @@ pub async fn do_index_smart(
                 max_file_size,
                 peer,
                 progress_token,
+                cancel_token,
             )
             .await;
 
@@ -651,6 +712,7 @@ async fn do_index_smart_inner(
     max_file_size: usize,
     peer: Option<Peer<RoleServer>>,
     progress_token: Option<ProgressToken>,
+    cancel_token: CancellationToken,
 ) -> Result<IndexResponse> {
     // Normalize path to canonical form for consistent cache lookups
     let normalized_path = RagClient::normalize_path(&path)?;
@@ -675,6 +737,7 @@ async fn do_index_smart_inner(
             max_file_size,
             peer,
             progress_token,
+            cancel_token,
         )
         .await
     } else {
@@ -692,6 +755,7 @@ async fn do_index_smart_inner(
             max_file_size,
             peer,
             progress_token,
+            cancel_token,
         )
         .await
     }
