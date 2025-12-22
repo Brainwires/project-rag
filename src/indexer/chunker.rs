@@ -1,6 +1,6 @@
 use super::CodeChunk;
 use crate::indexer::ast_parser::AstParser;
-use crate::indexer::file_walker::FileInfo;
+use crate::indexer::file_info::FileInfo;
 use crate::types::ChunkMetadata;
 use std::time::{SystemTime, UNIX_EPOCH};
 
