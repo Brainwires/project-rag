@@ -577,6 +577,97 @@ impl RagClient {
     pub fn embedding_dimension(&self) -> usize {
         self.embedding_provider.dimension()
     }
+
+    /// Find the definition of a symbol at a given file location
+    ///
+    /// This method looks up the symbol at the specified location and returns
+    /// its definition information if found.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The find definition request containing file path, line, and column
+    ///
+    /// # Returns
+    ///
+    /// A response containing the definition if found, along with precision info
+    pub async fn find_definition(&self, request: FindDefinitionRequest) -> Result<FindDefinitionResponse> {
+        let start = Instant::now();
+
+        // Validate request
+        request.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        // TODO: Query the relations store for the definition
+        // For now, return a placeholder response indicating the feature is in development
+        let response = FindDefinitionResponse {
+            definition: None,
+            precision: "medium".to_string(),
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+
+        Ok(response)
+    }
+
+    /// Find all references to a symbol at a given file location
+    ///
+    /// This method finds all locations where the symbol at the given position
+    /// is referenced throughout the indexed codebase.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The find references request containing file path, line, column, and limit
+    ///
+    /// # Returns
+    ///
+    /// A response containing the list of references found
+    pub async fn find_references(&self, request: FindReferencesRequest) -> Result<FindReferencesResponse> {
+        let start = Instant::now();
+
+        // Validate request
+        request.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        // TODO: Query the relations store for references
+        // For now, return a placeholder response indicating the feature is in development
+        let response = FindReferencesResponse {
+            symbol_name: None,
+            references: Vec::new(),
+            total_count: 0,
+            precision: "medium".to_string(),
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+
+        Ok(response)
+    }
+
+    /// Get the call graph for a function at a given file location
+    ///
+    /// This method returns the callers (incoming calls) and callees (outgoing calls)
+    /// for the function at the specified location.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The call graph request containing file path, line, column, and depth
+    ///
+    /// # Returns
+    ///
+    /// A response containing the root symbol and its call graph
+    pub async fn get_call_graph(&self, request: GetCallGraphRequest) -> Result<GetCallGraphResponse> {
+        let start = Instant::now();
+
+        // Validate request
+        request.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        // TODO: Query the relations store for call graph
+        // For now, return a placeholder response indicating the feature is in development
+        let response = GetCallGraphResponse {
+            root_symbol: None,
+            callers: Vec::new(),
+            callees: Vec::new(),
+            precision: "medium".to_string(),
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+
+        Ok(response)
+    }
 }
 
 // Indexing operations module
