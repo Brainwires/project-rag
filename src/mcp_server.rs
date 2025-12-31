@@ -224,6 +224,57 @@ impl RagMcpServer {
 
         serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
     }
+
+    #[tool(description = "Find the definition of a symbol at a given file location (line and column)")]
+    async fn find_definition(
+        &self,
+        Parameters(req): Parameters<FindDefinitionRequest>,
+    ) -> Result<String, String> {
+        // Validate request inputs
+        req.validate()?;
+
+        let response = self
+            .client
+            .find_definition(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
+
+    #[tool(description = "Find all references to a symbol at a given file location")]
+    async fn find_references(
+        &self,
+        Parameters(req): Parameters<FindReferencesRequest>,
+    ) -> Result<String, String> {
+        // Validate request inputs
+        req.validate()?;
+
+        let response = self
+            .client
+            .find_references(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
+
+    #[tool(description = "Get the call graph for a function at a given file location (callers and callees)")]
+    async fn get_call_graph(
+        &self,
+        Parameters(req): Parameters<GetCallGraphRequest>,
+    ) -> Result<String, String> {
+        // Validate request inputs
+        req.validate()?;
+
+        let response = self
+            .client
+            .get_call_graph(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
 }
 
 // Prompts for slash commands
@@ -326,6 +377,69 @@ impl RagMcpServer {
             format!(
                 "Please search git commit history at path '{}' for: {}. This will automatically index commits as needed.",
                 path, query
+            ),
+        )])
+    }
+
+    #[prompt(
+        name = "definition",
+        description = "Find where a symbol is defined at a given file location"
+    )]
+    async fn definition_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let file = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(1);
+        let column = args.get("column").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        Ok(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Please find the definition of the symbol at file '{}', line {}, column {}.",
+                file, line, column
+            ),
+        )])
+    }
+
+    #[prompt(
+        name = "references",
+        description = "Find all references to a symbol at a given file location"
+    )]
+    async fn references_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let file = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(1);
+        let column = args.get("column").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        Ok(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Please find all references to the symbol at file '{}', line {}, column {}.",
+                file, line, column
+            ),
+        )])
+    }
+
+    #[prompt(
+        name = "callgraph",
+        description = "Get the call graph (callers and callees) for a function at a given location"
+    )]
+    async fn callgraph_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let file = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(1);
+        let column = args.get("column").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        Ok(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Please get the call graph for the function at file '{}', line {}, column {}. Show what calls this function and what it calls.",
+                file, line, column
             ),
         )])
     }

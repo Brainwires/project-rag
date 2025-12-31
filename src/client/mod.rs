@@ -7,7 +7,10 @@ use crate::cache::HashCache;
 use crate::config::Config;
 use crate::embedding::{EmbeddingProvider, FastEmbedManager};
 use crate::git_cache::GitCache;
-use crate::indexer::CodeChunker;
+use crate::indexer::{CodeChunker, FileInfo, detect_language};
+use crate::relations::{
+    DefinitionResult, HybridRelationsProvider, ReferenceResult, RelationsProvider,
+};
 use crate::types::*;
 use crate::vector_db::VectorDatabase;
 
@@ -24,70 +27,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
-
 use tokio::sync::broadcast;
 
-/// State for an in-progress indexing operation
-pub(crate) struct IndexingOperation {
-    /// Sender to broadcast the result to all waiters
-    result_tx: broadcast::Sender<IndexResponse>,
-}
-
-/// Result of trying to acquire an index lock
-pub(crate) enum IndexLockResult {
-    /// We acquired the lock and should perform indexing
-    Acquired(IndexLockGuard),
-    /// Another operation is in progress, wait for its result
-    WaitForResult(broadcast::Receiver<IndexResponse>),
-}
-
-/// Guard for index locks that cleans up the lock when released
-pub(crate) struct IndexLockGuard {
-    path: String,
-    locks_map: Arc<RwLock<HashMap<String, IndexingOperation>>>,
-    /// Sender to broadcast the result when indexing completes
-    pub(crate) result_tx: broadcast::Sender<IndexResponse>,
-    /// Flag to track if the lock has been properly released
-    released: bool,
-}
-
-impl IndexLockGuard {
-    /// Broadcast the indexing result to all waiters
-    pub(crate) fn broadcast_result(&self, result: &IndexResponse) {
-        // Ignore send errors (no receivers is fine)
-        let _ = self.result_tx.send(result.clone());
-    }
-
-    /// Release the lock explicitly - MUST be called after broadcasting result
-    /// This ensures synchronous cleanup before the guard is dropped
-    pub(crate) async fn release(mut self) {
-        let mut locks = self.locks_map.write().await;
-        locks.remove(&self.path);
-        self.released = true;
-        // Drop self here, but released=true prevents the Drop impl from spawning cleanup
-    }
-}
-
-impl Drop for IndexLockGuard {
-    fn drop(&mut self) {
-        if !self.released {
-            // Lock wasn't properly released - this is a fallback for error cases
-            // Spawn a task to clean up the lock asynchronously
-            let path = self.path.clone();
-            let locks_map = self.locks_map.clone();
-
-            tracing::warn!(
-                "IndexLockGuard for '{}' dropped without explicit release - spawning cleanup task",
-                path
-            );
-
-            tokio::spawn(async move {
-                let mut locks = locks_map.write().await;
-                locks.remove(&path);
-            });
-        }
-    }
-}
+// Index locking mechanism
+mod index_lock;
+pub(crate) use index_lock::{IndexLockGuard, IndexLockResult, IndexingOperation};
 
 /// Main client for interacting with the RAG system
 ///
@@ -137,6 +81,8 @@ pub struct RagClient {
     pub(crate) config: Arc<Config>,
     // In-progress indexing operations (prevents concurrent indexing and allows result sharing)
     pub(crate) indexing_ops: Arc<RwLock<HashMap<String, IndexingOperation>>>,
+    // Relations provider for code navigation (find definition, references, call graph)
+    pub(crate) relations_provider: Arc<HybridRelationsProvider>,
 }
 
 impl RagClient {
@@ -238,6 +184,12 @@ impl RagClient {
 
         tracing::info!("Using git cache file: {:?}", git_cache_path);
 
+        // Initialize relations provider for code navigation
+        let relations_provider = Arc::new(
+            HybridRelationsProvider::new(false) // stack-graphs disabled by default
+                .context("Failed to initialize relations provider")?,
+        );
+
         Ok(Self {
             embedding_provider,
             vector_db,
@@ -248,6 +200,7 @@ impl RagClient {
             git_cache_path,
             config: Arc::new(config),
             indexing_ops: Arc::new(RwLock::new(HashMap::new())),
+            relations_provider,
         })
     }
 
@@ -261,6 +214,55 @@ impl RagClient {
         config.cache.git_cache_path = cache_path.parent().unwrap().join("git_cache.json");
 
         Self::with_config(config).await
+    }
+
+    /// Create FileInfo from a file path for relations analysis
+    fn create_file_info(&self, file_path: &str, project: Option<String>) -> Result<FileInfo> {
+        use std::path::Path;
+
+        let path = Path::new(file_path);
+        let canonical = std::fs::canonicalize(path)
+            .with_context(|| format!("Failed to canonicalize path: {}", file_path))?;
+
+        let content = std::fs::read_to_string(&canonical)
+            .with_context(|| format!("Failed to read file: {}", file_path))?;
+
+        let extension = canonical
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_string());
+
+        let language = extension.as_ref().and_then(|ext| {
+            detect_language(ext)
+        });
+
+        // Compute file hash
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+
+        // Determine root path (parent directory)
+        let root_path = canonical
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".to_string());
+
+        let relative_path = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| file_path.to_string());
+
+        Ok(FileInfo {
+            path: canonical,
+            relative_path,
+            root_path,
+            project,
+            extension,
+            language,
+            content,
+            hash,
+        })
     }
 
     /// Normalize a path to a canonical absolute form for consistent cache lookups
@@ -324,12 +326,11 @@ impl RagClient {
         // Drop the write lock on the map
         drop(ops);
 
-        Ok(IndexLockResult::Acquired(IndexLockGuard {
-            path: normalized_path,
-            locks_map: self.indexing_ops.clone(),
+        Ok(IndexLockResult::Acquired(IndexLockGuard::new(
+            normalized_path,
+            self.indexing_ops.clone(),
             result_tx,
-            released: false,
-        }))
+        )))
     }
 
     /// Index a codebase directory
@@ -493,28 +494,66 @@ impl RagClient {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No embedding generated"))?;
 
-        let results = self
+        let original_threshold = request.min_score;
+        let mut threshold_used = original_threshold;
+        let mut threshold_lowered = false;
+
+        let mut results = self
             .vector_db
             .search_filtered(
-                query_embedding,
+                query_embedding.clone(),
                 &request.query,
                 request.limit,
-                request.min_score,
-                request.project,
-                request.path,
+                threshold_used,
+                request.project.clone(),
+                request.path.clone(),
                 true,
-                request.file_extensions,
-                request.languages,
-                request.path_patterns,
+                request.file_extensions.clone(),
+                request.languages.clone(),
+                request.path_patterns.clone(),
             )
             .await
             .context("Failed to search with filters")?;
 
+        // Adaptive threshold lowering if no results found
+        if results.is_empty() && original_threshold > 0.3 {
+            let fallback_thresholds = [0.6, 0.5, 0.4, 0.3];
+
+            for &threshold in &fallback_thresholds {
+                if threshold >= original_threshold {
+                    continue;
+                }
+
+                results = self
+                    .vector_db
+                    .search_filtered(
+                        query_embedding.clone(),
+                        &request.query,
+                        request.limit,
+                        threshold,
+                        request.project.clone(),
+                        request.path.clone(),
+                        true,
+                        request.file_extensions.clone(),
+                        request.languages.clone(),
+                        request.path_patterns.clone(),
+                    )
+                    .await
+                    .context("Failed to search with filters")?;
+
+                if !results.is_empty() {
+                    threshold_used = threshold;
+                    threshold_lowered = true;
+                    break;
+                }
+            }
+        }
+
         Ok(QueryResponse {
             results,
             duration_ms: start.elapsed().as_millis() as u64,
-            threshold_used: request.min_score,
-            threshold_lowered: false,
+            threshold_used,
+            threshold_lowered,
         })
     }
 
@@ -636,6 +675,295 @@ impl RagClient {
     /// Get the embedding dimension used by this client
     pub fn embedding_dimension(&self) -> usize {
         self.embedding_provider.dimension()
+    }
+
+    /// Find the definition of a symbol at a given file location
+    ///
+    /// This method looks up the symbol at the specified location and returns
+    /// its definition information if found.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The find definition request containing file path, line, and column
+    ///
+    /// # Returns
+    ///
+    /// A response containing the definition if found, along with precision info
+    pub async fn find_definition(&self, request: FindDefinitionRequest) -> Result<FindDefinitionResponse> {
+        let start = Instant::now();
+
+        // Validate request
+        request.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Create FileInfo for the file
+        let file_info = self.create_file_info(&request.file_path, request.project.clone())?;
+
+        // Get precision level for this language
+        let language = file_info.language.as_deref().unwrap_or("Unknown");
+        let precision = self.relations_provider.precision_level(language);
+
+        // Extract definitions from the file
+        let definitions = self
+            .relations_provider
+            .extract_definitions(&file_info)
+            .context("Failed to extract definitions")?;
+
+        // Find the definition at the requested position
+        let definition = definitions.into_iter().find(|def| {
+            request.line >= def.symbol_id.start_line
+                && request.line <= def.end_line
+                && (request.column == 0 || request.column >= def.symbol_id.start_col)
+        });
+
+        let result = definition.map(|def| DefinitionResult::from(&def));
+
+        Ok(FindDefinitionResponse {
+            definition: result,
+            precision: format!("{:?}", precision).to_lowercase(),
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// Find all references to a symbol at a given file location
+    ///
+    /// This method finds all locations where the symbol at the given position
+    /// is referenced throughout the indexed codebase.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The find references request containing file path, line, column, and limit
+    ///
+    /// # Returns
+    ///
+    /// A response containing the list of references found
+    pub async fn find_references(&self, request: FindReferencesRequest) -> Result<FindReferencesResponse> {
+        let start = Instant::now();
+
+        // Validate request
+        request.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Create FileInfo for the file
+        let file_info = self.create_file_info(&request.file_path, request.project.clone())?;
+
+        // Get precision level for this language
+        let language = file_info.language.as_deref().unwrap_or("Unknown");
+        let precision = self.relations_provider.precision_level(language);
+
+        // Extract definitions from the file to find the symbol at the position
+        let definitions = self
+            .relations_provider
+            .extract_definitions(&file_info)
+            .context("Failed to extract definitions")?;
+
+        // Find the symbol at the requested position
+        let target_symbol = definitions.iter().find(|def| {
+            request.line >= def.symbol_id.start_line
+                && request.line <= def.end_line
+                && (request.column == 0 || request.column >= def.symbol_id.start_col)
+        });
+
+        let symbol_name = target_symbol.map(|def| def.symbol_id.name.clone());
+
+        // If no symbol found at position, return empty result
+        if symbol_name.is_none() {
+            return Ok(FindReferencesResponse {
+                symbol_name: None,
+                references: Vec::new(),
+                total_count: 0,
+                precision: format!("{:?}", precision).to_lowercase(),
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let symbol_name_str = symbol_name.clone().unwrap();
+
+        // Build symbol index from definitions
+        let mut symbol_index: std::collections::HashMap<String, Vec<crate::relations::Definition>> =
+            std::collections::HashMap::new();
+        for def in definitions {
+            symbol_index
+                .entry(def.symbol_id.name.clone())
+                .or_default()
+                .push(def);
+        }
+
+        // Find references in the same file
+        let references = self
+            .relations_provider
+            .extract_references(&file_info, &symbol_index)
+            .context("Failed to extract references")?;
+
+        // Filter to references matching our target symbol
+        let matching_refs: Vec<ReferenceResult> = references
+            .iter()
+            .filter(|r| {
+                // Check if this reference points to our target symbol
+                r.target_symbol_id.contains(&symbol_name_str)
+            })
+            .take(request.limit)
+            .map(|r| ReferenceResult::from(r))
+            .collect();
+
+        let total_count = matching_refs.len();
+
+        Ok(FindReferencesResponse {
+            symbol_name,
+            references: matching_refs,
+            total_count,
+            precision: format!("{:?}", precision).to_lowercase(),
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// Get the call graph for a function at a given file location
+    ///
+    /// This method returns the callers (incoming calls) and callees (outgoing calls)
+    /// for the function at the specified location.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The call graph request containing file path, line, column, and depth
+    ///
+    /// # Returns
+    ///
+    /// A response containing the root symbol and its call graph
+    pub async fn get_call_graph(&self, request: GetCallGraphRequest) -> Result<GetCallGraphResponse> {
+        let start = Instant::now();
+
+        // Validate request
+        request.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Create FileInfo for the file
+        let file_info = self.create_file_info(&request.file_path, request.project.clone())?;
+
+        // Get precision level for this language
+        let language = file_info.language.as_deref().unwrap_or("Unknown");
+        let precision = self.relations_provider.precision_level(language);
+
+        // Extract definitions from the file to find the function at the position
+        let definitions = self
+            .relations_provider
+            .extract_definitions(&file_info)
+            .context("Failed to extract definitions")?;
+
+        // Find the function at the requested position
+        let target_function = definitions.iter().find(|def| {
+            // Only consider functions/methods
+            matches!(
+                def.symbol_id.kind,
+                crate::relations::SymbolKind::Function | crate::relations::SymbolKind::Method
+            ) && request.line >= def.symbol_id.start_line
+                && request.line <= def.end_line
+                && (request.column == 0 || request.column >= def.symbol_id.start_col)
+        });
+
+        // If no function found at position, return empty result
+        let root_symbol = match target_function {
+            Some(func) => crate::relations::SymbolInfo {
+                name: func.symbol_id.name.clone(),
+                kind: func.symbol_id.kind.clone(),
+                file_path: request.file_path.clone(),
+                start_line: func.symbol_id.start_line,
+                end_line: func.end_line,
+                signature: func.signature.clone(),
+            },
+            None => {
+                return Ok(GetCallGraphResponse {
+                    root_symbol: None,
+                    callers: Vec::new(),
+                    callees: Vec::new(),
+                    precision: format!("{:?}", precision).to_lowercase(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        let function_name = root_symbol.name.clone();
+
+        // Build symbol index from definitions
+        let mut symbol_index: std::collections::HashMap<String, Vec<crate::relations::Definition>> =
+            std::collections::HashMap::new();
+        for def in &definitions {
+            symbol_index
+                .entry(def.symbol_id.name.clone())
+                .or_default()
+                .push(def.clone());
+        }
+
+        // Find references in the same file to identify callers
+        let references = self
+            .relations_provider
+            .extract_references(&file_info, &symbol_index)
+            .context("Failed to extract references")?;
+
+        // Find callers (references with Call kind pointing to our function)
+        let mut seen_callers = std::collections::HashSet::new();
+        let callers: Vec<crate::relations::CallGraphNode> = references
+            .iter()
+            .filter(|r| {
+                r.reference_kind == crate::relations::ReferenceKind::Call
+                    && r.target_symbol_id.contains(&function_name)
+            })
+            .filter_map(|r| {
+                // Try to find which function contains this call
+                definitions.iter().find(|def| {
+                    matches!(
+                        def.symbol_id.kind,
+                        crate::relations::SymbolKind::Function | crate::relations::SymbolKind::Method
+                    ) && r.start_line >= def.symbol_id.start_line
+                        && r.start_line <= def.end_line
+                })
+            })
+            .filter(|def| seen_callers.insert(def.symbol_id.name.clone()))
+            .map(|def| crate::relations::CallGraphNode {
+                name: def.symbol_id.name.clone(),
+                kind: def.symbol_id.kind.clone(),
+                file_path: request.file_path.clone(),
+                line: def.symbol_id.start_line,
+                children: Vec::new(),
+            })
+            .collect();
+
+        // Find callees (calls made from within our function)
+        let target_func = target_function.unwrap();
+        let mut seen_callees = std::collections::HashSet::new();
+        let callees: Vec<crate::relations::CallGraphNode> = references
+            .iter()
+            .filter(|r| {
+                r.reference_kind == crate::relations::ReferenceKind::Call
+                    && r.start_line >= target_func.symbol_id.start_line
+                    && r.start_line <= target_func.end_line
+            })
+            .filter_map(|r| {
+                // Extract the called function name from target_symbol_id
+                let parts: Vec<&str> = r.target_symbol_id.split(':').collect();
+                if parts.len() >= 2 {
+                    Some(parts[1].to_string())
+                } else {
+                    None
+                }
+            })
+            .filter(|name| seen_callees.insert(name.clone()))
+            .filter_map(|name| {
+                // Find the definition of the called function
+                symbol_index.get(&name).and_then(|defs| defs.first()).cloned()
+            })
+            .map(|def| crate::relations::CallGraphNode {
+                name: def.symbol_id.name.clone(),
+                kind: def.symbol_id.kind.clone(),
+                file_path: request.file_path.clone(),
+                line: def.symbol_id.start_line,
+                children: Vec::new(),
+            })
+            .collect();
+
+        Ok(GetCallGraphResponse {
+            root_symbol: Some(root_symbol),
+            callers,
+            callees,
+            precision: format!("{:?}", precision).to_lowercase(),
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
     }
 }
 

@@ -1,6 +1,6 @@
 # Project RAG - MCP Server for Code Understanding
 
-[![Tests](https://img.shields.io/badge/tests-343%20passing-brightgreen)](https://github.com/nightness/project-rag)
+[![Tests](https://img.shields.io/badge/tests-386%20passing-brightgreen)](https://github.com/nightness/project-rag)
 [![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](https://github.com/nightness/project-rag)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange)](https://www.rust-lang.org/)
 
@@ -28,11 +28,12 @@ This MCP server enables AI assistants to efficiently search and understand large
 - **Language Detection**: Automatic detection of 40+ file types (programming languages, documentation formats, and config files)
 - **Advanced Filtering**: Search by file type, language, or path patterns
 - **Respects .gitignore**: Automatically excludes ignored files during indexing
-- **Slash Commands**: 6 convenient slash commands via MCP Prompts
+- **Code Navigation**: Find definitions, references, and call graphs (LSP-like features)
+- **Slash Commands**: 9 convenient slash commands via MCP Prompts
 
 ## MCP Slash Commands
 
-The server provides 6 slash commands for quick access in Claude Code:
+The server provides 9 slash commands for quick access in Claude Code:
 
 1. **`/project:index`** - Index a codebase directory (automatically performs full or incremental)
 2. **`/project:query`** - Search the indexed codebase
@@ -40,6 +41,9 @@ The server provides 6 slash commands for quick access in Claude Code:
 4. **`/project:clear`** - Clear all indexed data
 5. **`/project:search`** - Advanced search with filters
 6. **`/project:git-search`** - Search git commit history with on-demand indexing
+7. **`/project:definition`** - Find where a symbol is defined (LSP-like)
+8. **`/project:references`** - Find all references to a symbol
+9. **`/project:callgraph`** - Get call graph for a function (callers/callees)
 
 See [SLASH_COMMANDS.md](docs/SLASH_COMMANDS.md) for detailed usage.
 
@@ -109,7 +113,7 @@ search_by_filters(query="JWT validation", file_extensions=["rs", "go"])
 
 ## MCP Tools
 
-The server provides 6 tools that can be used directly:
+The server provides 9 tools that can be used directly:
 
 1. **index_codebase** - Smartly index a codebase directory
    - Automatically performs full indexing for new codebases
@@ -145,6 +149,24 @@ The server provides 6 tools that can be used directly:
    - Regex filtering by author name/email and file paths
    - Date range filtering (ISO 8601 or Unix timestamp)
    - Branch selection support
+
+7. **find_definition** - Find where a symbol is defined (LSP-like)
+   - Specify file path, line number, and column
+   - Returns definition location with symbol metadata
+   - Uses hybrid approach: high-precision stack-graphs (Python, TypeScript, Java, Ruby) or AST-based RepoMap fallback
+   - Reports precision level of results
+
+8. **find_references** - Find all references to a symbol
+   - Specify file path, line number, and column
+   - Returns all locations where the symbol is used
+   - Categorizes reference types: Call, Read, Write, Import, TypeReference, Inheritance, Instantiation
+   - Optional: include definition site in results
+
+9. **get_call_graph** - Get call graph for a function
+   - Specify file path, line number, and column for a function
+   - Returns callers (what calls this function) and callees (what this function calls)
+   - Configurable traversal depth (default: 1 level)
+   - Useful for understanding code flow and impact analysis
 
 ## Prerequisites
 
@@ -308,12 +330,44 @@ Add to your Claude Desktop config:
 ```
 *Note: This automatically performs a full index for new codebases or an incremental update for previously indexed ones.*
 
+**Find definition of a symbol:**
+```json
+{
+  "file_path": "/path/to/your/project/src/main.rs",
+  "line": 42,
+  "column": 10
+}
+```
+
+**Find all references to a symbol:**
+```json
+{
+  "file_path": "/path/to/your/project/src/lib.rs",
+  "line": 15,
+  "column": 8,
+  "include_definition": false
+}
+```
+
+**Get call graph for a function:**
+```json
+{
+  "file_path": "/path/to/your/project/src/api.rs",
+  "line": 100,
+  "column": 4,
+  "depth": 2
+}
+```
+
 ## Architecture
 
 ```
 project-rag/
 ├── src/
 │   ├── bm25_search.rs      # Tantivy BM25 keyword search with RRF fusion
+│   ├── client/             # High-level client API
+│   │   ├── mod.rs          # RagClient - unified interface for all operations
+│   │   └── indexing/       # Indexing pipeline with progress reporting
 │   ├── embedding/          # FastEmbed integration for local embeddings
 │   │   ├── mod.rs          # EmbeddingProvider trait
 │   │   └── fastembed_manager.rs  # all-MiniLM-L6-v2 implementation
@@ -327,14 +381,27 @@ project-rag/
 │   │   ├── chunker.rs      # Chunking strategies (AST-based, fixed-lines, sliding window)
 │   │   ├── ast_parser.rs   # Tree-sitter AST parsing for 12 languages
 │   │   └── pdf_extractor.rs # PDF to Markdown converter with table support
-│   ├── mcp_server.rs       # MCP server with 6 tools
-│   ├── types.rs            # Request/Response types with JSON schema
+│   ├── relations/          # Code relationship analysis (LSP-like features)
+│   │   ├── mod.rs          # RelationsProvider trait, HybridRelationsProvider
+│   │   ├── types.rs        # SymbolId, Definition, Reference, CallEdge types
+│   │   ├── repomap/        # AST-based symbol extraction (fallback provider)
+│   │   │   ├── mod.rs      # RepoMapProvider
+│   │   │   ├── symbol_extractor.rs  # Extract definitions from AST
+│   │   │   └── reference_finder.rs  # Find references via identifier matching
+│   │   ├── storage/        # Relations storage layer
+│   │   │   ├── mod.rs      # RelationsStore trait
+│   │   │   └── lance_store.rs  # LanceDB storage (placeholder)
+│   │   └── stack_graphs/   # Optional: High-precision name resolution
+│   │       └── mod.rs      # StackGraphsProvider (feature-gated)
+│   ├── mcp_server.rs       # MCP server with 9 tools
+│   ├── types/              # Request/Response types with JSON schema
+│   │   └── mod.rs          # All MCP request/response types
 │   ├── main.rs             # Binary entry point with stdio transport
 │   └── lib.rs              # Library root
 ├── Cargo.toml              # Rust 2024 edition with dependencies
 ├── README.md               # This file
 ├── NOTES.md                # Development notes and known issues
-├── TEST_RESULTS.md         # Unit test results (10 tests passing)
+├── TEST_RESULTS.md         # Unit test results
 └── COVERAGE_ANALYSIS.md    # Detailed test coverage analysis
 ```
 
@@ -426,7 +493,7 @@ The BM25 (Tantivy) index uses file-based locks to prevent concurrent writes. The
 ### Running Tests
 
 ```bash
-# Run all unit tests (343 tests with ~94% coverage)
+# Run all unit tests (386 tests with ~94% coverage)
 cargo test --lib
 
 # Run specific module tests
@@ -514,10 +581,11 @@ RUST_LOG=trace cargo run
 ### ✅ Production Ready - 100% Complete
 
 - Core architecture with modular design
-- All 6 MCP tools implemented and working
-- **All 6 MCP slash commands implemented**
+- All 9 MCP tools implemented and working
+- **All 9 MCP slash commands implemented**
 - **Hybrid search** - Vector similarity + Full BM25 with IDF
 - **AST-based chunking** - Semantic code extraction for 12 languages
+- **Code navigation** - Find definitions, references, and call graphs (LSP-like)
 - **Multi-project support** - Index and query multiple codebases
 - **Persistent hash cache** - Fast incremental updates across restarts
 - **Concurrent access protection** - Smart lock management prevents index corruption
@@ -527,10 +595,11 @@ RUST_LOG=trace cargo run
 - Language detection (40+ file types: code, docs, configs)
 - PDF to Markdown conversion with table preservation
 - SHA256-based change detection
-- 343 unit tests passing (including PDF extraction, BM25/RRF, and lock safety tests)
+- 386 unit tests passing (including relations, PDF extraction, BM25/RRF, and lock safety tests)
 - Comprehensive documentation
 - **Full MCP prompts support enabled**
 - **Hybrid search with Tantivy BM25 + LanceDB vector using RRF**
+- **Hybrid relations provider** - Stack-graphs for Python/TS/Java/Ruby, RepoMap fallback for all languages
 
 ### 📋 Known Limitations
 

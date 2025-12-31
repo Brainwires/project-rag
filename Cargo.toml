@@ -71,6 +71,11 @@ qdrant-backend = ["qdrant-client"]  # External Qdrant server
 # Alternative folder name for data storage (for consuming crates that want different folder)
 alt-folder-name = []
 
+# High-precision code navigation for Python, TypeScript, Java, Ruby
+# This feature is prepared but not yet fully implemented
+# When enabled, uses stack-graphs for ~95% accuracy name resolution
+stack-graphs = []
+
 # Note: There is no "mcp" feature - both library and MCP server are always built together
 # This is a dual-purpose crate that provides:
 # - RagClient: Core library API for embedding in Rust applications
