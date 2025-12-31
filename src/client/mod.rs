@@ -494,28 +494,66 @@ impl RagClient {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No embedding generated"))?;
 
-        let results = self
+        let original_threshold = request.min_score;
+        let mut threshold_used = original_threshold;
+        let mut threshold_lowered = false;
+
+        let mut results = self
             .vector_db
             .search_filtered(
-                query_embedding,
+                query_embedding.clone(),
                 &request.query,
                 request.limit,
-                request.min_score,
-                request.project,
-                request.path,
+                threshold_used,
+                request.project.clone(),
+                request.path.clone(),
                 true,
-                request.file_extensions,
-                request.languages,
-                request.path_patterns,
+                request.file_extensions.clone(),
+                request.languages.clone(),
+                request.path_patterns.clone(),
             )
             .await
             .context("Failed to search with filters")?;
 
+        // Adaptive threshold lowering if no results found
+        if results.is_empty() && original_threshold > 0.3 {
+            let fallback_thresholds = [0.6, 0.5, 0.4, 0.3];
+
+            for &threshold in &fallback_thresholds {
+                if threshold >= original_threshold {
+                    continue;
+                }
+
+                results = self
+                    .vector_db
+                    .search_filtered(
+                        query_embedding.clone(),
+                        &request.query,
+                        request.limit,
+                        threshold,
+                        request.project.clone(),
+                        request.path.clone(),
+                        true,
+                        request.file_extensions.clone(),
+                        request.languages.clone(),
+                        request.path_patterns.clone(),
+                    )
+                    .await
+                    .context("Failed to search with filters")?;
+
+                if !results.is_empty() {
+                    threshold_used = threshold;
+                    threshold_lowered = true;
+                    break;
+                }
+            }
+        }
+
         Ok(QueryResponse {
             results,
             duration_ms: start.elapsed().as_millis() as u64,
-            threshold_used: request.min_score,
-            threshold_lowered: false,
+            threshold_used,
+            threshold_lowered,
         })
     }
 
