@@ -1,6 +1,6 @@
 # Project RAG - MCP Server for Code Understanding
 
-[![Tests](https://img.shields.io/badge/tests-386%20passing-brightgreen)](https://github.com/nightness/project-rag)
+[![Tests](https://img.shields.io/badge/tests-395%20passing-brightgreen)](https://github.com/nightness/project-rag)
 [![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](https://github.com/nightness/project-rag)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange)](https://www.rust-lang.org/)
 
@@ -28,7 +28,8 @@ This MCP server enables AI assistants to efficiently search and understand large
 - **Language Detection**: Automatic detection of 40+ file types (programming languages, documentation formats, and config files)
 - **Advanced Filtering**: Search by file type, language, or path patterns
 - **Respects .gitignore**: Automatically excludes ignored files during indexing
-- **Code Navigation**: Find definitions, references, and call graphs (LSP-like features)
+- **Code Navigation**: Find definitions, references, and call graphs (lightweight LSP-like features)
+- **Adaptive Search Thresholds**: Automatically lowers similarity threshold when no results found (0.7 → 0.6 → 0.5 → 0.4 → 0.3)
 - **Slash Commands**: 9 convenient slash commands via MCP Prompts
 
 ## MCP Slash Commands
@@ -447,6 +448,67 @@ project-rag/
 - **Ranking**: RRF combines both rankings using 1/(k+rank) formula
 - **Performance**: Both indexes queried in parallel for fast results
 
+### Adaptive Threshold Logic
+
+Both `query_codebase` and `search_by_filters` tools implement intelligent adaptive threshold lowering:
+
+**How it works:**
+1. Initial search uses the requested `min_score` threshold (default: 0.7)
+2. If no results found and threshold > 0.3, automatically retries with lower thresholds
+3. Fallback thresholds tried in order: 0.6 → 0.5 → 0.4 → 0.3
+4. Response includes `threshold_used` and `threshold_lowered` fields for transparency
+
+**Benefits:**
+- Prevents empty results when semantic similarity is lower than expected
+- Maintains search quality by preferring higher thresholds when possible
+- Transparent: you always know the actual threshold used
+
+**Example Response:**
+```json
+{
+  "results": [...],
+  "duration_ms": 45,
+  "threshold_used": 0.4,
+  "threshold_lowered": true
+}
+```
+
+### Lightweight LSP Features
+
+Project RAG provides code navigation capabilities similar to a Language Server Protocol (LSP) implementation, but optimized for semantic search use cases:
+
+**Find Definition** (`find_definition`):
+- Locate where symbols (functions, classes, variables) are defined
+- Uses hybrid approach: high-precision stack-graphs for Python, TypeScript, Java, Ruby
+- Falls back to AST-based RepoMap analysis for all other languages
+- Reports precision level (High, Medium, Low) in results
+
+**Find References** (`find_references`):
+- Find all locations where a symbol is used across the codebase
+- Categorizes reference types: Call, Read, Write, Import, TypeReference, Inheritance, Instantiation
+- Useful for understanding how code is connected
+- Option to include/exclude the definition site
+
+**Get Call Graph** (`get_call_graph`):
+- Analyze function call relationships
+- Shows both callers (what calls this function) and callees (what this function calls)
+- Configurable traversal depth for multi-level analysis
+- Great for impact analysis and understanding code flow
+
+**Architecture:**
+```
+RelationsProvider (trait)
+├── StackGraphsProvider (high precision: ~95%)
+│   └── Supports: Python, TypeScript, Java, Ruby
+└── RepoMapProvider (fallback: ~70% precision)
+    └── Supports: All tree-sitter languages (12+)
+```
+
+**When to Use:**
+- **Find Definition**: "Where is this function defined?"
+- **Find References**: "Where is this function called from?"
+- **Get Call Graph**: "What functions does this code depend on?"
+
 ### Concurrent Access & Lock Safety
 
 The BM25 (Tantivy) index uses file-based locks to prevent concurrent writes. The system includes smart lock management to handle multiple agents safely:
@@ -493,7 +555,7 @@ The BM25 (Tantivy) index uses file-based locks to prevent concurrent writes. The
 ### Running Tests
 
 ```bash
-# Run all unit tests (386 tests with ~94% coverage)
+# Run all unit tests (395 tests with ~94% coverage)
 cargo test --lib
 
 # Run specific module tests
@@ -595,7 +657,7 @@ RUST_LOG=trace cargo run
 - Language detection (40+ file types: code, docs, configs)
 - PDF to Markdown conversion with table preservation
 - SHA256-based change detection
-- 386 unit tests passing (including relations, PDF extraction, BM25/RRF, and lock safety tests)
+- 395 unit tests passing (including relations, PDF extraction, BM25/RRF, adaptive threshold, and lock safety tests)
 - Comprehensive documentation
 - **Full MCP prompts support enabled**
 - **Hybrid search with Tantivy BM25 + LanceDB vector using RRF**
