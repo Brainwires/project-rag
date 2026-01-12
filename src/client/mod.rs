@@ -281,6 +281,9 @@ impl RagClient {
     ///
     /// The lock is automatically released when the returned guard is dropped.
     pub(crate) async fn try_acquire_index_lock(&self, path: &str) -> Result<IndexLockResult> {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
         // Normalize the path to ensure consistent locking across different path formats
         let normalized_path = Self::normalize_path(path)?;
 
@@ -289,22 +292,27 @@ impl RagClient {
 
         // Check if an operation is already in progress for this path
         if let Some(existing_op) = ops.get(&normalized_path) {
-            // Check if the operation is still active by looking at receiver count
-            // If receiver_count() == 0, the indexing has completed but cleanup hasn't
-            // happened yet (the async Drop task is pending). In this case, treat it
-            // as if no operation exists and start a new one.
-            if existing_op.result_tx.receiver_count() > 0 {
-                // Operation is still active, subscribe to receive the result
+            // Check if the operation is stale (timed out or crashed)
+            if existing_op.is_stale() {
+                tracing::warn!(
+                    "Removing stale indexing lock for {} (operation timed out after {:?})",
+                    normalized_path,
+                    existing_op.started_at.elapsed()
+                );
+                ops.remove(&normalized_path);
+            } else if existing_op.active.load(Ordering::Acquire) {
+                // Operation is still active and not stale, subscribe to receive the result
                 let receiver = existing_op.result_tx.subscribe();
                 tracing::info!(
-                    "Indexing already in progress for {}, waiting for result",
-                    normalized_path
+                    "Indexing already in progress for {} (started {:?} ago), waiting for result",
+                    normalized_path,
+                    existing_op.started_at.elapsed()
                 );
                 return Ok(IndexLockResult::WaitForResult(receiver));
             } else {
-                // Stale entry - remove it and proceed to create a new operation
+                // Operation completed but cleanup hasn't happened yet
                 tracing::debug!(
-                    "Removing stale indexing lock for {} (operation completed)",
+                    "Removing completed indexing lock for {} (cleanup pending)",
                     normalized_path
                 );
                 ops.remove(&normalized_path);
@@ -315,11 +323,16 @@ impl RagClient {
         // Capacity of 1 is enough since we only send one result
         let (result_tx, _) = broadcast::channel(1);
 
-        // Register this operation
+        // Create the active flag - starts as true (active)
+        let active_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        // Register this operation with timestamp
         ops.insert(
             normalized_path.clone(),
             IndexingOperation {
                 result_tx: result_tx.clone(),
+                active: active_flag.clone(),
+                started_at: Instant::now(),
             },
         );
 
@@ -330,6 +343,7 @@ impl RagClient {
             normalized_path,
             self.indexing_ops.clone(),
             result_tx,
+            active_flag,
         )))
     }
 
