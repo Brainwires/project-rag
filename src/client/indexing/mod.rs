@@ -1,6 +1,6 @@
 use super::RagClient;
 use crate::embedding::EmbeddingProvider;
-use crate::indexer::FileWalker;
+use crate::indexer::{CodeChunk, FileWalker};
 use crate::types::{ChunkMetadata, IndexResponse};
 use crate::vector_db::VectorDatabase;
 use anyhow::{Context, Result};
@@ -20,6 +20,135 @@ macro_rules! check_cancelled {
             anyhow::bail!("Indexing was cancelled");
         }
     };
+}
+
+/// Result of embedding generation with cancellation support
+struct EmbeddingResult {
+    embeddings: Vec<Vec<f32>>,
+    successful_chunks: Vec<CodeChunk>,
+    errors: Vec<String>,
+}
+
+/// Generate embeddings for chunks with frequent cancellation checks
+///
+/// This function processes chunks in small batches and checks for cancellation
+/// between each batch, allowing for faster response to cancellation requests.
+async fn generate_embeddings_with_cancellation(
+    client: &RagClient,
+    chunks: &[CodeChunk],
+    cancel_token: &CancellationToken,
+    peer: &Option<Peer<RoleServer>>,
+    progress_token: &Option<ProgressToken>,
+    progress_start: f64,
+    progress_end: f64,
+) -> Result<EmbeddingResult> {
+    let batch_size = client.config.embedding.batch_size;
+    let timeout_secs = client.config.embedding.timeout_secs;
+    let check_interval = if client.config.embedding.cancellation_check_interval > 0 {
+        client.config.embedding.cancellation_check_interval
+    } else {
+        batch_size // Fall back to batch size if interval is 0
+    };
+
+    let mut all_embeddings = Vec::with_capacity(chunks.len());
+    let mut successful_chunks = Vec::with_capacity(chunks.len());
+    let mut errors = Vec::new();
+
+    let total_batches = chunks.len().div_ceil(batch_size);
+    let mut chunks_processed = 0;
+
+    for (batch_idx, chunk_batch) in chunks.chunks(batch_size).enumerate() {
+        // Check for cancellation at start of each batch
+        if cancel_token.is_cancelled() {
+            tracing::info!(
+                "Embedding generation cancelled after {} chunks",
+                chunks_processed
+            );
+            anyhow::bail!("Indexing was cancelled");
+        }
+
+        // Process batch in smaller sub-batches for more frequent cancellation checks
+        let mut batch_embeddings = Vec::new();
+        let mut batch_successful_chunks = Vec::new();
+
+        for sub_batch in chunk_batch.chunks(check_interval) {
+            // Check cancellation before each sub-batch
+            if cancel_token.is_cancelled() {
+                tracing::info!(
+                    "Embedding generation cancelled during batch {} after {} chunks",
+                    batch_idx,
+                    chunks_processed
+                );
+                anyhow::bail!("Indexing was cancelled");
+            }
+
+            let texts: Vec<String> = sub_batch.iter().map(|c| c.content.clone()).collect();
+
+            // Generate embeddings with timeout protection
+            let provider = client.embedding_provider.clone();
+            let embed_future = tokio::task::spawn_blocking(move || provider.embed_batch(texts));
+
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                embed_future,
+            )
+            .await
+            {
+                Ok(Ok(Ok(embeddings))) => {
+                    batch_embeddings.extend(embeddings);
+                    batch_successful_chunks.extend(sub_batch.iter().cloned());
+                    chunks_processed += sub_batch.len();
+                }
+                Ok(Ok(Err(e))) => {
+                    errors.push(format!(
+                        "Failed to generate embeddings for sub-batch: {}",
+                        e
+                    ));
+                    // Continue with next sub-batch
+                }
+                Ok(Err(e)) => {
+                    errors.push(format!("Embedding task panicked: {}", e));
+                    // Continue with next sub-batch
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "Embedding generation timed out after {} seconds",
+                        timeout_secs
+                    ));
+                    // Continue with next sub-batch
+                }
+            }
+        }
+
+        // Add batch results to overall results
+        all_embeddings.extend(batch_embeddings);
+        successful_chunks.extend(batch_successful_chunks);
+
+        // Send progress during embedding
+        if let (Some(peer), Some(token)) = (peer, progress_token) {
+            let progress =
+                progress_start + ((batch_idx + 1) as f64 / total_batches as f64) * (progress_end - progress_start);
+            let _ = peer
+                .notify_progress(ProgressNotificationParam {
+                    progress_token: token.clone(),
+                    progress,
+                    total: Some(100.0),
+                    message: Some(format!(
+                        "Generating embeddings... {}/{} batches ({} chunks)",
+                        batch_idx + 1,
+                        total_batches,
+                        chunks_processed
+                    )),
+                })
+                .await;
+        }
+    }
+
+    Ok(EmbeddingResult {
+        embeddings: all_embeddings,
+        successful_chunks,
+        errors,
+    })
 }
 
 /// Index a complete codebase
@@ -126,65 +255,22 @@ pub async fn do_index(
         });
     }
 
-    // Generate embeddings in batches (using config values)
-    // Track which chunks successfully got embeddings to ensure array lengths match
-    let batch_size = client.config.embedding.batch_size;
-    let timeout_secs = client.config.embedding.timeout_secs;
-    let mut all_embeddings = Vec::with_capacity(all_chunks.len());
-    let mut successful_chunks = Vec::with_capacity(all_chunks.len());
-    let total_batches = all_chunks.len().div_ceil(batch_size);
+    // Generate embeddings with frequent cancellation checks
+    // Progress range: 40% to 80%
+    let embed_result = generate_embeddings_with_cancellation(
+        client,
+        &all_chunks,
+        &cancel_token,
+        &peer,
+        &progress_token,
+        40.0,
+        80.0,
+    )
+    .await?;
 
-    for (batch_idx, chunk_batch) in all_chunks.chunks(batch_size).enumerate() {
-        // Check for cancellation at start of each batch
-        check_cancelled!(cancel_token);
-
-        let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
-
-        // Generate embeddings with timeout protection (configurable)
-        let provider = client.embedding_provider.clone();
-        let embed_future = tokio::task::spawn_blocking(move || provider.embed_batch(texts));
-
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), embed_future).await
-        {
-            Ok(Ok(Ok(embeddings))) => {
-                // Only add chunks that successfully got embeddings
-                all_embeddings.extend(embeddings);
-                successful_chunks.extend(chunk_batch.iter().cloned());
-            }
-            Ok(Ok(Err(e))) => {
-                errors.push(format!("Failed to generate embeddings: {}", e));
-                continue;
-            }
-            Ok(Err(e)) => {
-                errors.push(format!("Embedding task panicked: {}", e));
-                continue;
-            }
-            Err(_) => {
-                errors.push(format!(
-                    "Embedding generation timed out after {} seconds",
-                    timeout_secs
-                ));
-                continue;
-            }
-        }
-
-        // Send progress during embedding (40% to 80%)
-        if let (Some(peer), Some(token)) = (&peer, &progress_token) {
-            let progress = 40.0 + ((batch_idx + 1) as f64 / total_batches as f64) * 40.0;
-            let _ = peer
-                .notify_progress(ProgressNotificationParam {
-                    progress_token: token.clone(),
-                    progress,
-                    total: Some(100.0),
-                    message: Some(format!(
-                        "Generating embeddings... {}/{} batches",
-                        batch_idx + 1,
-                        total_batches
-                    )),
-                })
-                .await;
-        }
-    }
+    let all_embeddings = embed_result.embeddings;
+    let successful_chunks = embed_result.successful_chunks;
+    errors.extend(embed_result.errors);
 
     let embeddings_generated = all_embeddings.len();
 
@@ -449,7 +535,7 @@ pub async fn do_incremental_update(
     }
 
     // Index new/modified files
-    let embeddings_generated = if !files_to_index.is_empty() {
+    let (embeddings_generated, embed_errors) = if !files_to_index.is_empty() {
         // Chunk files in parallel for better performance
         let chunker = client.chunker.clone();
         let all_chunks: Vec<_> = files_to_index
@@ -474,41 +560,21 @@ pub async fn do_incremental_update(
                 .await;
         }
 
-        // Generate embeddings in batches (using config values)
-        let batch_size = client.config.embedding.batch_size;
-        let mut all_embeddings = Vec::with_capacity(all_chunks.len());
-        let total_batches = all_chunks.len().div_ceil(batch_size);
+        // Generate embeddings with frequent cancellation checks
+        // Progress range: 60% to 85%
+        let embed_result = generate_embeddings_with_cancellation(
+            client,
+            &all_chunks,
+            &cancel_token,
+            &peer,
+            &progress_token,
+            60.0,
+            85.0,
+        )
+        .await?;
 
-        for (batch_idx, chunk_batch) in all_chunks.chunks(batch_size).enumerate() {
-            // Check for cancellation at start of each batch
-            check_cancelled!(cancel_token);
-
-            let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
-
-            let embeddings = client
-                .embedding_provider
-                .embed_batch(texts)
-                .context("Failed to generate embeddings")?;
-
-            all_embeddings.extend(embeddings);
-
-            // Send progress during embedding (60% to 85%)
-            if let (Some(peer), Some(token)) = (&peer, &progress_token) {
-                let progress = 60.0 + ((batch_idx + 1) as f64 / total_batches as f64) * 25.0;
-                let _ = peer
-                    .notify_progress(ProgressNotificationParam {
-                        progress_token: token.clone(),
-                        progress,
-                        total: Some(100.0),
-                        message: Some(format!(
-                            "Generating embeddings... {}/{} batches",
-                            batch_idx + 1,
-                            total_batches
-                        )),
-                    })
-                    .await;
-            }
-        }
+        let all_embeddings = embed_result.embeddings;
+        let successful_chunks = embed_result.successful_chunks;
 
         // Send progress before storing
         if let (Some(peer), Some(token)) = (&peer, &progress_token) {
@@ -526,19 +592,30 @@ pub async fn do_incremental_update(
         check_cancelled!(cancel_token);
 
         // Store all embeddings (pass normalized root path for per-project BM25)
-        let metadata: Vec<ChunkMetadata> = all_chunks.iter().map(|c| c.metadata.clone()).collect();
-        let contents: Vec<String> = all_chunks.iter().map(|c| c.content.clone()).collect();
+        // Use successful_chunks to ensure metadata/contents match embeddings count
+        let metadata: Vec<ChunkMetadata> = successful_chunks
+            .iter()
+            .map(|c| c.metadata.clone())
+            .collect();
+        let contents: Vec<String> = successful_chunks.iter().map(|c| c.content.clone()).collect();
 
-        client
-            .vector_db
-            .store_embeddings(all_embeddings.clone(), metadata, contents, &path)
-            .await
-            .context("Failed to store embeddings")?;
+        if !all_embeddings.is_empty() {
+            client
+                .vector_db
+                .store_embeddings(all_embeddings.clone(), metadata, contents, &path)
+                .await
+                .context("Failed to store embeddings")?;
+        }
 
-        all_embeddings.len()
+        (all_embeddings.len(), embed_result.errors)
     } else {
-        0
+        (0, vec![])
     };
+
+    // Collect any embedding errors (logged but not fatal)
+    for err in embed_errors {
+        tracing::warn!("Embedding error during incremental update: {}", err);
+    }
 
     // Send progress before saving cache
     if let (Some(peer), Some(token)) = (&peer, &progress_token) {
