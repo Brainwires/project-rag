@@ -365,9 +365,9 @@ Defined in `ServerHandler::get_info()`:
 
 ## Additional Documentation
 - See `README.md` for user-facing documentation and installation instructions
-- See `NOTES.md` for development notes and known issues
-- See `docs/TEST_RESULTS.md` for test suite details
-- See `docs/COVERAGE_ANALYSIS.md` for detailed test coverage
-- See `docs/PRODUCTION_READY.md` for production deployment guide
-- See `docs/SLASH_COMMANDS.md` for detailed slash command documentation
-- See `BENCHMARKING.md` for performance benchmarks and optimization tips
+- See `TESTING.md` for testing guide and coverage information
+- See `docs/deployment.md` for production deployment guide
+- See `docs/troubleshooting.md` for common issues and solutions
+- See `docs/slash-commands.md` for slash command documentation
+- See `docs/index-locking.md` for concurrent indexing protection details
+- See `docs/adr/` for architecture decision records

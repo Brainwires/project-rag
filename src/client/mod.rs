@@ -273,6 +273,43 @@ impl RagClient {
         Ok(canonical.to_string_lossy().to_string())
     }
 
+    /// Check if a specific path's index is dirty (incomplete/corrupted)
+    ///
+    /// Returns true if the path is marked as dirty, meaning a previous indexing
+    /// operation was interrupted and the data may be inconsistent.
+    pub async fn is_index_dirty(&self, path: &str) -> bool {
+        if let Ok(normalized) = Self::normalize_path(path) {
+            let cache = self.hash_cache.read().await;
+            cache.is_dirty(&normalized)
+        } else {
+            false
+        }
+    }
+
+    /// Check if any indexed paths are dirty
+    ///
+    /// Returns a list of paths that have dirty indexes.
+    pub async fn get_dirty_paths(&self) -> Vec<String> {
+        let cache = self.hash_cache.read().await;
+        cache.get_dirty_roots().iter().cloned().collect()
+    }
+
+    /// Check if searching on a specific path should be blocked due to dirty state
+    ///
+    /// Returns an error if the path is dirty, otherwise Ok(())
+    async fn check_path_not_dirty(&self, path: Option<&str>) -> Result<()> {
+        if let Some(p) = path {
+            if self.is_index_dirty(p).await {
+                anyhow::bail!(
+                    "Index for '{}' is dirty (previous indexing was interrupted). \
+                    Please re-run index_codebase to rebuild the index before querying.",
+                    p
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Try to acquire an indexing lock for a given path
     ///
     /// Returns either:
@@ -281,6 +318,9 @@ impl RagClient {
     ///
     /// The lock is automatically released when the returned guard is dropped.
     pub(crate) async fn try_acquire_index_lock(&self, path: &str) -> Result<IndexLockResult> {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
         // Normalize the path to ensure consistent locking across different path formats
         let normalized_path = Self::normalize_path(path)?;
 
@@ -289,22 +329,27 @@ impl RagClient {
 
         // Check if an operation is already in progress for this path
         if let Some(existing_op) = ops.get(&normalized_path) {
-            // Check if the operation is still active by looking at receiver count
-            // If receiver_count() == 0, the indexing has completed but cleanup hasn't
-            // happened yet (the async Drop task is pending). In this case, treat it
-            // as if no operation exists and start a new one.
-            if existing_op.result_tx.receiver_count() > 0 {
-                // Operation is still active, subscribe to receive the result
+            // Check if the operation is stale (timed out or crashed)
+            if existing_op.is_stale() {
+                tracing::warn!(
+                    "Removing stale indexing lock for {} (operation timed out after {:?})",
+                    normalized_path,
+                    existing_op.started_at.elapsed()
+                );
+                ops.remove(&normalized_path);
+            } else if existing_op.active.load(Ordering::Acquire) {
+                // Operation is still active and not stale, subscribe to receive the result
                 let receiver = existing_op.result_tx.subscribe();
                 tracing::info!(
-                    "Indexing already in progress for {}, waiting for result",
-                    normalized_path
+                    "Indexing already in progress for {} (started {:?} ago), waiting for result",
+                    normalized_path,
+                    existing_op.started_at.elapsed()
                 );
                 return Ok(IndexLockResult::WaitForResult(receiver));
             } else {
-                // Stale entry - remove it and proceed to create a new operation
+                // Operation completed but cleanup hasn't happened yet
                 tracing::debug!(
-                    "Removing stale indexing lock for {} (operation completed)",
+                    "Removing completed indexing lock for {} (cleanup pending)",
                     normalized_path
                 );
                 ops.remove(&normalized_path);
@@ -315,11 +360,16 @@ impl RagClient {
         // Capacity of 1 is enough since we only send one result
         let (result_tx, _) = broadcast::channel(1);
 
-        // Register this operation
+        // Create the active flag - starts as true (active)
+        let active_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        // Register this operation with timestamp
         ops.insert(
             normalized_path.clone(),
             IndexingOperation {
                 result_tx: result_tx.clone(),
+                active: active_flag.clone(),
+                started_at: Instant::now(),
             },
         );
 
@@ -330,6 +380,7 @@ impl RagClient {
             normalized_path,
             self.indexing_ops.clone(),
             result_tx,
+            active_flag,
         )))
     }
 
@@ -411,6 +462,9 @@ impl RagClient {
     pub async fn query_codebase(&self, request: QueryRequest) -> Result<QueryResponse> {
         request.validate().map_err(|e| anyhow::anyhow!(e))?;
 
+        // Check if the target path is dirty (if path filter is specified)
+        self.check_path_not_dirty(request.path.as_deref()).await?;
+
         let start = Instant::now();
 
         let query_embedding = self
@@ -483,6 +537,9 @@ impl RagClient {
         request: AdvancedSearchRequest,
     ) -> Result<QueryResponse> {
         request.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Check if the target path is dirty (if path filter is specified)
+        self.check_path_not_dirty(request.path.as_deref()).await?;
 
         let start = Instant::now();
 

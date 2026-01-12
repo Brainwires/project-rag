@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 pub struct HashCache {
     /// Map of root path -> (file path -> hash)
     pub roots: HashMap<String, HashMap<String, String>>,
+    /// Set of root paths that are currently being indexed (dirty state)
+    /// If a root is in this set, its index may be incomplete/corrupted
+    #[serde(default)]
+    pub dirty_roots: HashSet<String>,
 }
 
 impl HashCache {
@@ -56,6 +60,34 @@ impl HashCache {
     /// Remove a root path from the cache
     pub fn remove_root(&mut self, root: &str) {
         self.roots.remove(root);
+        self.dirty_roots.remove(root);
+    }
+
+    /// Mark a root path as dirty (indexing in progress)
+    /// This should be called BEFORE indexing starts and the cache saved immediately
+    pub fn mark_dirty(&mut self, root: &str) {
+        self.dirty_roots.insert(root.to_string());
+    }
+
+    /// Clear the dirty flag for a root path (indexing completed successfully)
+    /// This should be called AFTER indexing completes and the cache saved immediately
+    pub fn clear_dirty(&mut self, root: &str) {
+        self.dirty_roots.remove(root);
+    }
+
+    /// Check if a root path is marked as dirty
+    pub fn is_dirty(&self, root: &str) -> bool {
+        self.dirty_roots.contains(root)
+    }
+
+    /// Get all dirty root paths
+    pub fn get_dirty_roots(&self) -> &HashSet<String> {
+        &self.dirty_roots
+    }
+
+    /// Check if any roots are dirty
+    pub fn has_dirty_roots(&self) -> bool {
+        !self.dirty_roots.is_empty()
     }
 
     /// Get default cache path (in user's cache directory)
@@ -214,5 +246,114 @@ mod tests {
         cache.remove_root("/nonexistent");
         // Should not panic
         assert_eq!(cache.roots.len(), 0);
+    }
+
+    #[test]
+    fn test_dirty_flag_operations() {
+        let mut cache = HashCache::default();
+
+        // Initially not dirty
+        assert!(!cache.is_dirty("/test/path"));
+        assert!(!cache.has_dirty_roots());
+        assert!(cache.get_dirty_roots().is_empty());
+
+        // Mark as dirty
+        cache.mark_dirty("/test/path");
+        assert!(cache.is_dirty("/test/path"));
+        assert!(cache.has_dirty_roots());
+        assert!(cache.get_dirty_roots().contains("/test/path"));
+
+        // Clear dirty flag
+        cache.clear_dirty("/test/path");
+        assert!(!cache.is_dirty("/test/path"));
+        assert!(!cache.has_dirty_roots());
+    }
+
+    #[test]
+    fn test_dirty_flag_persistence() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let cache_path = temp_file.path().to_path_buf();
+
+        // Create cache with dirty flag
+        let mut cache = HashCache::default();
+        cache.mark_dirty("/test/path");
+        cache.save(&cache_path).unwrap();
+
+        // Load and verify dirty flag persisted
+        let loaded = HashCache::load(&cache_path).unwrap();
+        assert!(loaded.is_dirty("/test/path"));
+        assert!(loaded.has_dirty_roots());
+    }
+
+    #[test]
+    fn test_remove_root_clears_dirty() {
+        let mut cache = HashCache::default();
+
+        // Add root with files and mark as dirty
+        let mut hashes = HashMap::new();
+        hashes.insert("file1.rs".to_string(), "hash1".to_string());
+        cache.update_root("/test/path".to_string(), hashes);
+        cache.mark_dirty("/test/path");
+
+        assert!(cache.is_dirty("/test/path"));
+        assert!(cache.get_root("/test/path").is_some());
+
+        // Remove root - should also clear dirty
+        cache.remove_root("/test/path");
+        assert!(!cache.is_dirty("/test/path"));
+        assert!(cache.get_root("/test/path").is_none());
+    }
+
+    #[test]
+    fn test_multiple_dirty_roots() {
+        let mut cache = HashCache::default();
+
+        cache.mark_dirty("/path1");
+        cache.mark_dirty("/path2");
+        cache.mark_dirty("/path3");
+
+        assert!(cache.is_dirty("/path1"));
+        assert!(cache.is_dirty("/path2"));
+        assert!(cache.is_dirty("/path3"));
+        assert_eq!(cache.get_dirty_roots().len(), 3);
+
+        cache.clear_dirty("/path2");
+        assert!(cache.is_dirty("/path1"));
+        assert!(!cache.is_dirty("/path2"));
+        assert!(cache.is_dirty("/path3"));
+        assert_eq!(cache.get_dirty_roots().len(), 2);
+    }
+
+    #[test]
+    fn test_dirty_flag_idempotent() {
+        let mut cache = HashCache::default();
+
+        // Marking same path multiple times should be idempotent
+        cache.mark_dirty("/test/path");
+        cache.mark_dirty("/test/path");
+        cache.mark_dirty("/test/path");
+        assert_eq!(cache.get_dirty_roots().len(), 1);
+
+        // Clearing same path multiple times should be safe
+        cache.clear_dirty("/test/path");
+        cache.clear_dirty("/test/path");
+        assert!(!cache.is_dirty("/test/path"));
+    }
+
+    #[test]
+    fn test_dirty_flag_with_old_cache_format() {
+        // Test that loading a cache without dirty_roots field works (backwards compatibility)
+        let temp_file = NamedTempFile::new().unwrap();
+        let cache_path = temp_file.path().to_path_buf();
+
+        // Write old format JSON (without dirty_roots)
+        let old_format = r#"{"roots":{"/test/path":{"file1.rs":"hash1"}}}"#;
+        fs::write(&cache_path, old_format).unwrap();
+
+        // Load should succeed with empty dirty_roots
+        let loaded = HashCache::load(&cache_path).unwrap();
+        assert!(loaded.get_root("/test/path").is_some());
+        assert!(!loaded.has_dirty_roots());
+        assert!(!loaded.is_dirty("/test/path"));
     }
 }

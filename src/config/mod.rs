@@ -53,12 +53,20 @@ pub struct EmbeddingConfig {
     pub model_name: String,
 
     /// Batch size for embedding generation
+    /// Smaller values allow faster cancellation response but may be less efficient
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 
-    /// Timeout in seconds for embedding generation
+    /// Timeout in seconds for embedding generation per batch
+    /// This is per-batch, not total - smaller batches mean faster timeout response
     #[serde(default = "default_embedding_timeout")]
     pub timeout_secs: u64,
+
+    /// Maximum number of chunks to process before checking for cancellation
+    /// This provides more granular control over cancellation responsiveness
+    /// Set to 0 to use batch_size (check once per batch)
+    #[serde(default = "default_cancellation_check_interval")]
+    pub cancellation_check_interval: usize,
 }
 
 /// Indexing configuration
@@ -134,11 +142,20 @@ fn default_model_name() -> String {
 }
 
 fn default_batch_size() -> usize {
-    32
+    // Reduced from 32 to 8 for faster cancellation response
+    // Each batch takes ~1-3 seconds, so cancellation can respond within 3 seconds
+    8
 }
 
 fn default_embedding_timeout() -> u64 {
-    30
+    // Reduced from 30 to 10 seconds for faster timeout detection per batch
+    10
+}
+
+fn default_cancellation_check_interval() -> usize {
+    // Check cancellation every 4 chunks (every ~0.5-1.5 seconds)
+    // Set to 0 to use batch_size instead
+    4
 }
 
 fn default_chunk_size() -> usize {
@@ -196,6 +213,7 @@ impl Default for EmbeddingConfig {
             model_name: default_model_name(),
             batch_size: default_batch_size(),
             timeout_secs: default_embedding_timeout(),
+            cancellation_check_interval: default_cancellation_check_interval(),
         }
     }
 }

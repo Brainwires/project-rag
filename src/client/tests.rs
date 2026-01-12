@@ -988,3 +988,344 @@ async fn test_project_isolation() {
         assert_eq!(result.project, Some("project-a".to_string()));
     }
 }
+
+// ===== Concurrent Indexing Lock Tests =====
+
+#[tokio::test]
+async fn test_index_lock_prevents_duplicate_indexing() {
+    let (client, temp_dir) = create_test_client().await;
+
+    // Create data to index
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::write(data_dir.join("test.rs"), "fn main() { println!(\"test\"); }").unwrap();
+
+    let path = data_dir.to_string_lossy().to_string();
+
+    // Start first indexing
+    let lock_result1 = client.try_acquire_index_lock(&path).await.unwrap();
+    assert!(
+        matches!(lock_result1, IndexLockResult::Acquired(_)),
+        "First call should acquire the lock"
+    );
+
+    // Try to acquire lock again while first is still held
+    let lock_result2 = client.try_acquire_index_lock(&path).await.unwrap();
+    assert!(
+        matches!(lock_result2, IndexLockResult::WaitForResult(_)),
+        "Second call should wait for the first operation"
+    );
+
+    // Release the first lock by dropping it (simulate completion)
+    if let IndexLockResult::Acquired(guard) = lock_result1 {
+        // Broadcast a result before releasing
+        let result = IndexResponse {
+            mode: crate::types::IndexingMode::Full,
+            files_indexed: 1,
+            chunks_created: 1,
+            embeddings_generated: 1,
+            duration_ms: 100,
+            errors: vec![],
+            files_updated: 0,
+            files_removed: 0,
+        };
+        guard.broadcast_result(&result);
+        guard.release().await;
+    }
+}
+
+#[tokio::test]
+async fn test_index_lock_waiters_receive_result() {
+    let (client, temp_dir) = create_test_client().await;
+
+    // Create data to index
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::write(data_dir.join("test.rs"), "fn test() {}").unwrap();
+
+    let path = data_dir.to_string_lossy().to_string();
+
+    // Acquire the lock first
+    let lock_result = client.try_acquire_index_lock(&path).await.unwrap();
+    let guard = match lock_result {
+        IndexLockResult::Acquired(g) => g,
+        _ => panic!("Expected to acquire lock"),
+    };
+
+    // Get a waiter
+    let lock_result2 = client.try_acquire_index_lock(&path).await.unwrap();
+    let mut receiver = match lock_result2 {
+        IndexLockResult::WaitForResult(r) => r,
+        _ => panic!("Expected to wait for result"),
+    };
+
+    // Broadcast result from the first operation
+    let expected_response = IndexResponse {
+        mode: crate::types::IndexingMode::Full,
+        files_indexed: 42,
+        chunks_created: 100,
+        embeddings_generated: 100,
+        duration_ms: 500,
+        errors: vec![],
+        files_updated: 0,
+        files_removed: 0,
+    };
+    guard.broadcast_result(&expected_response);
+    guard.release().await;
+
+    // Waiter should receive the same result
+    let received = receiver.recv().await.unwrap();
+    assert_eq!(received.files_indexed, 42);
+    assert_eq!(received.chunks_created, 100);
+    assert_eq!(received.embeddings_generated, 100);
+}
+
+#[tokio::test]
+async fn test_index_lock_path_normalization() {
+    let (client, temp_dir) = create_test_client().await;
+
+    // Create data to index
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::write(data_dir.join("test.rs"), "fn test() {}").unwrap();
+
+    // Get different path representations
+    let path1 = data_dir.to_string_lossy().to_string();
+    let path2 = format!("{}/../data", data_dir.to_string_lossy()); // With ..
+
+    // Acquire lock with first path
+    let lock_result1 = client.try_acquire_index_lock(&path1).await.unwrap();
+    assert!(matches!(lock_result1, IndexLockResult::Acquired(_)));
+
+    // Try to acquire with different but equivalent path
+    let lock_result2 = client.try_acquire_index_lock(&path2).await.unwrap();
+    assert!(
+        matches!(lock_result2, IndexLockResult::WaitForResult(_)),
+        "Equivalent paths should share the same lock"
+    );
+
+    // Release the first lock
+    if let IndexLockResult::Acquired(guard) = lock_result1 {
+        let result = IndexResponse {
+            mode: crate::types::IndexingMode::Full,
+            files_indexed: 1,
+            chunks_created: 1,
+            embeddings_generated: 1,
+            duration_ms: 100,
+            errors: vec![],
+            files_updated: 0,
+            files_removed: 0,
+        };
+        guard.broadcast_result(&result);
+        guard.release().await;
+    }
+}
+
+#[tokio::test]
+async fn test_index_lock_released_after_completion() {
+    let (client, temp_dir) = create_test_client().await;
+
+    // Create data to index
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::write(data_dir.join("test.rs"), "fn test() {}").unwrap();
+
+    let path = data_dir.to_string_lossy().to_string();
+
+    // First: acquire, broadcast, release
+    {
+        let lock_result = client.try_acquire_index_lock(&path).await.unwrap();
+        let guard = match lock_result {
+            IndexLockResult::Acquired(g) => g,
+            _ => panic!("Expected to acquire lock"),
+        };
+
+        let result = IndexResponse {
+            mode: crate::types::IndexingMode::Full,
+            files_indexed: 1,
+            chunks_created: 1,
+            embeddings_generated: 1,
+            duration_ms: 100,
+            errors: vec![],
+            files_updated: 0,
+            files_removed: 0,
+        };
+        guard.broadcast_result(&result);
+        guard.release().await;
+    }
+
+    // Second: should be able to acquire lock again
+    let lock_result2 = client.try_acquire_index_lock(&path).await.unwrap();
+    assert!(
+        matches!(lock_result2, IndexLockResult::Acquired(_)),
+        "Should be able to acquire lock after previous operation completed"
+    );
+
+    // Clean up
+    if let IndexLockResult::Acquired(guard) = lock_result2 {
+        let result = IndexResponse {
+            mode: crate::types::IndexingMode::Incremental,
+            files_indexed: 0,
+            chunks_created: 0,
+            embeddings_generated: 0,
+            duration_ms: 50,
+            errors: vec![],
+            files_updated: 0,
+            files_removed: 0,
+        };
+        guard.broadcast_result(&result);
+        guard.release().await;
+    }
+}
+
+#[tokio::test]
+async fn test_concurrent_index_calls_share_result() {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    let (client, temp_dir) = create_test_client().await;
+
+    // Create data to index
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::write(data_dir.join("test.rs"), "fn main() {}").unwrap();
+
+    let path = data_dir.to_string_lossy().to_string();
+    let client = Arc::new(client);
+
+    // Use a barrier to synchronize the start of both tasks
+    let barrier = Arc::new(Barrier::new(2));
+
+    let client1 = client.clone();
+    let path1 = path.clone();
+    let barrier1 = barrier.clone();
+
+    let client2 = client.clone();
+    let path2 = path.clone();
+    let barrier2 = barrier.clone();
+
+    // Spawn two concurrent indexing tasks
+    let task1 = tokio::spawn(async move {
+        barrier1.wait().await;
+        let request = IndexRequest {
+            path: path1,
+            project: None,
+            include_patterns: vec![],
+            exclude_patterns: vec![],
+            max_file_size: 1024 * 1024,
+        };
+        client1.index_codebase(request).await
+    });
+
+    let task2 = tokio::spawn(async move {
+        barrier2.wait().await;
+        let request = IndexRequest {
+            path: path2,
+            project: None,
+            include_patterns: vec![],
+            exclude_patterns: vec![],
+            max_file_size: 1024 * 1024,
+        };
+        client2.index_codebase(request).await
+    });
+
+    // Wait for both to complete
+    let (result1, result2) = tokio::join!(task1, task2);
+
+    // Both should succeed
+    let resp1 = result1.unwrap().unwrap();
+    let resp2 = result2.unwrap().unwrap();
+
+    // Both should have the same indexing result (one did the work, one received broadcast)
+    assert_eq!(resp1.files_indexed, resp2.files_indexed);
+    assert_eq!(resp1.chunks_created, resp2.chunks_created);
+    assert_eq!(resp1.embeddings_generated, resp2.embeddings_generated);
+}
+
+#[tokio::test]
+async fn test_index_lock_drop_without_release_broadcasts_error() {
+    let (client, temp_dir) = create_test_client().await;
+
+    // Create data to index
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::write(data_dir.join("test.rs"), "fn test() {}").unwrap();
+
+    let path = data_dir.to_string_lossy().to_string();
+
+    // Acquire the lock
+    let lock_result = client.try_acquire_index_lock(&path).await.unwrap();
+    let guard = match lock_result {
+        IndexLockResult::Acquired(g) => g,
+        _ => panic!("Expected to acquire lock"),
+    };
+
+    // Get a waiter
+    let lock_result2 = client.try_acquire_index_lock(&path).await.unwrap();
+    let mut receiver = match lock_result2 {
+        IndexLockResult::WaitForResult(r) => r,
+        _ => panic!("Expected to wait for result"),
+    };
+
+    // Drop the guard WITHOUT calling broadcast_result or release
+    // This simulates a panic or error during indexing
+    drop(guard);
+
+    // Give the async cleanup task time to run
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Waiter should receive an error response (not hang forever)
+    let received = receiver.recv().await.unwrap();
+    assert_eq!(received.files_indexed, 0);
+    assert!(!received.errors.is_empty());
+    assert!(received.errors[0].contains("interrupted"));
+}
+
+#[tokio::test]
+async fn test_index_lock_can_reacquire_after_drop_without_release() {
+    let (client, temp_dir) = create_test_client().await;
+
+    // Create data to index
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::write(data_dir.join("test.rs"), "fn test() {}").unwrap();
+
+    let path = data_dir.to_string_lossy().to_string();
+
+    // Acquire and immediately drop (simulating panic)
+    {
+        let lock_result = client.try_acquire_index_lock(&path).await.unwrap();
+        match lock_result {
+            IndexLockResult::Acquired(_guard) => {
+                // Drop without release
+            }
+            _ => panic!("Expected to acquire lock"),
+        }
+    }
+
+    // Give the async cleanup task time to run
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Should be able to acquire lock again
+    let lock_result2 = client.try_acquire_index_lock(&path).await.unwrap();
+    assert!(
+        matches!(lock_result2, IndexLockResult::Acquired(_)),
+        "Should be able to acquire lock after previous guard was dropped"
+    );
+
+    // Clean up properly this time
+    if let IndexLockResult::Acquired(guard) = lock_result2 {
+        let result = IndexResponse {
+            mode: crate::types::IndexingMode::Full,
+            files_indexed: 1,
+            chunks_created: 1,
+            embeddings_generated: 1,
+            duration_ms: 100,
+            errors: vec![],
+            files_updated: 0,
+            files_removed: 0,
+        };
+        guard.broadcast_result(&result);
+        guard.release().await;
+    }
+}

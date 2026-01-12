@@ -144,7 +144,13 @@ We welcome contributions in these areas:
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
 
-2. Start Qdrant:
+2. Install protobuf compiler:
+   ```bash
+   # Ubuntu/Debian
+   sudo apt-get install protobuf-compiler
+   ```
+
+Note: LanceDB is the default embedded database and requires no additional setup. If using the optional Qdrant backend, start a Qdrant server:
    ```bash
    docker run -p 6333:6333 -p 6334:6334 \
        -v $(pwd)/qdrant_data:/qdrant/storage \
