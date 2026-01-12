@@ -46,7 +46,7 @@ The server provides 9 slash commands for quick access in Claude Code:
 8. **`/project:references`** - Find all references to a symbol
 9. **`/project:callgraph`** - Get call graph for a function (callers/callees)
 
-See [SLASH_COMMANDS.md](docs/SLASH_COMMANDS.md) for detailed usage.
+See [slash-commands.md](docs/slash-commands.md) for detailed usage.
 
 ## Supported File Types
 
@@ -401,9 +401,9 @@ project-rag/
 │   └── lib.rs              # Library root
 ├── Cargo.toml              # Rust 2024 edition with dependencies
 ├── README.md               # This file
-├── NOTES.md                # Development notes and known issues
-├── TEST_RESULTS.md         # Unit test results
-└── COVERAGE_ANALYSIS.md    # Detailed test coverage analysis
+├── CONTRIBUTING.md         # Contributor guidelines
+├── TESTING.md              # Testing guide
+└── CLAUDE.md               # AI assistant instructions
 ```
 
 ## Configuration
@@ -796,8 +796,8 @@ Contributions welcome! Please ensure:
 ## Support
 
 - **Issues**: https://github.com/your-repo/project-rag/issues
-- **Documentation**: See NOTES.md and COVERAGE_ANALYSIS.md
-- **Examples**: See mcp_test_minimal.rs for working MCP server pattern
+- **Documentation**: See [docs/](docs/) for deployment, troubleshooting, and slash commands
+- **Architecture**: See [docs/adr/](docs/adr/) for architecture decision records
 
 ## Acknowledgments
 
