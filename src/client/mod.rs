@@ -273,6 +273,43 @@ impl RagClient {
         Ok(canonical.to_string_lossy().to_string())
     }
 
+    /// Check if a specific path's index is dirty (incomplete/corrupted)
+    ///
+    /// Returns true if the path is marked as dirty, meaning a previous indexing
+    /// operation was interrupted and the data may be inconsistent.
+    pub async fn is_index_dirty(&self, path: &str) -> bool {
+        if let Ok(normalized) = Self::normalize_path(path) {
+            let cache = self.hash_cache.read().await;
+            cache.is_dirty(&normalized)
+        } else {
+            false
+        }
+    }
+
+    /// Check if any indexed paths are dirty
+    ///
+    /// Returns a list of paths that have dirty indexes.
+    pub async fn get_dirty_paths(&self) -> Vec<String> {
+        let cache = self.hash_cache.read().await;
+        cache.get_dirty_roots().iter().cloned().collect()
+    }
+
+    /// Check if searching on a specific path should be blocked due to dirty state
+    ///
+    /// Returns an error if the path is dirty, otherwise Ok(())
+    async fn check_path_not_dirty(&self, path: Option<&str>) -> Result<()> {
+        if let Some(p) = path {
+            if self.is_index_dirty(p).await {
+                anyhow::bail!(
+                    "Index for '{}' is dirty (previous indexing was interrupted). \
+                    Please re-run index_codebase to rebuild the index before querying.",
+                    p
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Try to acquire an indexing lock for a given path
     ///
     /// Returns either:
@@ -425,6 +462,9 @@ impl RagClient {
     pub async fn query_codebase(&self, request: QueryRequest) -> Result<QueryResponse> {
         request.validate().map_err(|e| anyhow::anyhow!(e))?;
 
+        // Check if the target path is dirty (if path filter is specified)
+        self.check_path_not_dirty(request.path.as_deref()).await?;
+
         let start = Instant::now();
 
         let query_embedding = self
@@ -497,6 +537,9 @@ impl RagClient {
         request: AdvancedSearchRequest,
     ) -> Result<QueryResponse> {
         request.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Check if the target path is dirty (if path filter is specified)
+        self.check_path_not_dirty(request.path.as_deref()).await?;
 
         let start = Instant::now();
 

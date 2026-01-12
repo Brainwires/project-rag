@@ -717,12 +717,63 @@ async fn do_index_smart_inner(
     // Normalize path to canonical form for consistent cache lookups
     let normalized_path = RagClient::normalize_path(&path)?;
 
-    // Check if we have an existing cache for this path
+    // Check if index is dirty (previous indexing was interrupted)
+    // If dirty, we MUST do a full reindex after clearing the corrupted data
     let cache = client.hash_cache.read().await;
+    let is_dirty = cache.is_dirty(&normalized_path);
     let has_existing_index = cache.get_root(&normalized_path).is_some();
     drop(cache);
 
-    if has_existing_index {
+    // Handle dirty index: clear everything and force full reindex
+    if is_dirty {
+        tracing::warn!(
+            "Index for '{}' is marked as dirty (previous indexing was interrupted). Clearing corrupted data and performing full reindex.",
+            normalized_path
+        );
+
+        // Send progress notification about dirty state
+        if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+            let _ = peer
+                .notify_progress(ProgressNotificationParam {
+                    progress_token: token.clone(),
+                    progress: 0.0,
+                    total: Some(100.0),
+                    message: Some("Dirty index detected, clearing corrupted data...".into()),
+                })
+                .await;
+        }
+
+        // Clear any existing embeddings for this path from the vector database
+        // We can't trust partial data, so delete everything for this path
+        if let Err(e) = clear_path_data(client, &normalized_path).await {
+            tracing::error!("Failed to clear corrupted index data for '{}': {}", normalized_path, e);
+            // Continue anyway - the full index will overwrite
+        }
+
+        // Clear the cache entry for this path (removes from roots and dirty_roots)
+        let mut cache = client.hash_cache.write().await;
+        cache.remove_root(&normalized_path);
+        if let Err(e) = cache.save(&client.cache_path) {
+            tracing::warn!("Failed to save cache after clearing dirty state: {}", e);
+        }
+        drop(cache);
+    }
+
+    // Mark the index as dirty BEFORE starting (persisted immediately)
+    // This ensures that if we crash/are killed, the next run knows the index is corrupted
+    {
+        let mut cache = client.hash_cache.write().await;
+        cache.mark_dirty(&normalized_path);
+        if let Err(e) = cache.save(&client.cache_path) {
+            tracing::error!("Failed to save dirty flag: {}", e);
+            // This is critical - if we can't persist the dirty flag, we shouldn't proceed
+            anyhow::bail!("Failed to mark index as dirty before indexing: {}", e);
+        }
+        tracing::debug!("Marked index as dirty for: {}", normalized_path);
+    }
+
+    // Perform the actual indexing
+    let result = if has_existing_index && !is_dirty {
         tracing::info!(
             "Existing index found for '{}' (normalized: '{}'), performing incremental update",
             path,
@@ -730,7 +781,7 @@ async fn do_index_smart_inner(
         );
         do_incremental_update(
             client,
-            normalized_path,
+            normalized_path.clone(),
             project,
             include_patterns,
             exclude_patterns,
@@ -748,7 +799,7 @@ async fn do_index_smart_inner(
         );
         do_index(
             client,
-            normalized_path,
+            normalized_path.clone(),
             project,
             include_patterns,
             exclude_patterns,
@@ -758,7 +809,52 @@ async fn do_index_smart_inner(
             cancel_token,
         )
         .await
+    };
+
+    // Clear the dirty flag ONLY on successful completion
+    // On error/cancellation, the dirty flag remains set
+    match &result {
+        Ok(_) => {
+            let mut cache = client.hash_cache.write().await;
+            cache.clear_dirty(&normalized_path);
+            if let Err(e) = cache.save(&client.cache_path) {
+                tracing::warn!("Failed to clear dirty flag after successful indexing: {}", e);
+                // Don't fail the whole operation for this
+            }
+            tracing::debug!("Cleared dirty flag for: {}", normalized_path);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Indexing failed or was cancelled for '{}', dirty flag remains set: {}",
+                normalized_path,
+                e
+            );
+            // Dirty flag intentionally left set - next indexing will do full reindex
+        }
     }
+
+    result
+}
+
+/// Clear all indexed data for a specific path
+async fn clear_path_data(client: &RagClient, normalized_path: &str) -> Result<()> {
+    // Get all file paths that were indexed for this root
+    let cache = client.hash_cache.read().await;
+    let file_paths: Vec<String> = cache
+        .get_root(normalized_path)
+        .map(|hashes| hashes.keys().cloned().collect())
+        .unwrap_or_default();
+    drop(cache);
+
+    // Delete embeddings for each file
+    for file_path in file_paths {
+        if let Err(e) = client.vector_db.delete_by_file(&file_path).await {
+            tracing::warn!("Failed to delete embeddings for file '{}': {}", file_path, e);
+        }
+    }
+
+    tracing::info!("Cleared indexed data for path: {}", normalized_path);
+    Ok(())
 }
 
 #[cfg(test)]
