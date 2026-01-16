@@ -53,6 +53,8 @@ pdf-extract = "0.7"
 rayon = "1.10"
 # Async utilities for cancellation
 tokio-util = "0.7"
+# Cross-platform file locking for cross-process coordination
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3.0"

@@ -96,6 +96,7 @@ async fn test_full_indexing_workflow() -> Result<()> {
             1_048_576,
             None,
             None,
+            None, // cancel_token
         )
         .await?;
 

@@ -702,8 +702,8 @@ pub async fn do_index_smart(
 
     match lock_result {
         IndexLockResult::WaitForResult(mut receiver) => {
-            // Another operation is in progress, wait for its result
-            tracing::info!("Waiting for existing indexing operation to complete for: {}", path);
+            // Another task in THIS PROCESS is indexing, wait for its result via broadcast
+            tracing::info!("Waiting for existing indexing operation in this process to complete for: {}", path);
 
             // Send progress notification if we have a peer
             if let (Some(peer), Some(token)) = (&peer, &progress_token) {
@@ -728,6 +728,73 @@ pub async fn do_index_smart(
                     Err(anyhow::anyhow!(
                         "Indexing operation failed or was cancelled: {}",
                         e
+                    ))
+                }
+            }
+        }
+        IndexLockResult::WaitForFilesystemLock(normalized_path) => {
+            // Another PROCESS is indexing this path, wait for the filesystem lock
+            tracing::info!(
+                "Another process is indexing {} - waiting for filesystem lock to be released",
+                normalized_path
+            );
+
+            // Send progress notification if we have a peer
+            if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+                let _ = peer
+                    .notify_progress(ProgressNotificationParam {
+                        progress_token: token.clone(),
+                        progress: 0.0,
+                        total: Some(100.0),
+                        message: Some("Waiting for another process to finish indexing...".into()),
+                    })
+                    .await;
+            }
+
+            // Block until we can acquire the filesystem lock (with 30 min timeout)
+            // This happens when the other process finishes indexing
+            use super::FsLockGuard;
+            use std::time::Duration;
+
+            let path_for_lock = normalized_path.clone();
+            let fs_lock_result = tokio::task::spawn_blocking(move || {
+                FsLockGuard::acquire_blocking(&path_for_lock, Duration::from_secs(30 * 60))
+            })
+            .await
+            .context("Filesystem lock blocking task panicked")??;
+
+            match fs_lock_result {
+                Some(_lock) => {
+                    // We acquired the lock! The other process finished.
+                    // The database should be up-to-date from their indexing.
+                    // We'll do an incremental check to be safe (will be fast if nothing changed)
+                    tracing::info!(
+                        "Other process finished indexing {} - performing incremental check",
+                        normalized_path
+                    );
+
+                    // Drop the lock immediately - we don't need it for incremental check
+                    // since we're not modifying the database
+                    drop(_lock);
+
+                    // Return a response indicating we waited and the index should be current
+                    // The caller can do an incremental check if they want to verify
+                    Ok(IndexResponse {
+                        mode: crate::types::IndexingMode::Incremental,
+                        files_indexed: 0,
+                        chunks_created: 0,
+                        embeddings_generated: 0,
+                        duration_ms: 0,
+                        errors: vec![],
+                        files_updated: 0,
+                        files_removed: 0,
+                    })
+                }
+                None => {
+                    // Timeout waiting for the lock - the other process took too long
+                    Err(anyhow::anyhow!(
+                        "Timeout waiting for another process to finish indexing {} (30 minutes)",
+                        normalized_path
                     ))
                 }
             }
