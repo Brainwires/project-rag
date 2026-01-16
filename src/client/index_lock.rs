@@ -1,12 +1,17 @@
 //! Index locking mechanism for preventing concurrent indexing operations
+//!
+//! This module provides two layers of locking:
+//! 1. Filesystem locks (cross-process) - prevents multiple processes from indexing the same path
+//! 2. In-memory locks (in-process) - allows waiting tasks to receive the result via broadcast
 
+use super::fs_lock::FsLockGuard;
 use crate::types::IndexResponse;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 use tokio::sync::broadcast;
+use tokio::sync::RwLock;
 
 /// Maximum time an indexing operation can run before being considered stale (30 minutes)
 /// This handles cases where the process crashes or panics without proper cleanup
@@ -39,11 +44,16 @@ impl IndexingOperation {
 pub(crate) enum IndexLockResult {
     /// We acquired the lock and should perform indexing
     Acquired(IndexLockGuard),
-    /// Another operation is in progress, wait for its result
+    /// Another operation in the SAME PROCESS is in progress, wait for its result
     WaitForResult(broadcast::Receiver<IndexResponse>),
+    /// Another PROCESS is indexing this path, need to wait for filesystem lock
+    WaitForFilesystemLock(String),
 }
 
 /// Guard for index locks that cleans up the lock when released
+///
+/// This guard holds both the filesystem lock (cross-process) and the in-memory
+/// lock state (for broadcasting results to waiters in the same process).
 pub(crate) struct IndexLockGuard {
     path: String,
     locks_map: Arc<RwLock<HashMap<String, IndexingOperation>>>,
@@ -53,15 +63,20 @@ pub(crate) struct IndexLockGuard {
     active_flag: Arc<AtomicBool>,
     /// Flag to track if the lock has been properly released
     released: bool,
+    /// Filesystem lock guard - dropped automatically when IndexLockGuard is dropped
+    /// This ensures cross-process coordination
+    #[allow(dead_code)]
+    fs_lock: FsLockGuard,
 }
 
 impl IndexLockGuard {
-    /// Create a new IndexLockGuard
+    /// Create a new IndexLockGuard with both filesystem and in-memory locks
     pub(crate) fn new(
         path: String,
         locks_map: Arc<RwLock<HashMap<String, IndexingOperation>>>,
         result_tx: broadcast::Sender<IndexResponse>,
         active_flag: Arc<AtomicBool>,
+        fs_lock: FsLockGuard,
     ) -> Self {
         Self {
             path,
@@ -69,6 +84,7 @@ impl IndexLockGuard {
             result_tx,
             active_flag,
             released: false,
+            fs_lock,
         }
     }
 
