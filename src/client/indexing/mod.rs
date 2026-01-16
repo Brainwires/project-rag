@@ -845,6 +845,107 @@ pub async fn do_index_smart(
     }
 }
 
+/// Default stale dirty flag timeout: 2 hours
+/// If a dirty flag is older than this, it's likely from a crashed/cancelled process
+const STALE_DIRTY_FLAG_TIMEOUT_SECS: u64 = 2 * 60 * 60;
+
+/// Result of dirty flag validation
+#[derive(Debug)]
+enum DirtyFlagValidation {
+    /// The dirty flag is valid - index is truly corrupted
+    TrulyCorrupted { reason: String },
+    /// The dirty flag is stale and can be safely cleared
+    StaleFlag { age_secs: u64 },
+    /// The index appears to be complete despite the dirty flag
+    IndexAppearsComplete {
+        cached_files: usize,
+        indexed_files: usize,
+    },
+}
+
+/// Validate whether a dirty flag represents actual corruption or is stale
+async fn validate_dirty_flag(
+    client: &RagClient,
+    normalized_path: &str,
+) -> Result<DirtyFlagValidation> {
+    // Read cache and extract the information we need, then drop the lock
+    let (dirty_info_data, cached_files_count) = {
+        let cache = client.hash_cache.read().await;
+        let dirty_info = cache.get_dirty_info(normalized_path).cloned();
+        let cached_files_count = cache
+            .get_root(normalized_path)
+            .map(|h| h.len())
+            .unwrap_or(0);
+        (dirty_info, cached_files_count)
+    };
+
+    // Check if dirty flag is stale (older than timeout)
+    if let Some(ref info) = dirty_info_data {
+        let age = info.age_secs();
+        if info.is_stale(STALE_DIRTY_FLAG_TIMEOUT_SECS) {
+            return Ok(DirtyFlagValidation::StaleFlag { age_secs: age });
+        }
+    }
+
+    // Check if the vector database has embeddings for this path
+    let indexed_count = client
+        .vector_db
+        .count_by_root_path(normalized_path)
+        .await
+        .unwrap_or(0);
+
+    // If we have cached file hashes but no embeddings, index is truly corrupted
+    if cached_files_count > 0 && indexed_count == 0 {
+        return Ok(DirtyFlagValidation::TrulyCorrupted {
+            reason: format!(
+                "Cache has {} files but vector DB has 0 embeddings",
+                cached_files_count
+            ),
+        });
+    }
+
+    // If we have no cached files and no embeddings, the dirty flag was set
+    // before any work was done - safe to clear and start fresh
+    if cached_files_count == 0 && indexed_count == 0 {
+        return Ok(DirtyFlagValidation::StaleFlag {
+            age_secs: dirty_info_data.as_ref().map(|i| i.age_secs()).unwrap_or(0),
+        });
+    }
+
+    // If we have both cached files and embeddings, compare the counts
+    // This is a rough check - if they're close, the index is likely complete
+    let indexed_files = client
+        .vector_db
+        .get_indexed_files(normalized_path)
+        .await
+        .unwrap_or_default();
+    let indexed_files_count = indexed_files.len();
+
+    // If the indexed file count is close to or exceeds cached file count,
+    // the index is likely complete (some files may have multiple chunks)
+    if indexed_files_count > 0 && indexed_files_count >= cached_files_count * 8 / 10 {
+        // At least 80% of files are indexed
+        return Ok(DirtyFlagValidation::IndexAppearsComplete {
+            cached_files: cached_files_count,
+            indexed_files: indexed_files_count,
+        });
+    }
+
+    // Otherwise, the index is likely incomplete
+    Ok(DirtyFlagValidation::TrulyCorrupted {
+        reason: format!(
+            "Cached {} files but only {} files indexed ({}%)",
+            cached_files_count,
+            indexed_files_count,
+            if cached_files_count > 0 {
+                indexed_files_count * 100 / cached_files_count
+            } else {
+                0
+            }
+        ),
+    })
+}
+
 /// Inner implementation of smart indexing (called when we have the lock)
 #[allow(clippy::too_many_arguments)]
 async fn do_index_smart_inner(
@@ -862,45 +963,125 @@ async fn do_index_smart_inner(
     let normalized_path = RagClient::normalize_path(&path)?;
 
     // Check if index is dirty (previous indexing was interrupted)
-    // If dirty, we MUST do a full reindex after clearing the corrupted data
-    let cache = client.hash_cache.read().await;
-    let is_dirty = cache.is_dirty(&normalized_path);
-    let has_existing_index = cache.get_root(&normalized_path).is_some();
-    drop(cache);
+    let is_dirty = {
+        let cache = client.hash_cache.read().await;
+        cache.is_dirty(&normalized_path)
+    };
 
-    // Handle dirty index: clear everything and force full reindex
+    // Handle dirty index with validation
+    let mut force_full_reindex = false;
     if is_dirty {
-        tracing::warn!(
-            "Index for '{}' is marked as dirty (previous indexing was interrupted). Clearing corrupted data and performing full reindex.",
+        tracing::info!(
+            "Index for '{}' is marked as dirty. Validating dirty flag...",
             normalized_path
         );
 
-        // Send progress notification about dirty state
-        if let (Some(peer), Some(token)) = (&peer, &progress_token) {
-            let _ = peer
-                .notify_progress(ProgressNotificationParam {
-                    progress_token: token.clone(),
-                    progress: 0.0,
-                    total: Some(100.0),
-                    message: Some("Dirty index detected, clearing corrupted data...".into()),
-                })
-                .await;
-        }
+        // Validate the dirty flag to determine if it's truly corrupted
+        let validation = validate_dirty_flag(client, &normalized_path).await?;
 
-        // Clear any existing embeddings for this path from the vector database
-        // We can't trust partial data, so delete everything for this path
-        if let Err(e) = clear_path_data(client, &normalized_path).await {
-            tracing::error!("Failed to clear corrupted index data for '{}': {}", normalized_path, e);
-            // Continue anyway - the full index will overwrite
-        }
+        match validation {
+            DirtyFlagValidation::TrulyCorrupted { reason } => {
+                tracing::warn!(
+                    "Index for '{}' is truly corrupted: {}. Clearing and performing full reindex.",
+                    normalized_path,
+                    reason
+                );
 
-        // Clear the cache entry for this path (removes from roots and dirty_roots)
-        let mut cache = client.hash_cache.write().await;
-        cache.remove_root(&normalized_path);
-        if let Err(e) = cache.save(&client.cache_path) {
-            tracing::warn!("Failed to save cache after clearing dirty state: {}", e);
+                // Send progress notification about dirty state
+                if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+                    let _ = peer
+                        .notify_progress(ProgressNotificationParam {
+                            progress_token: token.clone(),
+                            progress: 0.0,
+                            total: Some(100.0),
+                            message: Some(format!("Corrupted index detected ({}), clearing...", reason)),
+                        })
+                        .await;
+                }
+
+                // Clear any existing embeddings for this path
+                if let Err(e) = clear_path_data(client, &normalized_path).await {
+                    tracing::error!(
+                        "Failed to clear corrupted index data for '{}': {}",
+                        normalized_path,
+                        e
+                    );
+                }
+
+                // Clear the cache entry
+                let mut cache = client.hash_cache.write().await;
+                cache.remove_root(&normalized_path);
+                if let Err(e) = cache.save(&client.cache_path) {
+                    tracing::warn!("Failed to save cache after clearing dirty state: {}", e);
+                }
+                drop(cache);
+
+                force_full_reindex = true;
+            }
+            DirtyFlagValidation::StaleFlag { age_secs } => {
+                tracing::info!(
+                    "Dirty flag for '{}' is stale (age: {} seconds). Clearing flag and proceeding with incremental update.",
+                    normalized_path,
+                    age_secs
+                );
+
+                // Send progress notification
+                if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+                    let _ = peer
+                        .notify_progress(ProgressNotificationParam {
+                            progress_token: token.clone(),
+                            progress: 0.0,
+                            total: Some(100.0),
+                            message: Some(format!(
+                                "Stale dirty flag detected (age: {}s), clearing...",
+                                age_secs
+                            )),
+                        })
+                        .await;
+                }
+
+                // Just clear the dirty flag, don't remove the cache
+                let mut cache = client.hash_cache.write().await;
+                cache.clear_dirty(&normalized_path);
+                if let Err(e) = cache.save(&client.cache_path) {
+                    tracing::warn!("Failed to save cache after clearing stale dirty flag: {}", e);
+                }
+                drop(cache);
+                // Proceed with incremental update
+            }
+            DirtyFlagValidation::IndexAppearsComplete {
+                cached_files,
+                indexed_files,
+            } => {
+                tracing::info!(
+                    "Index for '{}' appears complete despite dirty flag ({} cached files, {} indexed files). Clearing flag and proceeding with incremental update.",
+                    normalized_path,
+                    cached_files,
+                    indexed_files
+                );
+
+                // Send progress notification
+                if let (Some(peer), Some(token)) = (&peer, &progress_token) {
+                    let _ = peer
+                        .notify_progress(ProgressNotificationParam {
+                            progress_token: token.clone(),
+                            progress: 0.0,
+                            total: Some(100.0),
+                            message: Some("Index appears complete, clearing stale dirty flag...".into()),
+                        })
+                        .await;
+                }
+
+                // Clear the dirty flag
+                let mut cache = client.hash_cache.write().await;
+                cache.clear_dirty(&normalized_path);
+                if let Err(e) = cache.save(&client.cache_path) {
+                    tracing::warn!("Failed to save cache after clearing dirty flag: {}", e);
+                }
+                drop(cache);
+                // Proceed with incremental update
+            }
         }
-        drop(cache);
     }
 
     // Mark the index as dirty BEFORE starting (persisted immediately)
@@ -916,8 +1097,13 @@ async fn do_index_smart_inner(
         tracing::debug!("Marked index as dirty for: {}", normalized_path);
     }
 
+    // Re-check has_existing_index after potential cleanup
+    let cache = client.hash_cache.read().await;
+    let has_existing_index = cache.get_root(&normalized_path).is_some();
+    drop(cache);
+
     // Perform the actual indexing
-    let result = if has_existing_index && !is_dirty {
+    let result = if has_existing_index && !force_full_reindex {
         tracing::info!(
             "Existing index found for '{}' (normalized: '{}'), performing incremental update",
             path,
@@ -937,9 +1123,10 @@ async fn do_index_smart_inner(
         .await
     } else {
         tracing::info!(
-            "No existing index found for '{}' (normalized: '{}'), performing full index",
+            "No existing index found for '{}' (normalized: '{}') or force_full_reindex={}, performing full index",
             path,
-            normalized_path
+            normalized_path,
+            force_full_reindex
         );
         do_index(
             client,
