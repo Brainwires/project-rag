@@ -295,7 +295,7 @@ impl RagClient {
     /// Returns a list of paths that have dirty indexes.
     pub async fn get_dirty_paths(&self) -> Vec<String> {
         let cache = self.hash_cache.read().await;
-        cache.get_dirty_roots().iter().cloned().collect()
+        cache.get_dirty_roots().keys().cloned().collect()
     }
 
     /// Check if searching on a specific path should be blocked due to dirty state

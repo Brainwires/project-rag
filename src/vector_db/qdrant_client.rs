@@ -511,6 +511,63 @@ impl VectorDatabase for QdrantVectorDB {
         // Qdrant persists automatically, no explicit flush needed
         Ok(())
     }
+
+    async fn count_by_root_path(&self, root_path: &str) -> Result<usize> {
+        use qdrant_client::qdrant::CountPointsBuilder;
+
+        let filter = Filter::must([Condition::matches("root_path", root_path.to_string())]);
+
+        let count_result = self
+            .client
+            .count(CountPointsBuilder::new(COLLECTION_NAME).filter(filter))
+            .await
+            .context("Failed to count points by root path")?;
+
+        Ok(count_result.result.map(|r| r.count).unwrap_or(0) as usize)
+    }
+
+    async fn get_indexed_files(&self, root_path: &str) -> Result<Vec<String>> {
+        use qdrant_client::qdrant::ScrollPointsBuilder;
+
+        let filter = Filter::must([Condition::matches("root_path", root_path.to_string())]);
+
+        let mut file_paths = std::collections::HashSet::new();
+        let mut offset: Option<qdrant_client::qdrant::PointId> = None;
+
+        loop {
+            let mut builder = ScrollPointsBuilder::new(COLLECTION_NAME)
+                .filter(filter.clone())
+                .with_payload(true)
+                .limit(1000);
+
+            if let Some(ref point_id) = offset {
+                builder = builder.offset(point_id.clone());
+            }
+
+            let scroll_result = self
+                .client
+                .scroll(builder)
+                .await
+                .context("Failed to scroll points")?;
+
+            if scroll_result.result.is_empty() {
+                break;
+            }
+
+            for point in &scroll_result.result {
+                if let Some(file_path) = point.payload.get("file_path").and_then(|v| v.as_str()) {
+                    file_paths.insert(file_path.to_string());
+                }
+            }
+
+            offset = scroll_result.next_page_offset;
+            if offset.is_none() {
+                break;
+            }
+        }
+
+        Ok(file_paths.into_iter().collect())
+    }
 }
 
 impl Default for QdrantVectorDB {

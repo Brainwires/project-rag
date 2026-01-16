@@ -67,6 +67,14 @@ pub trait VectorDatabase: Send + Sync {
 
     /// Flush/save changes to disk
     async fn flush(&self) -> Result<()>;
+
+    /// Count embeddings for a specific root path
+    /// Used to validate dirty flags - if embeddings exist, the index may be valid
+    async fn count_by_root_path(&self, root_path: &str) -> Result<usize>;
+
+    /// Get unique file paths indexed for a specific root path
+    /// Returns a list of file paths that have embeddings in the database
+    async fn get_indexed_files(&self, root_path: &str) -> Result<Vec<String>>;
 }
 
 #[derive(Debug, Clone)]

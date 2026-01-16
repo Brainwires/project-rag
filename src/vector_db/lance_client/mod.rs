@@ -877,6 +877,58 @@ impl VectorDatabase for LanceVectorDB {
         // LanceDB persists automatically, no explicit flush needed
         Ok(())
     }
+
+    async fn count_by_root_path(&self, root_path: &str) -> Result<usize> {
+        let table = self.get_table().await?;
+
+        // Use SQL-like filter to count rows with matching root_path
+        let filter = format!("root_path = '{}'", root_path);
+        let count = table
+            .count_rows(Some(filter))
+            .await
+            .context("Failed to count rows by root path")?;
+
+        Ok(count)
+    }
+
+    async fn get_indexed_files(&self, root_path: &str) -> Result<Vec<String>> {
+        let table = self.get_table().await?;
+
+        // Query file_path column filtered by root_path
+        let filter = format!("root_path = '{}'", root_path);
+        let stream = table
+            .query()
+            .only_if(filter)
+            .select(lancedb::query::Select::Columns(vec![
+                "file_path".to_string(),
+            ]))
+            .execute()
+            .await
+            .context("Failed to query indexed files")?;
+
+        let results: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .context("Failed to collect file paths")?;
+
+        // Extract unique file paths
+        let mut file_paths = std::collections::HashSet::new();
+
+        for batch in results {
+            let file_path_array = batch
+                .column_by_name("file_path")
+                .context("Missing file_path column")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("Invalid file_path type")?;
+
+            for i in 0..batch.num_rows() {
+                file_paths.insert(file_path_array.value(i).to_string());
+            }
+        }
+
+        Ok(file_paths.into_iter().collect())
+    }
 }
 
 #[cfg(test)]
