@@ -1,6 +1,6 @@
 # Project RAG - MCP Server for Code Understanding
 
-[![Tests](https://img.shields.io/badge/tests-395%20passing-brightgreen)](https://github.com/nightness/project-rag)
+[![Tests](https://img.shields.io/badge/tests-413%20passing-brightgreen)](https://github.com/nightness/project-rag)
 [![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](https://github.com/nightness/project-rag)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange)](https://www.rust-lang.org/)
 
@@ -23,6 +23,7 @@ This MCP server enables AI assistants to efficiently search and understand large
 - **Git History Search**: Search commit history with smart on-demand indexing (default: 10 commits, only indexes deeper as needed)
 - **Multi-Project Support**: Index and query multiple codebases simultaneously with project filtering
 - **Smart Indexing**: Automatically performs full indexing for new codebases or incremental updates for previously indexed ones
+- **Cross-Process Locking**: Filesystem-based locks prevent multiple processes (e.g., multiple Claude Code sessions) from indexing the same codebase simultaneously
 - **Concurrent Access Protection**: Safe lock management prevents index corruption when multiple agents try to index simultaneously
 - **Stable Embedded Database**: LanceDB vector database (default, no external dependencies) with optional Qdrant support
 - **Language Detection**: Automatic detection of 40+ file types (programming languages, documentation formats, and config files)
@@ -509,9 +510,53 @@ RelationsProvider (trait)
 - **Find References**: "Where is this function called from?"
 - **Get Call Graph**: "What functions does this code depend on?"
 
-### Concurrent Access & Lock Safety
+### Cross-Process Locking
 
-The BM25 (Tantivy) index uses file-based locks to prevent concurrent writes. The system includes smart lock management to handle multiple agents safely:
+Project RAG uses a **two-layer locking system** to prevent multiple processes from indexing the same codebase simultaneously:
+
+**Layer 1: Filesystem Locks (Cross-Process)**
+- Uses `flock()` system call for OS-level exclusive locks
+- Lock files stored in `~/.local/share/project-rag/locks/` (or `brainwires/locks/`)
+- Automatically released when process exits (even on crash)
+- Prevents multiple Claude Code sessions from hammering CPU with duplicate indexing
+
+**Layer 2: In-Memory Locks (In-Process)**
+- Broadcast channels allow waiting tasks to receive results
+- Prevents duplicate work within the same process
+
+**How It Works:**
+```
+Process A (Claude Session 1)          Process B (Claude Session 2)
+─────────────────────────────          ─────────────────────────────
+index_codebase("/project")             index_codebase("/project")
+        │                                       │
+        ▼                                       ▼
+Acquire filesystem lock                Try filesystem lock
+        │                                       │
+        ▼                                       ▼
+     ACQUIRED                              BLOCKED (waits)
+        │                                       │
+        ▼                                       │
+Do full indexing...                             │
+        │                                       │
+        ▼                                       │
+Release lock ──────────────────────────────────►│
+                                                ▼
+                                         Lock acquired
+                                                │
+                                                ▼
+                                         Return (index is current)
+```
+
+**Benefits:**
+- No duplicate CPU work across multiple Claude Code sessions
+- No database corruption from concurrent writes
+- Automatic cleanup on process crash (OS releases flock)
+- Waiting process gets immediate response when indexing completes
+
+### BM25 Index Lock Safety
+
+The BM25 (Tantivy) index uses additional file-based locks to prevent concurrent writes:
 
 **Stale Lock Detection:**
 - Lock files are checked for staleness (>5 minutes old)
@@ -555,7 +600,7 @@ The BM25 (Tantivy) index uses file-based locks to prevent concurrent writes. The
 ### Running Tests
 
 ```bash
-# Run all unit tests (395 tests with ~94% coverage)
+# Run all unit tests (413 tests with ~94% coverage)
 cargo test --lib
 
 # Run specific module tests
@@ -657,7 +702,7 @@ RUST_LOG=trace cargo run
 - Language detection (40+ file types: code, docs, configs)
 - PDF to Markdown conversion with table preservation
 - SHA256-based change detection
-- 395 unit tests passing (including relations, PDF extraction, BM25/RRF, adaptive threshold, and lock safety tests)
+- 413 unit tests passing (including relations, PDF extraction, BM25/RRF, adaptive threshold, cross-process locking, and lock safety tests)
 - Comprehensive documentation
 - **Full MCP prompts support enabled**
 - **Hybrid search with Tantivy BM25 + LanceDB vector using RRF**
