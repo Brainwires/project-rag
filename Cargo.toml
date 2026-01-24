@@ -1,6 +1,6 @@
 [package]
 name = "project-rag"
-version = "0.1"
+version = "0.1.0"
 edition = "2024"
 description = "RAG-based codebase indexing and semantic search - dual purpose library and MCP server"
 authors = ["Brainwires"]
