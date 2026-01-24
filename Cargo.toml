@@ -1,8 +1,25 @@
 [package]
 name = "project-rag"
-version = "0.1.0"
+version = "0.1"
 edition = "2024"
 description = "RAG-based codebase indexing and semantic search - dual purpose library and MCP server"
+authors = ["Brainwires"]
+license = "MIT"
+repository = "https://github.com/Brainwires/project-rag"
+homepage = "https://github.com/Brainwires/project-rag"
+documentation = "https://docs.rs/project-rag"
+readme = "README.md"
+rust-version = "1.88"
+keywords = ["mcp", "rag", "embeddings", "semantic-search", "code-analysis"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    ".github/",
+    ".cache/",
+    "docs/adr/",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "TESTING.md",
+]
 
 [dependencies]
 rmcp = { version = "0.8", features = ["server", "transport-io", "macros"] }

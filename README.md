@@ -1,8 +1,10 @@
 # Project RAG - MCP Server for Code Understanding
 
-[![Tests](https://img.shields.io/badge/tests-413%20passing-brightgreen)](https://github.com/nightness/project-rag)
-[![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](https://github.com/nightness/project-rag)
+[![Tests](https://img.shields.io/badge/tests-413%20passing-brightgreen)](https://github.com/Brainwires/project-rag)
+[![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](https://github.com/Brainwires/project-rag)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange)](https://www.rust-lang.org/)
+[![Crates.io](https://img.shields.io/crates/v/project-rag)](https://crates.io/crates/project-rag)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A Rust-based Model Context Protocol (MCP) server that provides AI assistants with powerful RAG (Retrieval-Augmented Generation) capabilities for understanding massive codebases.
 
@@ -172,7 +174,7 @@ The server provides 9 tools that can be used directly:
 
 ## Prerequisites
 
-- **Rust**: 1.83+ with Rust 2024 edition support
+- **Rust**: 1.88+ with Rust 2024 edition support
 - **protobuf-compiler**: Required for building (install via `sudo apt-get install protobuf-compiler` on Ubuntu/Debian)
 
 ### Vector Database Options
@@ -840,7 +842,7 @@ Contributions welcome! Please ensure:
 
 ## Support
 
-- **Issues**: https://github.com/your-repo/project-rag/issues
+- **Issues**: https://github.com/Brainwires/project-rag/issues
 - **Documentation**: See [docs/](docs/) for deployment, troubleshooting, and slash commands
 - **Architecture**: See [docs/adr/](docs/adr/) for architecture decision records
 
