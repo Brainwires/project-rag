@@ -679,15 +679,41 @@ impl RagClient {
         })
     }
 
-    /// Clear all indexed data from the vector database
+    /// Clear all indexed data from the vector database and hash cache
     pub async fn clear_index(&self) -> Result<ClearResponse> {
         match self.vector_db.clear().await {
             Ok(_) => {
+                // Clear hash cache (both roots and dirty_roots)
                 let mut cache = self.hash_cache.write().await;
                 cache.roots.clear();
+                cache.dirty_roots.clear();
 
+                // Delete cache file directly for robustness (in case save fails)
+                if self.cache_path.exists() {
+                    if let Err(e) = std::fs::remove_file(&self.cache_path) {
+                        tracing::warn!("Failed to delete hash cache file: {}", e);
+                    } else {
+                        tracing::info!("Deleted hash cache file: {:?}", self.cache_path);
+                    }
+                }
+
+                // Save empty cache (recreates the file with empty state)
                 if let Err(e) = cache.save(&self.cache_path) {
                     tracing::warn!("Failed to save cleared cache: {}", e);
+                }
+
+                // Also clear git cache
+                let mut git_cache = self.git_cache.write().await;
+                git_cache.repos.clear();
+                if self.git_cache_path.exists() {
+                    if let Err(e) = std::fs::remove_file(&self.git_cache_path) {
+                        tracing::warn!("Failed to delete git cache file: {}", e);
+                    } else {
+                        tracing::info!("Deleted git cache file: {:?}", self.git_cache_path);
+                    }
+                }
+                if let Err(e) = git_cache.save(&self.git_cache_path) {
+                    tracing::warn!("Failed to save cleared git cache: {}", e);
                 }
 
                 if let Err(e) = self
