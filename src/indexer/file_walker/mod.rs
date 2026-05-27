@@ -4,6 +4,7 @@ use super::file_info::FileInfo;
 use super::language::detect_language;
 use super::pdf_extractor::extract_pdf_to_markdown;
 use anyhow::{Context, Result};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -17,8 +18,35 @@ pub struct FileWalker {
     pub(crate) max_file_size: usize,
     pub(crate) include_patterns: Vec<String>,
     pub(crate) exclude_patterns: Vec<String>,
+    /// Compiled glob sets, built once from the pattern strings.
+    include_set: Option<GlobSet>,
+    exclude_set: Option<GlobSet>,
     /// Optional cancellation flag - if set to true, walk() will exit early
     cancelled: Option<Arc<AtomicBool>>,
+}
+
+/// Compile a list of glob patterns into a GlobSet. Patterns that fail to compile are
+/// skipped with a warning rather than aborting the whole walk. Returns None when empty.
+fn build_glob_set(patterns: &[String]) -> Option<GlobSet> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        match Glob::new(pattern) {
+            Ok(glob) => {
+                builder.add(glob);
+            }
+            Err(e) => tracing::warn!("Ignoring invalid glob pattern '{}': {}", pattern, e),
+        }
+    }
+    match builder.build() {
+        Ok(set) => Some(set),
+        Err(e) => {
+            tracing::warn!("Failed to build glob set: {}", e);
+            None
+        }
+    }
 }
 
 impl FileWalker {
@@ -29,6 +57,8 @@ impl FileWalker {
             max_file_size,
             include_patterns: vec![],
             exclude_patterns: vec![],
+            include_set: None,
+            exclude_set: None,
             cancelled: None,
         }
     }
@@ -57,6 +87,8 @@ impl FileWalker {
         include_patterns: Vec<String>,
         exclude_patterns: Vec<String>,
     ) -> Self {
+        self.include_set = build_glob_set(&include_patterns);
+        self.exclude_set = build_glob_set(&exclude_patterns);
         self.include_patterns = include_patterns;
         self.exclude_patterns = exclude_patterns;
         self
@@ -195,26 +227,23 @@ impl FileWalker {
         Ok((non_printable as f64 / content.len() as f64) < 0.3)
     }
 
-    /// Check if file matches include/exclude patterns
+    /// Check if a file matches the include/exclude glob patterns.
+    ///
+    /// Globs are matched against the path relative to the walk root, so patterns like
+    /// `**/vendor/**` or `src/**/*.rs` behave as expected regardless of where the root sits.
     pub(crate) fn matches_patterns(&self, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
+        let rel = path.strip_prefix(&self.root).unwrap_or(path);
 
-        // If include patterns are specified, file must match at least one
-        if !self.include_patterns.is_empty() {
-            let matches_include = self
-                .include_patterns
-                .iter()
-                .any(|pattern| path_str.contains(pattern));
-            if !matches_include {
-                return false;
-            }
+        // If include patterns are specified, file must match at least one.
+        if let Some(include_set) = &self.include_set
+            && !include_set.is_match(rel)
+        {
+            return false;
         }
 
-        // File must not match any exclude pattern
-        if self
-            .exclude_patterns
-            .iter()
-            .any(|pattern| path_str.contains(pattern))
+        // File must not match any exclude pattern.
+        if let Some(exclude_set) = &self.exclude_set
+            && exclude_set.is_match(rel)
         {
             return false;
         }
