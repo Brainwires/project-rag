@@ -271,6 +271,68 @@ mod tests {
         assert_eq!(hit.end_line, 110);
     }
 
+    /// Git commits all share `file_path = git://<repo>` and `start_line = 0`, so a fusion
+    /// key of path+line alone collapses an entire history onto one id and the BM25 index
+    /// holds a single document for it. `file_hash` (the commit hash) is what separates
+    /// them. Guards that chunks differing ONLY by file_hash stay individually retrievable.
+    #[tokio::test]
+    async fn test_commit_chunks_are_not_collapsed_by_shared_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("lancedb")
+            .to_string_lossy()
+            .to_string();
+        let db = LanceVectorDB::with_path(&db_path).await.unwrap();
+        db.initialize(384).await.unwrap();
+
+        let commit_meta = |hash: &str| {
+            let mut m = create_test_metadata("git://repo", 0, 0);
+            m.file_hash = hash.to_string();
+            m.language = Some("git-commit".to_string());
+            m
+        };
+
+        db.store_embeddings(
+            vec![vec![0.5; 384], vec![0.5; 384]],
+            vec![commit_meta("aaaa1111"), commit_meta("bbbb2222")],
+            vec![
+                "Commit Message:\nfix the alpha subsystem".to_string(),
+                "Commit Message:\nrewrite zzzuniquecommit handling".to_string(),
+            ],
+            "/test/repo",
+        )
+        .await
+        .unwrap();
+
+        let results = db
+            .search(
+                vec![0.5; 384],
+                "zzzuniquecommit",
+                10,
+                0.0,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results.len(),
+            2,
+            "both commits must remain distinct rows, not one collapsed id"
+        );
+        let matched = results
+            .iter()
+            .find(|r| r.content.contains("zzzuniquecommit"))
+            .expect("the commit matching the query text must be retrievable");
+        assert!(
+            matched.keyword_score.is_some(),
+            "commit chunks must participate in keyword fusion"
+        );
+    }
+
     #[tokio::test]
     async fn test_search_with_min_score() {
         let temp_dir = TempDir::new().unwrap();

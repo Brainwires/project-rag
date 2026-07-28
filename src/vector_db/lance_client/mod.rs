@@ -130,8 +130,14 @@ impl LanceVectorDB {
     /// The chunk's stable identity, and the fusion key shared by the vector table's `id`
     /// column and the BM25 index. Both arms MUST derive it here; deriving it in two places
     /// is how they silently drifted apart and killed hybrid search.
+    ///
+    /// `file_hash` is part of the key because git commits are stored as chunks whose
+    /// file_path is `git://<repo>` and whose start_line is 0 -- identical for EVERY commit
+    /// in a repository. Keyed on path and line alone they would all collapse onto one id
+    /// and the BM25 index would hold a single document for the entire history. For code
+    /// chunks the hash is constant within a file, so start_line still provides uniqueness.
     fn chunk_id(meta: &ChunkMetadata) -> String {
-        format!("{}:{}", meta.file_path, meta.start_line)
+        format!("{}:{}:{}", meta.file_path, meta.start_line, meta.file_hash)
     }
 
     /// Create schema for the embeddings table
@@ -787,8 +793,23 @@ impl VectorDatabase for LanceVectorDB {
         languages: Vec<String>,
         path_patterns: Vec<String>,
     ) -> Result<Vec<SearchResult>> {
-        // Get more results than requested to account for filtering
-        let search_limit = limit * 3;
+        // These filters are applied AFTER the search, so the candidate pool has to be big
+        // enough that the surviving rows can actually fill `limit`. With the old `limit * 3`
+        // this silently returned nothing whenever the wanted rows were a small minority of
+        // the corpus -- search_git_history is exactly that shape: a few hundred commits
+        // sharing a table with tens of thousands of code chunks, so no commit ever reached
+        // the top-N and the language filter then emptied the list every time.
+        //
+        // The proper fix is predicate pushdown into the LanceDB query; until then, widen
+        // the pool when a filter is actually present. The keyword arm helps here too now
+        // that fusion works: a commit whose message contains the query terms is surfaced by
+        // BM25 directly rather than having to win on vector distance.
+        let filtered = !file_extensions.is_empty() || !languages.is_empty() || !path_patterns.is_empty();
+        let search_limit = if filtered {
+            (limit * 20).max(200)
+        } else {
+            limit * 3
+        };
 
         // Do basic search with hybrid support
         let mut results = self

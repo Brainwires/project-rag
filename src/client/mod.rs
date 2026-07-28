@@ -810,6 +810,126 @@ impl RagClient {
     /// # Returns
     ///
     /// A response containing the definition if found, along with precision info
+    /// The identifier token sitting at a 1-based `line` / 0-based `column`.
+    ///
+    /// Symbol resolution used to work purely by range containment: take the first
+    /// definition whose start..end spans the line. On a call site that is always the
+    /// ENCLOSING function, so asking about `SendNotification2(...)` inside
+    /// `ProcessDeviceNotifyCache` resolved to `ProcessDeviceNotifyCache`. Reading the
+    /// actual token under the cursor is what the caller meant by "the symbol here".
+    fn identifier_at(content: &str, line: usize, column: usize) -> Option<String> {
+        let text = content.lines().nth(line.checked_sub(1)?)?;
+        let bytes = text.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+        if bytes.is_empty() {
+            return None;
+        }
+        // Clamp into the line; a column past the end just anchors at the last character.
+        let mut idx = column.min(bytes.len() - 1);
+        // A cursor resting just after a token (or on its opening delimiter) should still
+        // resolve that token.
+        if !is_ident(bytes[idx]) && idx > 0 && is_ident(bytes[idx - 1]) {
+            idx -= 1;
+        }
+        if !is_ident(bytes[idx]) {
+            return None;
+        }
+
+        let mut start = idx;
+        while start > 0 && is_ident(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = idx;
+        while end + 1 < bytes.len() && is_ident(bytes[end + 1]) {
+            end += 1;
+        }
+        Some(text[start..=end].to_string())
+    }
+
+    /// Resolve which definition a cursor position refers to.
+    ///
+    /// Preference order:
+    ///   1. the identifier under the cursor, if it names a definition in this file
+    ///   2. the INNERMOST definition whose range contains the line
+    ///
+    /// Step 2 used to be "the first definition that contains the line", which picked
+    /// whichever happened to be earliest in extraction order -- normally the enclosing
+    /// class or function rather than the nested one being asked about.
+    fn resolve_symbol_at<'a>(
+        definitions: &'a [crate::relations::Definition],
+        content: &str,
+        line: usize,
+        column: usize,
+        callable_only: bool,
+    ) -> Option<&'a crate::relations::Definition> {
+        let is_candidate = |def: &crate::relations::Definition| {
+            !callable_only
+                || matches!(
+                    def.symbol_id.kind,
+                    crate::relations::SymbolKind::Function | crate::relations::SymbolKind::Method
+                )
+        };
+
+        if let Some(name) = Self::identifier_at(content, line, column) {
+            let exact = definitions
+                .iter()
+                .filter(|d| d.symbol_id.name == name && is_candidate(d))
+                .min_by_key(|d| d.end_line.saturating_sub(d.symbol_id.start_line));
+            if exact.is_some() {
+                return exact;
+            }
+        }
+
+        definitions
+            .iter()
+            .filter(|d| {
+                is_candidate(d) && line >= d.symbol_id.start_line && line <= d.end_line
+            })
+            .min_by_key(|d| d.end_line.saturating_sub(d.symbol_id.start_line))
+    }
+
+    /// Files that plausibly mention `symbol`, newest-ranked first.
+    ///
+    /// References live wherever the identifier appears, which is generally NOT the file
+    /// that defines it -- the previous implementation only ever scanned the definition's
+    /// own file, so any cross-file reference was invisible. Rather than parse the whole
+    /// corpus, shortlist with keyword search: a reference must contain the literal token,
+    /// so BM25 surfaces exactly the right files and tree-sitter only runs on those.
+    async fn files_mentioning(
+        &self,
+        symbol: &str,
+        project: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        let embedding = self
+            .embedding_provider
+            .embed_batch(vec![symbol.to_string()])
+            .context("Failed to embed symbol name")?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No embedding generated for symbol"))?;
+
+        let results = self
+            .vector_db
+            .search(embedding, symbol, limit, 0.0, project, None, true)
+            .await
+            .context("Failed to search for candidate files")?;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut files = Vec::new();
+        for r in results {
+            let full = match &r.root_path {
+                Some(root) => std::path::Path::new(root).join(&r.file_path),
+                None => std::path::PathBuf::from(&r.file_path),
+            };
+            if seen.insert(full.clone()) {
+                files.push(full);
+            }
+        }
+        Ok(files)
+    }
+
     pub async fn find_definition(&self, request: FindDefinitionRequest) -> Result<FindDefinitionResponse> {
         let start = Instant::now();
 
@@ -830,13 +950,14 @@ impl RagClient {
             .context("Failed to extract definitions")?;
 
         // Find the definition at the requested position
-        let definition = definitions.into_iter().find(|def| {
-            request.line >= def.symbol_id.start_line
-                && request.line <= def.end_line
-                && (request.column == 0 || request.column >= def.symbol_id.start_col)
-        });
-
-        let result = definition.map(|def| DefinitionResult::from(&def));
+        let result = Self::resolve_symbol_at(
+            &definitions,
+            &file_info.content,
+            request.line,
+            request.column,
+            false,
+        )
+        .map(DefinitionResult::from);
 
         Ok(FindDefinitionResponse {
             definition: result,
@@ -877,11 +998,13 @@ impl RagClient {
             .context("Failed to extract definitions")?;
 
         // Find the symbol at the requested position
-        let target_symbol = definitions.iter().find(|def| {
-            request.line >= def.symbol_id.start_line
-                && request.line <= def.end_line
-                && (request.column == 0 || request.column >= def.symbol_id.start_col)
-        });
+        let target_symbol = Self::resolve_symbol_at(
+            &definitions,
+            &file_info.content,
+            request.line,
+            request.column,
+            false,
+        );
 
         let symbol_name = target_symbol.map(|def| def.symbol_id.name.clone());
 
@@ -898,32 +1021,74 @@ impl RagClient {
 
         let symbol_name_str = symbol_name.clone().unwrap();
 
-        // Build symbol index from definitions
+        // Index ONLY the target symbol. ReferenceFinder matches identifiers against this
+        // map, so restricting it keeps the scan of other files cheap and on-topic.
+        let target_defs: Vec<crate::relations::Definition> = definitions
+            .iter()
+            .filter(|d| d.symbol_id.name == symbol_name_str)
+            .cloned()
+            .collect();
         let mut symbol_index: std::collections::HashMap<String, Vec<crate::relations::Definition>> =
             std::collections::HashMap::new();
-        for def in definitions {
-            symbol_index
-                .entry(def.symbol_id.name.clone())
-                .or_default()
-                .push(def);
+        if !target_defs.is_empty() {
+            symbol_index.insert(symbol_name_str.clone(), target_defs);
         }
 
-        // Find references in the same file
-        let references = self
-            .relations_provider
-            .extract_references(&file_info, &symbol_index)
-            .context("Failed to extract references")?;
+        // Scan the defining file plus every other file the index says mentions the symbol.
+        // Searching only the defining file is why this returned nothing for anything called
+        // from elsewhere, which is the normal case for a public API.
+        let mut scan_targets: Vec<std::path::PathBuf> = vec![file_info.path.clone()];
+        match self
+            .files_mentioning(&symbol_name_str, request.project.clone(), request.limit.max(20))
+            .await
+        {
+            Ok(found) => {
+                for f in found {
+                    if !scan_targets.iter().any(|p| p == &f) {
+                        scan_targets.push(f);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("Candidate lookup failed, scanning defining file only: {}", e),
+        }
 
-        // Filter to references matching our target symbol
-        let matching_refs: Vec<ReferenceResult> = references
-            .iter()
-            .filter(|r| {
-                // Check if this reference points to our target symbol
-                r.target_symbol_id.contains(&symbol_name_str)
-            })
-            .take(request.limit)
-            .map(|r| ReferenceResult::from(r))
-            .collect();
+        let mut matching_refs: Vec<ReferenceResult> = Vec::new();
+        for target in &scan_targets {
+            if matching_refs.len() >= request.limit {
+                break;
+            }
+            let scan_info = if target == &file_info.path {
+                file_info.clone()
+            } else {
+                match self.create_file_info(&target.to_string_lossy(), request.project.clone()) {
+                    Ok(fi) => fi,
+                    Err(e) => {
+                        tracing::debug!("Skipping unreadable candidate {:?}: {}", target, e);
+                        continue;
+                    }
+                }
+            };
+
+            let references = match self
+                .relations_provider
+                .extract_references(&scan_info, &symbol_index)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!("Reference extraction failed for {:?}: {}", target, e);
+                    continue;
+                }
+            };
+
+            for r in references.iter() {
+                if matching_refs.len() >= request.limit {
+                    break;
+                }
+                if r.target_symbol_id.contains(&symbol_name_str) {
+                    matching_refs.push(ReferenceResult::from(r));
+                }
+            }
+        }
 
         let total_count = matching_refs.len();
 
@@ -968,15 +1133,13 @@ impl RagClient {
             .context("Failed to extract definitions")?;
 
         // Find the function at the requested position
-        let target_function = definitions.iter().find(|def| {
-            // Only consider functions/methods
-            matches!(
-                def.symbol_id.kind,
-                crate::relations::SymbolKind::Function | crate::relations::SymbolKind::Method
-            ) && request.line >= def.symbol_id.start_line
-                && request.line <= def.end_line
-                && (request.column == 0 || request.column >= def.symbol_id.start_col)
-        });
+        let target_function = Self::resolve_symbol_at(
+            &definitions,
+            &file_info.content,
+            request.line,
+            request.column,
+            true,
+        );
 
         // If no function found at position, return empty result
         let root_symbol = match target_function {
@@ -1011,39 +1174,107 @@ impl RagClient {
                 .push(def.clone());
         }
 
-        // Find references in the same file to identify callers
+        // References in this file, used for the callee side.
         let references = self
             .relations_provider
             .extract_references(&file_info, &symbol_index)
             .context("Failed to extract references")?;
 
-        // Find callers (references with Call kind pointing to our function)
+        // Callers can live anywhere, so scan the defining file plus every file the index
+        // says mentions the function. Restricting this to the defining file is why the
+        // caller list came back empty for anything with an external call site.
+        let caller_index: std::collections::HashMap<String, Vec<crate::relations::Definition>> =
+            std::collections::HashMap::from([(
+                function_name.clone(),
+                definitions
+                    .iter()
+                    .filter(|d| d.symbol_id.name == function_name)
+                    .cloned()
+                    .collect(),
+            )]);
+
+        let mut scan_targets: Vec<std::path::PathBuf> = vec![file_info.path.clone()];
+        match self
+            .files_mentioning(&function_name, request.project.clone(), 20)
+            .await
+        {
+            Ok(found) => {
+                for f in found {
+                    if !scan_targets.iter().any(|p| p == &f) {
+                        scan_targets.push(f);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("Candidate lookup failed, scanning defining file only: {}", e),
+        }
+
         let mut seen_callers = std::collections::HashSet::new();
-        let callers: Vec<crate::relations::CallGraphNode> = references
-            .iter()
-            .filter(|r| {
+        let mut callers: Vec<crate::relations::CallGraphNode> = Vec::new();
+
+        for target in &scan_targets {
+            let (scan_info, scan_defs) = if target == &file_info.path {
+                (file_info.clone(), definitions.clone())
+            } else {
+                match self.create_file_info(&target.to_string_lossy(), request.project.clone()) {
+                    Ok(fi) => {
+                        let defs = self
+                            .relations_provider
+                            .extract_definitions(&fi)
+                            .unwrap_or_default();
+                        (fi, defs)
+                    }
+                    Err(e) => {
+                        tracing::debug!("Skipping unreadable candidate {:?}: {}", target, e);
+                        continue;
+                    }
+                }
+            };
+
+            let refs = match self
+                .relations_provider
+                .extract_references(&scan_info, &caller_index)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!("Reference extraction failed for {:?}: {}", target, e);
+                    continue;
+                }
+            };
+
+            for r in refs.iter().filter(|r| {
                 r.reference_kind == crate::relations::ReferenceKind::Call
                     && r.target_symbol_id.contains(&function_name)
-            })
-            .filter_map(|r| {
-                // Try to find which function contains this call
-                definitions.iter().find(|def| {
-                    matches!(
-                        def.symbol_id.kind,
-                        crate::relations::SymbolKind::Function | crate::relations::SymbolKind::Method
-                    ) && r.start_line >= def.symbol_id.start_line
-                        && r.start_line <= def.end_line
-                })
-            })
-            .filter(|def| seen_callers.insert(def.symbol_id.name.clone()))
-            .map(|def| crate::relations::CallGraphNode {
-                name: def.symbol_id.name.clone(),
-                kind: def.symbol_id.kind.clone(),
-                file_path: request.file_path.clone(),
-                line: def.symbol_id.start_line,
-                children: Vec::new(),
-            })
-            .collect();
+            }) {
+                // Attribute the call to the innermost function containing it, in the file
+                // the call was actually found in.
+                let enclosing = scan_defs
+                    .iter()
+                    .filter(|def| {
+                        matches!(
+                            def.symbol_id.kind,
+                            crate::relations::SymbolKind::Function
+                                | crate::relations::SymbolKind::Method
+                        ) && r.start_line >= def.symbol_id.start_line
+                            && r.start_line <= def.end_line
+                    })
+                    .min_by_key(|def| def.end_line.saturating_sub(def.symbol_id.start_line));
+
+                if let Some(def) = enclosing
+                    && seen_callers.insert((
+                        scan_info.relative_path.clone(),
+                        def.symbol_id.name.clone(),
+                    ))
+                {
+                    callers.push(crate::relations::CallGraphNode {
+                        name: def.symbol_id.name.clone(),
+                        kind: def.symbol_id.kind.clone(),
+                        file_path: scan_info.relative_path.clone(),
+                        line: def.symbol_id.start_line,
+                        children: Vec::new(),
+                    });
+                }
+            }
+        }
 
         // Find callees (calls made from within our function)
         let target_func = target_function.unwrap();
