@@ -10,7 +10,7 @@ use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument, doc};
 /// BM25-based keyword search using Tantivy
 pub struct BM25Search {
     index: Index,
-    id_field: Field,
+    chunk_id_field: Field,
     content_field: Field,
     file_path_field: Field,
     /// Path to the index directory (needed for lock cleanup)
@@ -20,9 +20,13 @@ pub struct BM25Search {
 }
 
 /// Search result from BM25
+///
+/// `chunk_id` is the chunk's stable `file_path:start_line` identifier -- the same value
+/// stored in the vector table's `id` column. Both retrieval arms must key on it, or
+/// Reciprocal Rank Fusion silently fuses nothing. See the note on `add_documents`.
 #[derive(Debug, Clone)]
 pub struct BM25Result {
-    pub id: u64,
+    pub chunk_id: String,
     pub score: f32,
 }
 
@@ -31,26 +35,58 @@ impl BM25Search {
     pub fn new<P: AsRef<Path>>(index_path: P) -> Result<Self> {
         let index_path = index_path.as_ref().to_path_buf();
 
-        // Create schema with ID, content, and file_path fields
-        let mut schema_builder = Schema::builder();
-        let id_field = schema_builder.add_u64_field("id", STORED | INDEXED);
-        let content_field = schema_builder.add_text_field("content", TEXT);
-        let file_path_field = schema_builder.add_text_field("file_path", STRING | STORED);
-        let schema = schema_builder.build();
+        // Schema keyed by the chunk's stable `file_path:start_line` id.
+        let build_schema = || {
+            let mut b = Schema::builder();
+            b.add_text_field("chunk_id", STRING | STORED);
+            b.add_text_field("content", TEXT);
+            b.add_text_field("file_path", STRING | STORED);
+            b.build()
+        };
 
         // Create or open index
         std::fs::create_dir_all(&index_path).context("Failed to create BM25 index directory")?;
 
-        let index = if index_path.join("meta.json").exists() {
+        let mut index = if index_path.join("meta.json").exists() {
             Index::open_in_dir(&index_path).context("Failed to open existing BM25 index")?
         } else {
-            Index::create_in_dir(&index_path, schema.clone())
+            Index::create_in_dir(&index_path, build_schema())
                 .context("Failed to create BM25 index")?
         };
 
+        // Older builds keyed documents by a u64 `id` holding a table row number. Field
+        // handles are positional, so opening one of those directories with the new schema
+        // would read a u64 field as text and corrupt every lookup. Detect and rebuild --
+        // the BM25 index is a derived artifact, so throwing it away costs only a re-index.
+        if index.schema().get_field("chunk_id").is_err() {
+            tracing::warn!(
+                "BM25 index at {:?} predates chunk_id keying; rebuilding it",
+                index_path
+            );
+            drop(index);
+            std::fs::remove_dir_all(&index_path)
+                .context("Failed to remove stale BM25 index directory")?;
+            std::fs::create_dir_all(&index_path)
+                .context("Failed to recreate BM25 index directory")?;
+            index = Index::create_in_dir(&index_path, build_schema())
+                .context("Failed to recreate BM25 index")?;
+        }
+
+        // Take handles from the schema actually on disk, never from a locally built one.
+        let schema = index.schema();
+        let chunk_id_field = schema
+            .get_field("chunk_id")
+            .context("BM25 schema is missing the chunk_id field")?;
+        let content_field = schema
+            .get_field("content")
+            .context("BM25 schema is missing the content field")?;
+        let file_path_field = schema
+            .get_field("file_path")
+            .context("BM25 schema is missing the file_path field")?;
+
         Ok(Self {
             index,
-            id_field,
+            chunk_id_field,
             content_field,
             file_path_field,
             index_path,
@@ -111,8 +147,14 @@ impl BM25Search {
     /// Add documents to the index
     ///
     /// Arguments:
-    /// * `documents` - Vec of (id, content, file_path) tuples
-    pub fn add_documents(&self, documents: Vec<(u64, String, String)>) -> Result<()> {
+    /// * `documents` - Vec of (chunk_id, content, file_path) tuples
+    ///
+    /// `chunk_id` MUST be the same `file_path:start_line` value stored in the vector
+    /// table's `id` column. It used to be a `count_rows()`-derived row number, which
+    /// matched the vector arm's batch-relative index only for the first insert into a
+    /// fresh table -- which is exactly the shape the unit tests create, so the mismatch
+    /// never showed up there while fusion was dead in every real index.
+    pub fn add_documents(&self, documents: Vec<(String, String, String)>) -> Result<()> {
         // Lock to ensure only one writer at a time (within this process)
         let _guard = self
             .writer_lock
@@ -161,9 +203,9 @@ impl BM25Search {
             }
         };
 
-        for (id, content, file_path) in documents {
+        for (chunk_id, content, file_path) in documents {
             let doc = doc!(
-                self.id_field => id,
+                self.chunk_id_field => chunk_id,
                 self.content_field => content,
                 self.file_path_field => file_path,
             );
@@ -206,18 +248,22 @@ impl BM25Search {
                 .doc(doc_address)
                 .context("Failed to retrieve document")?;
 
-            if let Some(id_value) = retrieved_doc.get_first(self.id_field)
-                && let Some(id) = id_value.as_u64()
+            if let Some(id_value) = retrieved_doc.get_first(self.chunk_id_field)
+                && let Some(chunk_id) = id_value.as_str()
             {
-                results.push(BM25Result { id, score });
+                results.push(BM25Result {
+                    chunk_id: chunk_id.to_string(),
+                    score,
+                });
             }
         }
 
         Ok(results)
     }
 
-    /// Delete all documents for a specific ID
-    pub fn delete_by_id(&self, id: u64) -> Result<()> {
+    /// Delete all documents for a specific chunk ID
+    #[allow(dead_code)]
+    pub fn delete_by_chunk_id(&self, chunk_id: &str) -> Result<()> {
         // Lock to ensure only one writer at a time
         let _guard = self
             .writer_lock
@@ -229,7 +275,7 @@ impl BM25Search {
             .writer(50_000_000)
             .context("Failed to create index writer")?;
 
-        let term = Term::from_field_u64(self.id_field, id);
+        let term = Term::from_field_text(self.chunk_id_field, chunk_id);
         index_writer.delete_term(term);
 
         index_writer.commit().context("Failed to commit deletion")?;
@@ -318,12 +364,15 @@ pub const RRF_K_CONSTANT: f32 = 60.0;
 /// This is a convenience wrapper around `reciprocal_rank_fusion_generic` for the common case
 /// of combining vector search results (u64 IDs) with BM25 results.
 pub fn reciprocal_rank_fusion(
-    vector_results: Vec<(u64, f32)>,
+    vector_results: Vec<(String, f32)>,
     bm25_results: Vec<BM25Result>,
     k: usize,
-) -> Vec<(u64, f32)> {
+) -> Vec<(String, f32)> {
     // Convert BM25 results to the same format as vector results
-    let bm25_tuples: Vec<(u64, f32)> = bm25_results.into_iter().map(|r| (r.id, r.score)).collect();
+    let bm25_tuples: Vec<(String, f32)> = bm25_results
+        .into_iter()
+        .map(|r| (r.chunk_id, r.score))
+        .collect();
 
     // Use the generic implementation
     reciprocal_rank_fusion_generic([vector_results, bm25_tuples], k)
