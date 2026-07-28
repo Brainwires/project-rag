@@ -24,8 +24,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing.
+    // Must write to stderr: stdout carries the JSON-RPC stream in stdio MCP mode,
+    // and log lines interleaved there corrupt it.
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
 
     // Parse CLI arguments
     let cli = Cli::parse();
