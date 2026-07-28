@@ -193,6 +193,84 @@ mod tests {
         assert!(results[0].keyword_score.is_some());
     }
 
+    /// Regression: hybrid search across MORE THAN ONE insert batch.
+    ///
+    /// `test_search_hybrid` above stores a single batch into a fresh table, and that is
+    /// precisely why it never caught the bug this test exists for. The BM25 arm used to key
+    /// documents by `count_rows() + i` (a table row number) while the vector arm keyed by
+    /// position within the query's result batches. For the FIRST insert into an empty table
+    /// both are 0..n, so fusion appeared to work; from the second insert onward the two key
+    /// spaces diverged and RRF fused nothing -- every score collapsed to 1/(60+rank),
+    /// keyword_score was never populated, and keyword-only hits were dropped entirely.
+    ///
+    /// Both arms now key on the chunk's stable `file_path:start_line`.
+    #[tokio::test]
+    async fn test_search_hybrid_across_multiple_batches() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("lancedb")
+            .to_string_lossy()
+            .to_string();
+        let db = LanceVectorDB::with_path(&db_path).await.unwrap();
+        db.initialize(384).await.unwrap();
+
+        // The keyword target goes in FIRST, so under the old scheme it held row id 0 -- but
+        // its vector is deliberately far from the query, so the vector arm ranks it LAST.
+        // That is what breaks the accidental agreement: insertion order and distance order
+        // must differ, or row ids and batch positions coincide and the bug hides.
+        db.store_embeddings(
+            vec![vec![0.9; 384]],
+            vec![create_test_metadata("target.rs", 100, 110)],
+            vec!["fn zzzuniquesymbol() { /* distinctive */ }".to_string()],
+            "/test/root",
+        )
+        .await
+        .unwrap();
+
+        // Two rows close to the query vector, inserted second. The vector arm returns these
+        // at positions 0 and 1, so the old code fused BM25's id 0 (target.rs) with whatever
+        // sat at position 0 -- a different document entirely.
+        db.store_embeddings(
+            vec![vec![0.1; 384], vec![0.1; 384]],
+            vec![
+                create_test_metadata("near1.rs", 1, 10),
+                create_test_metadata("near2.rs", 20, 30),
+            ],
+            vec!["fn alpha() {}".to_string(), "fn beta() {}".to_string()],
+            "/test/root",
+        )
+        .await
+        .unwrap();
+
+        // Query text matches ONLY target.rs; query vector is closest to the near*.rs rows.
+        let results = db
+            .search(
+                vec![0.1; 384],
+                "zzzuniquesymbol",
+                10,
+                0.0,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let hit = results
+            .iter()
+            .find(|r| r.file_path == "target.rs")
+            .expect("keyword hit must survive fusion and be materialised as the RIGHT row");
+
+        assert!(
+            hit.keyword_score.is_some(),
+            "keyword_score must be populated for a BM25 match; None means the two arms \
+             keyed on different id spaces again"
+        );
+        assert_eq!(hit.start_line, 100);
+        assert_eq!(hit.end_line, 110);
+    }
+
     #[tokio::test]
     async fn test_search_with_min_score() {
         let temp_dir = TempDir::new().unwrap();
