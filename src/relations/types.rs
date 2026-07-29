@@ -324,6 +324,22 @@ pub struct Definition {
 }
 
 impl Definition {
+    /// Extract the symbol name from an id produced by [`Definition::to_storage_id`].
+    ///
+    /// The layout is `def:<file_path>:<name>:<line>` -- note this differs from
+    /// [`SymbolId::to_storage_id`], which is `<file>:<name>:<line>:<col>`. Reaching for
+    /// the wrong one is what kept get_call_graph callees permanently empty.
+    ///
+    /// Fields are taken from the RIGHT because `file_path` may itself contain a colon
+    /// (a Windows drive letter).
+    pub fn name_from_storage_id(id: &str) -> Option<&str> {
+        let rest = id.strip_prefix("def:")?;
+        let mut parts = rest.rsplitn(3, ':');
+        let _line = parts.next()?;
+        let name = parts.next()?;
+        if name.is_empty() { None } else { Some(name) }
+    }
+
     /// Generate a unique storage ID for this definition
     pub fn to_storage_id(&self) -> String {
         format!(

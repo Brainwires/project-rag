@@ -275,6 +275,25 @@ impl RagMcpServer {
 
         serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
     }
+
+    #[tool(
+        description = "List every symbol defined in one file (name, kind, line span, signature) with no file content. Use this to enumerate a file: query_codebase and search_by_filters are relevance-ranked with a limit and cannot enumerate, while find_definition and find_references need a position you already have."
+    )]
+    async fn list_symbols(
+        &self,
+        Parameters(req): Parameters<ListSymbolsRequest>,
+    ) -> Result<String, String> {
+        // Validate request inputs
+        req.validate()?;
+
+        let response = self
+            .client
+            .list_symbols(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
 }
 
 // Prompts for slash commands

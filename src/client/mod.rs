@@ -1101,6 +1101,58 @@ impl RagClient {
         })
     }
 
+    /// Control-flow and cast keywords that are followed by a parenthesis but are not
+    /// calls. Without this, `if (` is reported as a callee whenever some file happens
+    /// to carry a bogus definition of that name.
+    fn is_call_like_keyword(name: &str) -> bool {
+        matches!(
+            name,
+            "if" | "for" | "while" | "switch" | "catch" | "return" | "sizeof"
+                | "do" | "else" | "new" | "delete" | "throw" | "defined"
+                | "static_cast" | "dynamic_cast" | "reinterpret_cast" | "const_cast"
+        )
+    }
+    /// Identifiers that appear immediately before an opening parenthesis inside the
+    /// given 1-based line span -- that is, plausible call sites.
+    ///
+    /// Used to widen the callee symbol index beyond the defining file. Deliberately
+    /// crude: over-reporting costs one extra lookup, under-reporting loses a callee.
+    fn call_identifiers_in_span(content: &str, start_line: usize, end_line: usize) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (idx, line) in content.lines().enumerate() {
+            let n = idx + 1;
+            if n < start_line || n > end_line {
+                continue;
+            }
+            let bytes = line.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+                    let start = i;
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                        i += 1;
+                    }
+                    let mut j = i;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < bytes.len() && bytes[j] == b'(' {
+                        let name = &line[start..i];
+                        if name.len() > 1
+                            && !Self::is_call_like_keyword(name)
+                            && seen.insert(name.to_string())
+                        {
+                            out.push(name.to_string());
+                        }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
     /// Get the call graph for a function at a given file location
     ///
     /// This method returns the callers (incoming calls) and callees (outgoing calls)
@@ -1175,9 +1227,66 @@ impl RagClient {
         }
 
         // References in this file, used for the callee side.
+        //
+        // The index handed to extract_references decides what is even visible: a
+        // reference is emitted only when its identifier is a key in that map. Building
+        // it from this file alone therefore drops every callee defined in another
+        // translation unit, and TForm1 alone is spread over five .cpp files. So widen
+        // it first with definitions of the names actually called inside the target
+        // span. Bounded on both axes so a large function cannot fan out forever.
+        const MAX_CALLEE_PROBES: usize = 40;
+        const FILES_PER_NAME: usize = 5;
+
+        let mut callee_index = symbol_index.clone();
+        let mut probed_files: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::from([file_info.path.clone()]);
+
+        let called_names = Self::call_identifiers_in_span(
+            &file_info.content,
+            root_symbol.start_line,
+            root_symbol.end_line,
+        );
+
+        for name in called_names
+            .iter()
+            .filter(|n| !symbol_index.contains_key(*n))
+            .take(MAX_CALLEE_PROBES)
+        {
+            let candidates = match self
+                .files_mentioning(name, request.project.clone(), FILES_PER_NAME)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::debug!("Callee candidate lookup failed for {}: {}", name, e);
+                    continue;
+                }
+            };
+            for f in candidates {
+                if !probed_files.insert(f.clone()) {
+                    continue;
+                }
+                let fi = match self.create_file_info(&f.to_string_lossy(), request.project.clone()) {
+                    Ok(fi) => fi,
+                    Err(e) => {
+                        tracing::debug!("Skipping unreadable callee candidate {:?}: {}", f, e);
+                        continue;
+                    }
+                };
+                match self.relations_provider.extract_definitions(&fi) {
+                    Ok(defs) => {
+                        for d in defs {
+                            callee_index.entry(d.symbol_id.name.clone()).or_default().push(d);
+                        }
+                    }
+                    Err(e) => tracing::debug!("Definition extraction failed for {:?}: {}", f, e),
+                }
+            }
+        }
+
         let references = self
             .relations_provider
-            .extract_references(&file_info, &symbol_index)
+            .extract_references(&file_info, &callee_index)
             .context("Failed to extract references")?;
 
         // Callers can live anywhere, so scan the defining file plus every file the index
@@ -1287,23 +1396,27 @@ impl RagClient {
                     && r.start_line <= target_func.end_line
             })
             .filter_map(|r| {
-                // Extract the called function name from target_symbol_id
-                let parts: Vec<&str> = r.target_symbol_id.split(':').collect();
-                if parts.len() >= 2 {
-                    Some(parts[1].to_string())
-                } else {
-                    None
-                }
+                // Extract the called function name from target_symbol_id.
+                // target_symbol_id is a Definition id -- `def:<file>:<name>:<line>` --
+                // NOT a SymbolId id (`<file>:<name>:<line>:<col>`). Parsing it with the
+                // wrong layout, or with a forward split that yields the file path, is why
+                // callees were always empty and assumed unimplemented.
+                crate::relations::Definition::name_from_storage_id(&r.target_symbol_id)
+                    .map(|s| s.to_string())
             })
+            .filter(|name| !Self::is_call_like_keyword(name))
             .filter(|name| seen_callees.insert(name.clone()))
             .filter_map(|name| {
-                // Find the definition of the called function
-                symbol_index.get(&name).and_then(|defs| defs.first()).cloned()
+                // Resolve against the widened index so a callee defined in another
+                // translation unit still resolves to a definition.
+                callee_index.get(&name).and_then(|defs| defs.first()).cloned()
             })
             .map(|def| crate::relations::CallGraphNode {
                 name: def.symbol_id.name.clone(),
                 kind: def.symbol_id.kind.clone(),
-                file_path: request.file_path.clone(),
+                // The definition own file, not the requested one: a cross-TU callee
+                // does not live in request.file_path.
+                file_path: def.symbol_id.file_path.clone(),
                 line: def.symbol_id.start_line,
                 children: Vec::new(),
             })
@@ -1313,6 +1426,54 @@ impl RagClient {
             root_symbol: Some(root_symbol),
             callers,
             callees,
+            precision: format!("{:?}", precision).to_lowercase(),
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// List every symbol defined in a single file.
+    ///
+    /// Returns definitions only -- name, kind, line span, signature -- and never chunk
+    /// content, so enumerating a large file stays cheap. This is the enumeration
+    /// primitive the other tools lack: query_codebase and search_by_filters are
+    /// relevance-ranked with a limit, and find_definition / find_references need a
+    /// position the caller already has.
+    pub async fn list_symbols(&self, request: ListSymbolsRequest) -> Result<ListSymbolsResponse> {
+        let start = Instant::now();
+
+        request.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        let file_info = self.create_file_info(&request.file_path, request.project.clone())?;
+        let language = file_info.language.as_deref().unwrap_or("Unknown");
+        let precision = self.relations_provider.precision_level(language);
+
+        let definitions = self
+            .relations_provider
+            .extract_definitions(&file_info)
+            .context("Failed to extract definitions")?;
+
+        let wanted: Vec<String> = request.kinds.iter().map(|k| k.to_lowercase()).collect();
+        let mut symbols: Vec<crate::relations::SymbolInfo> = definitions
+            .iter()
+            .filter(|d| {
+                wanted.is_empty()
+                    || wanted.contains(&format!("{:?}", d.symbol_id.kind).to_lowercase())
+            })
+            .map(|d| crate::relations::SymbolInfo {
+                name: d.symbol_id.name.clone(),
+                kind: d.symbol_id.kind.clone(),
+                file_path: file_info.relative_path.clone(),
+                start_line: d.symbol_id.start_line,
+                end_line: d.end_line,
+                signature: d.signature.clone(),
+            })
+            .collect();
+        symbols.sort_by_key(|s| s.start_line);
+
+        Ok(ListSymbolsResponse {
+            file_path: file_info.relative_path.clone(),
+            total_count: symbols.len(),
+            symbols,
             precision: format!("{:?}", precision).to_lowercase(),
             duration_ms: start.elapsed().as_millis() as u64,
         })

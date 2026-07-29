@@ -479,6 +479,44 @@ pub struct GetCallGraphResponse {
     pub duration_ms: u64,
 }
 
+/// Request to list every symbol defined in one file
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ListSymbolsRequest {
+    /// File path (relative or absolute)
+    pub file_path: String,
+    /// Optional project name to filter by
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Restrict to these symbol kinds (e.g. ["function", "method"]); empty means all
+    #[serde(default)]
+    pub kinds: Vec<String>,
+}
+
+impl ListSymbolsRequest {
+    /// Validate the list symbols request
+    pub fn validate(&self) -> Result<(), String> {
+        if self.file_path.is_empty() {
+            return Err("file_path cannot be empty".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Response from list_symbols
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ListSymbolsResponse {
+    /// File the symbols were extracted from, relative to the indexed root
+    pub file_path: String,
+    /// Every definition found, ordered by start_line. Never includes file content.
+    pub symbols: Vec<crate::relations::SymbolInfo>,
+    /// Number of symbols returned
+    pub total_count: usize,
+    /// Precision level of the extractor for this language
+    pub precision: String,
+    /// Time taken in milliseconds
+    pub duration_ms: u64,
+}
+
 /// Metadata stored with each code chunk
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkMetadata {

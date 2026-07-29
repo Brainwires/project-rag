@@ -1388,3 +1388,94 @@ async fn test_index_lock_can_reacquire_after_drop_without_release() {
         guard.release().await;
     }
 }
+
+// ===== Regression tests for the get_call_graph callee path =====
+
+#[test]
+fn callee_fix_definition_storage_id_parsing() {
+    // Reference::target_symbol_id holds a DEFINITION id -- `def:<file>:<name>:<line>`
+    // (Definition::to_storage_id) -- NOT a SymbolId id, which is
+    // `<file>:<name>:<line>:<col>`. Callees stayed empty because the name was parsed
+    // with the wrong layout. Fields are taken from the right so a Windows drive-letter
+    // colon in the path cannot shift them.
+    use crate::relations::Definition;
+
+    let plain = "def:Unit1.cpp:WndProc:16359";
+    assert_eq!(Definition::name_from_storage_id(plain), Some("WndProc"));
+
+    let drive = r"def:D:\Work\nft\PPSKiosk\Unit1.cpp:WndProc:16359";
+    assert_eq!(Definition::name_from_storage_id(drive), Some("WndProc"));
+
+    // The SymbolId parser cannot read this layout -- it expects a trailing column and
+    // would try to parse the name as a line number. This is the original defect.
+    assert!(
+        crate::relations::SymbolId::from_storage_id(plain)
+            .map(|s| s.name)
+            .as_deref() != Some("WndProc"),
+        "the SymbolId parser must not be used for Definition ids"
+    );
+
+    // Malformed input is rejected rather than guessed at.
+    assert_eq!(Definition::name_from_storage_id("Unit1.cpp:WndProc:16359"), None);
+    assert_eq!(Definition::name_from_storage_id("def:nocolons"), None);
+}
+
+#[test]
+fn callee_fix_call_identifiers_in_span() {
+    let src = concat!(
+        "void __fastcall TForm1::WndProc(TMessage& msg)\n",
+        "{\n",
+        "    EnterServiceMenu();\n",
+        "    if (flag) { CheckTerminalState(); }\n",
+        "    int total = alpha + beta;\n",
+        "}\n",
+        "void TForm1::Other() { NotInSpan(); }\n",
+    );
+
+    let names = RagClient::call_identifiers_in_span(src, 1, 6);
+    assert!(names.contains(&"EnterServiceMenu".to_string()));
+    assert!(names.contains(&"CheckTerminalState".to_string()));
+
+    // Plain operands are not call sites.
+    assert!(!names.contains(&"total".to_string()));
+    assert!(!names.contains(&"alpha".to_string()));
+
+    // The span bound is honoured in both directions.
+    assert!(!names.contains(&"NotInSpan".to_string()));
+    let tail = RagClient::call_identifiers_in_span(src, 7, 7);
+    assert!(tail.contains(&"NotInSpan".to_string()));
+    assert!(!tail.contains(&"EnterServiceMenu".to_string()));
+}
+
+/// Smoke test for list_symbols against a real source tree.
+///
+/// Skipped unless PROJECT_RAG_SMOKE_FILE is set, because it depends on a file outside
+/// this repository. list_symbols touches no vector DB, so this exercises the real
+/// extraction path without an index.
+#[tokio::test]
+async fn list_symbols_smoke_on_real_file() {
+    let path = match std::env::var("PROJECT_RAG_SMOKE_FILE") {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let (client, _tmp) = create_test_client().await;
+    let resp = client
+        .list_symbols(ListSymbolsRequest {
+            file_path: path,
+            project: None,
+            kinds: Vec::new(),
+        })
+        .await
+        .expect("list_symbols should succeed");
+
+    eprintln!("SMOKE total_count={} precision={}", resp.total_count, resp.precision);
+    for s in resp.symbols.iter().take(12) {
+        eprintln!("SMOKE  {:>6}  {:?}  {}", s.start_line, s.kind, s.name);
+    }
+    for want in ["WndProc", "BindCommands", "AttachPinPadEventHandlers", "IsSmartCardPresent"] {
+        let hit = resp.symbols.iter().find(|s| s.name == want);
+        eprintln!("SMOKE  want {:<26} -> {:?}", want, hit.map(|s| s.start_line));
+    }
+
+    assert!(resp.total_count > 0, "expected at least one symbol");
+}
