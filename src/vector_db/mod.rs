@@ -77,9 +77,27 @@ pub trait VectorDatabase: Send + Sync {
     async fn get_indexed_files(&self, root_path: &str) -> Result<Vec<String>>;
 }
 
+/// Per-language index statistics.
+///
+/// The file count counts distinct files, the chunk count counts stored rows.
+/// These are different numbers, because a file is split into many chunks.
+/// Reporting the row count as both is what made the old statistics unusable.
+#[derive(Debug, Clone)]
+pub struct LanguageBreakdown {
+    pub language: String,
+    pub file_count: usize,
+    pub chunk_count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct DatabaseStats {
+    /// Distinct files with at least one chunk indexed.
+    pub total_files: usize,
+    /// Total stored rows, one per chunk.
     pub total_points: usize,
+    /// Total stored embedding vectors, one per chunk row.
     pub total_vectors: usize,
-    pub language_breakdown: Vec<(String, usize)>,
+    /// On-disk size of the database, 0 when the backend cannot report it.
+    pub database_size_bytes: u64,
+    pub language_breakdown: Vec<LanguageBreakdown>,
 }

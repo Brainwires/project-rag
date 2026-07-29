@@ -663,18 +663,18 @@ impl RagClient {
         let language_breakdown = stats
             .language_breakdown
             .into_iter()
-            .map(|(language, count)| LanguageStats {
-                language,
-                file_count: count,
-                chunk_count: count,
+            .map(|entry| LanguageStats {
+                language: entry.language,
+                file_count: entry.file_count,
+                chunk_count: entry.chunk_count,
             })
             .collect();
 
         Ok(StatisticsResponse {
-            total_files: stats.total_points,
-            total_chunks: stats.total_vectors,
+            total_files: stats.total_files,
+            total_chunks: stats.total_points,
             total_embeddings: stats.total_vectors,
-            database_size_bytes: 0,
+            database_size_bytes: stats.database_size_bytes,
             language_breakdown,
         })
     }

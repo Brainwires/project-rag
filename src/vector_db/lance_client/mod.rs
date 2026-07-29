@@ -11,7 +11,7 @@
 use crate::bm25_search::BM25Search;
 use crate::glob_utils;
 use crate::types::{ChunkMetadata, SearchResult};
-use crate::vector_db::{DatabaseStats, VectorDatabase};
+use crate::vector_db::{DatabaseStats, LanguageBreakdown, VectorDatabase};
 use anyhow::{Context, Result};
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
@@ -23,7 +23,8 @@ use lancedb::Table;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 /// LanceDB vector database implementation (embedded, no server required)
@@ -35,6 +36,21 @@ pub struct LanceVectorDB {
     /// Per-project BM25 search indexes for keyword matching
     /// Key: hashed root path, Value: BM25Search instance
     bm25_indexes: Arc<RwLock<HashMap<String, BM25Search>>>,
+}
+
+/// Total on-disk size of every file under the given directory.
+///
+/// LanceDB stores a directory tree rather than a single file. Entries that
+/// cannot be read are skipped rather than failing the whole statistics call,
+/// so this is a best-effort figure.
+fn directory_size_bytes(path: &Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .sum()
 }
 
 impl LanceVectorDB {
@@ -931,6 +947,8 @@ impl VectorDatabase for LanceVectorDB {
             .query()
             .select(lancedb::query::Select::Columns(vec![
                 "language".to_string(),
+                "file_path".to_string(),
+                "root_path".to_string(),
             ]))
             .execute()
             .await
@@ -941,7 +959,9 @@ impl VectorDatabase for LanceVectorDB {
             .await
             .context("Failed to collect language data")?;
 
-        let mut language_counts: HashMap<String, usize> = HashMap::new();
+        let mut chunk_counts: HashMap<String, usize> = HashMap::new();
+        let mut files_by_language: HashMap<String, HashSet<(String, String)>> = HashMap::new();
+        let mut all_files: HashSet<(String, String)> = HashSet::new();
 
         for batch in query_result {
             let language_array = batch
@@ -951,18 +971,60 @@ impl VectorDatabase for LanceVectorDB {
                 .downcast_ref::<StringArray>()
                 .context("Invalid language type")?;
 
+            let file_path_array = batch
+                .column_by_name("file_path")
+                .context("Missing file_path column")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("Invalid file_path type")?;
+
+            let root_path_array = batch
+                .column_by_name("root_path")
+                .context("Missing root_path column")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("Invalid root_path type")?;
+
             for i in 0..batch.num_rows() {
                 let language = language_array.value(i);
-                *language_counts.entry(language.to_string()).or_insert(0) += 1;
+
+                // file_path is stored relative to root_path, so only the pair
+                // identifies a file: the same relative path can exist under
+                // two different indexed roots.
+                let root = if root_path_array.is_null(i) {
+                    String::new()
+                } else {
+                    root_path_array.value(i).to_string()
+                };
+                let file_key = (root, file_path_array.value(i).to_string());
+
+                *chunk_counts.entry(language.to_string()).or_insert(0) += 1;
+                files_by_language
+                    .entry(language.to_string())
+                    .or_default()
+                    .insert(file_key.clone());
+                all_files.insert(file_key);
             }
         }
 
-        let mut language_breakdown: Vec<(String, usize)> = language_counts.into_iter().collect();
-        language_breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut language_breakdown: Vec<LanguageBreakdown> = chunk_counts
+            .into_iter()
+            .map(|(language, chunk_count)| {
+                let file_count = files_by_language.get(&language).map_or(0, |f| f.len());
+                LanguageBreakdown {
+                    language,
+                    file_count,
+                    chunk_count,
+                }
+            })
+            .collect();
+        language_breakdown.sort_by(|a, b| b.chunk_count.cmp(&a.chunk_count));
 
         Ok(DatabaseStats {
+            total_files: all_files.len(),
             total_points: count_result,
             total_vectors: count_result,
+            database_size_bytes: directory_size_bytes(Path::new(&self.db_path)),
             language_breakdown,
         })
     }

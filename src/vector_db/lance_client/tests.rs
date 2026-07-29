@@ -629,6 +629,7 @@ mod tests {
         let stats = db.get_statistics().await.unwrap();
         assert_eq!(stats.total_points, 0);
         assert_eq!(stats.total_vectors, 0);
+        assert_eq!(stats.total_files, 0);
         assert_eq!(stats.language_breakdown.len(), 0);
     }
 
@@ -666,13 +667,65 @@ mod tests {
         let stats = db.get_statistics().await.unwrap();
         assert_eq!(stats.total_points, 3);
         assert_eq!(stats.total_vectors, 3);
+        assert_eq!(stats.total_files, 3, "three distinct files were stored");
+        assert!(
+            stats.database_size_bytes > 0,
+            "on-disk size should be reported, not hardcoded to 0"
+        );
         assert_eq!(stats.language_breakdown.len(), 2);
 
-        // Verify language counts (sorted by count descending)
-        assert_eq!(stats.language_breakdown[0].0, "Rust");
-        assert_eq!(stats.language_breakdown[0].1, 2);
-        assert_eq!(stats.language_breakdown[1].0, "Python");
-        assert_eq!(stats.language_breakdown[1].1, 1);
+        // Verify language counts (sorted by chunk count descending)
+        assert_eq!(stats.language_breakdown[0].language, "Rust");
+        assert_eq!(stats.language_breakdown[0].chunk_count, 2);
+        assert_eq!(stats.language_breakdown[0].file_count, 2);
+        assert_eq!(stats.language_breakdown[1].language, "Python");
+        assert_eq!(stats.language_breakdown[1].chunk_count, 1);
+        assert_eq!(stats.language_breakdown[1].file_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_statistics_counts_files_distinctly_from_chunks() {
+        // Regression guard: file counts used to be filled with the row count,
+        // so one file split into several chunks was reported as several files.
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("lancedb")
+            .to_string_lossy()
+            .to_string();
+        let db = LanceVectorDB::with_path(&db_path).await.unwrap();
+        db.initialize(384).await.unwrap();
+
+        // Three chunks that all come from the same file.
+        let embeddings = vec![vec![0.1; 384], vec![0.2; 384], vec![0.3; 384]];
+        let mut meta1 = create_test_metadata("big.rs", 1, 10);
+        meta1.language = Some("Rust".to_string());
+        let mut meta2 = create_test_metadata("big.rs", 11, 20);
+        meta2.language = Some("Rust".to_string());
+        let mut meta3 = create_test_metadata("big.rs", 21, 30);
+        meta3.language = Some("Rust".to_string());
+
+        let contents = vec![
+            "fn a() {}".to_string(),
+            "fn b() {}".to_string(),
+            "fn c() {}".to_string(),
+        ];
+
+        db.store_embeddings(
+            embeddings,
+            vec![meta1, meta2, meta3],
+            contents,
+            "/test/root",
+        )
+        .await
+        .unwrap();
+
+        let stats = db.get_statistics().await.unwrap();
+        assert_eq!(stats.total_points, 3, "three chunks were stored");
+        assert_eq!(stats.total_files, 1, "but they all came from one file");
+        assert_eq!(stats.language_breakdown.len(), 1);
+        assert_eq!(stats.language_breakdown[0].chunk_count, 3);
+        assert_eq!(stats.language_breakdown[0].file_count, 1);
     }
 
     #[tokio::test]

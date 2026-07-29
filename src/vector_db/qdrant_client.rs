@@ -501,8 +501,14 @@ impl VectorDatabase for QdrantVectorDB {
         // For language breakdown, we'd need to scroll through all points
         // For now, return a simplified version
         Ok(DatabaseStats {
+            // This backend does not scan payloads, so distinct-file and
+            // on-disk-size figures are unavailable. They stay 0 rather than
+            // being filled with the row count, which is exactly the
+            // substitution that made the statistics misleading before.
+            total_files: 0,
             total_points: points_count as usize,
             total_vectors: points_count as usize,
+            database_size_bytes: 0,
             language_breakdown: vec![],
         })
     }

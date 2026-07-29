@@ -246,7 +246,9 @@ where
             if diff_section.starts_with("Diff:") {
                 let diff_content = diff_section.strip_prefix("Diff:\n").unwrap_or(diff_section);
                 if diff_content.len() > 500 {
-                    format!("{}...", &diff_content[..500])
+                    // Byte cap: slicing a str at a non-boundary offset panics.
+                    let end = crate::git::floor_char_boundary(diff_content, 500);
+                    format!("{}...", &diff_content[..end])
                 } else {
                     diff_content.to_string()
                 }

@@ -66,7 +66,9 @@ impl CommitChunker {
 
         // Truncate if too long
         if content.len() > self.max_content_length {
-            content.truncate(self.max_content_length);
+            // Byte cap: floor to a character boundary before truncating.
+            let end = crate::git::floor_char_boundary(&content, self.max_content_length);
+            content.truncate(end);
             content.push_str("\n\n[... content truncated for embedding ...]");
         }
 
@@ -124,6 +126,28 @@ mod tests {
             diff_content: "@@ -10,7 +10,7 @@\n-    old_line\n+    new_line\n".to_string(),
             parent_hashes: vec!["parent123".to_string()],
         }
+    }
+
+    #[test]
+    fn test_commit_to_chunk_truncates_multibyte_content_without_panicking() {
+        // Regression: the length cap was applied with String::truncate on a
+        // raw byte offset, which panics when that offset lands inside a
+        // multi-byte character. A diff of Cyrillic text reproduces it.
+        let mut commit = create_test_commit();
+        commit.diff_content = "привет мир ".repeat(2000);
+
+        let chunker = CommitChunker::with_max_length(6000);
+        let chunk = chunker
+            .commit_to_chunk(&commit, "/repo/path", None)
+            .expect("Should convert commit to chunk");
+
+        assert!(
+            chunk.content.contains("content truncated"),
+            "content should have been truncated"
+        );
+        // Surviving this assertion at all proves the cut landed on a
+        // character boundary: an invalid cut would have panicked above.
+        assert!(chunk.content.len() < commit.diff_content.len());
     }
 
     #[test]

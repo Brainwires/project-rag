@@ -245,7 +245,9 @@ impl GitWalker {
 
         // Truncate if too large and add marker
         if diff_content.len() > 8000 {
-            diff_content.truncate(8000);
+            // 8000 is a byte cap and may land inside a multi-byte character.
+            let end = crate::git::floor_char_boundary(&diff_content, 8000);
+            diff_content.truncate(end);
             diff_content.push_str("\n\n[... diff truncated ...]");
             tracing::warn!("Truncated large diff for commit {}", commit.id());
         }
