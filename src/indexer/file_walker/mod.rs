@@ -8,8 +8,8 @@ use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct FileWalker {
     pub(crate) root: PathBuf,
@@ -197,7 +197,12 @@ impl FileWalker {
 
     /// Check if file matches include/exclude patterns
     pub(crate) fn matches_patterns(&self, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
+        // Match against the path relative to the walk root, not the absolute path:
+        // matching the absolute path lets any ancestor directory name (a username,
+        // a temp-dir suffix, anything containing the pattern as a substring) produce
+        // false positives that have nothing to do with the file itself.
+        let relative = path.strip_prefix(&self.root).unwrap_or(path);
+        let path_str = relative.to_string_lossy();
 
         // If include patterns are specified, file must match at least one
         if !self.include_patterns.is_empty() {

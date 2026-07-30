@@ -78,7 +78,9 @@ fn test_normalize_path_absolute() {
     let result = RagClient::normalize_path(&path);
     assert!(result.is_ok());
     let normalized = result.unwrap();
-    assert!(normalized.starts_with('/'));
+    // `starts_with('/')` doesn't hold on Windows, where canonicalize() yields
+    // `\\?\C:\...`; `Path::is_absolute()` is the real, cross-platform invariant.
+    assert!(std::path::Path::new(&normalized).is_absolute());
 }
 
 // ===== index_codebase Tests =====
@@ -478,9 +480,17 @@ async fn test_search_with_filters_language_filter() {
     // Create files in different languages
     let data_dir = temp_dir.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
-    std::fs::write(data_dir.join("main.rs"), "fn main() { println!(\"Hello\"); }").unwrap();
+    std::fs::write(
+        data_dir.join("main.rs"),
+        "fn main() { println!(\"Hello\"); }",
+    )
+    .unwrap();
     std::fs::write(data_dir.join("main.py"), "def main(): print('Hello')").unwrap();
-    std::fs::write(data_dir.join("main.js"), "function main() { console.log('Hello'); }").unwrap();
+    std::fs::write(
+        data_dir.join("main.js"),
+        "function main() { console.log('Hello'); }",
+    )
+    .unwrap();
 
     let index_req = IndexRequest {
         path: data_dir.to_string_lossy().to_string(),
@@ -528,7 +538,11 @@ async fn test_search_with_filters_path_pattern() {
     std::fs::create_dir_all(&src_dir).unwrap();
     std::fs::create_dir_all(&tests_dir).unwrap();
 
-    std::fs::write(src_dir.join("lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { a + b }").unwrap();
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+    )
+    .unwrap();
     std::fs::write(
         tests_dir.join("test_lib.rs"),
         "fn test_add() { assert_eq!(add(1, 2), 3); }",
@@ -560,10 +574,13 @@ async fn test_search_with_filters_path_pattern() {
     assert!(result.is_ok());
 
     let response = result.unwrap();
-    // All results should be from src directory
+    // All results should be from src directory. Compare with '/'-normalized
+    // separators since `file_path` uses the OS-native separator, which is '\'
+    // on Windows.
     for result in &response.results {
+        let normalized = result.file_path.replace('\\', "/");
         assert!(
-            result.file_path.contains("src/") || result.file_path.starts_with("src/"),
+            normalized.contains("src/") || normalized.starts_with("src/"),
             "Expected path to contain src/, got: {}",
             result.file_path
         );
@@ -627,15 +644,18 @@ async fn test_search_with_filters_combined_filters() {
     assert!(result.is_ok());
 
     let response = result.unwrap();
-    // All results should be Rust files in src directory
+    // All results should be Rust files in src directory. Compare with
+    // '/'-normalized separators since `file_path` uses the OS-native separator,
+    // which is '\' on Windows.
     for result in &response.results {
         assert!(
             result.file_path.ends_with(".rs"),
             "Expected .rs file, got: {}",
             result.file_path
         );
+        let normalized = result.file_path.replace('\\', "/");
         assert!(
-            result.file_path.contains("src/") || result.file_path.starts_with("src/"),
+            normalized.contains("src/") || normalized.starts_with("src/"),
             "Expected path to contain src/, got: {}",
             result.file_path
         );
@@ -998,7 +1018,11 @@ async fn test_index_lock_prevents_duplicate_indexing() {
     // Create data to index
     let data_dir = temp_dir.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
-    std::fs::write(data_dir.join("test.rs"), "fn main() { println!(\"test\"); }").unwrap();
+    std::fs::write(
+        data_dir.join("test.rs"),
+        "fn main() { println!(\"test\"); }",
+    )
+    .unwrap();
 
     let path = data_dir.to_string_lossy().to_string();
 
@@ -1014,7 +1038,10 @@ async fn test_index_lock_prevents_duplicate_indexing() {
     // With cross-process locking, this could be WaitForResult (same process, in-memory)
     // or WaitForFilesystemLock (different process holding filesystem lock)
     assert!(
-        matches!(lock_result2, IndexLockResult::WaitForResult(_) | IndexLockResult::WaitForFilesystemLock(_)),
+        matches!(
+            lock_result2,
+            IndexLockResult::WaitForResult(_) | IndexLockResult::WaitForFilesystemLock(_)
+        ),
         "Second call should wait for the first operation (got: {:?})",
         match &lock_result2 {
             IndexLockResult::Acquired(_) => "Acquired",
@@ -1134,7 +1161,10 @@ async fn test_index_lock_path_normalization() {
     // Both WaitForResult and WaitForFilesystemLock indicate the lock is shared
     let lock_result2 = client.try_acquire_index_lock(&path2).await.unwrap();
     assert!(
-        matches!(lock_result2, IndexLockResult::WaitForResult(_) | IndexLockResult::WaitForFilesystemLock(_)),
+        matches!(
+            lock_result2,
+            IndexLockResult::WaitForResult(_) | IndexLockResult::WaitForFilesystemLock(_)
+        ),
         "Equivalent paths should share the same lock"
     );
 
@@ -1276,12 +1306,21 @@ async fn test_concurrent_index_calls_share_result() {
     //   waits for filesystem lock then returns immediately (files_indexed = 0)
     //
     // The important thing is both succeed without errors
-    assert!(resp1.errors.is_empty(), "Task 1 should succeed without errors");
-    assert!(resp2.errors.is_empty(), "Task 2 should succeed without errors");
+    assert!(
+        resp1.errors.is_empty(),
+        "Task 1 should succeed without errors"
+    );
+    assert!(
+        resp2.errors.is_empty(),
+        "Task 2 should succeed without errors"
+    );
 
     // At least one should have done the actual indexing
     let total_indexed = resp1.files_indexed + resp2.files_indexed;
-    assert!(total_indexed >= 1, "At least one task should have indexed files");
+    assert!(
+        total_indexed >= 1,
+        "At least one task should have indexed files"
+    );
 }
 
 #[tokio::test]
@@ -1411,12 +1450,16 @@ fn callee_fix_definition_storage_id_parsing() {
     assert!(
         crate::relations::SymbolId::from_storage_id(plain)
             .map(|s| s.name)
-            .as_deref() != Some("WndProc"),
+            .as_deref()
+            != Some("WndProc"),
         "the SymbolId parser must not be used for Definition ids"
     );
 
     // Malformed input is rejected rather than guessed at.
-    assert_eq!(Definition::name_from_storage_id("Unit1.cpp:WndProc:16359"), None);
+    assert_eq!(
+        Definition::name_from_storage_id("Unit1.cpp:WndProc:16359"),
+        None
+    );
     assert_eq!(Definition::name_from_storage_id("def:nocolons"), None);
 }
 
@@ -1468,13 +1511,25 @@ async fn list_symbols_smoke_on_real_file() {
         .await
         .expect("list_symbols should succeed");
 
-    eprintln!("SMOKE total_count={} precision={}", resp.total_count, resp.precision);
+    eprintln!(
+        "SMOKE total_count={} precision={}",
+        resp.total_count, resp.precision
+    );
     for s in resp.symbols.iter().take(12) {
         eprintln!("SMOKE  {:>6}  {:?}  {}", s.start_line, s.kind, s.name);
     }
-    for want in ["WndProc", "BindCommands", "AttachPinPadEventHandlers", "IsSmartCardPresent"] {
+    for want in [
+        "WndProc",
+        "BindCommands",
+        "AttachPinPadEventHandlers",
+        "IsSmartCardPresent",
+    ] {
         let hit = resp.symbols.iter().find(|s| s.name == want);
-        eprintln!("SMOKE  want {:<26} -> {:?}", want, hit.map(|s| s.start_line));
+        eprintln!(
+            "SMOKE  want {:<26} -> {:?}",
+            want,
+            hit.map(|s| s.start_line)
+        );
     }
 
     assert!(resp.total_count > 0, "expected at least one symbol");
