@@ -534,6 +534,24 @@ pub struct CallGraphNode {
 }
 
 /// Symbol info for call graph root
+/// A node the extractor recognised as a definition but could not name, and
+/// therefore left out of the symbol list.
+///
+/// Before this existed such nodes were dropped silently, so a caller had no way to
+/// tell an empty or short symbol list from a complete one. A non-empty vector of
+/// these means the listing is INCOMPLETE.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkippedDefinition {
+    /// 1-based line the definition starts on
+    pub line: usize,
+    /// tree-sitter node kind, e.g. "function_definition"
+    pub kind: String,
+    /// Why it was skipped
+    pub reason: String,
+    /// First line of the node text, truncated -- enough to identify it by eye
+    pub snippet: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SymbolInfo {
     /// Symbol name

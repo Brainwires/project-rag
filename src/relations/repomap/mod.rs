@@ -59,6 +59,13 @@ impl RelationsProvider for RepoMapProvider {
         self.symbol_extractor.extract_definitions(file_info)
     }
 
+    fn extract_definitions_reporting(
+        &self,
+        file_info: &FileInfo,
+    ) -> Result<(Vec<Definition>, Vec<crate::relations::SkippedDefinition>)> {
+        self.symbol_extractor.extract_definitions_reporting(file_info)
+    }
+
     fn extract_references(
         &self,
         file_info: &FileInfo,

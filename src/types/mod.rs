@@ -513,6 +513,11 @@ pub struct ListSymbolsResponse {
     pub total_count: usize,
     /// Precision level of the extractor for this language
     pub precision: String,
+    /// Definition nodes that were recognised but could not be named, and are therefore
+    /// MISSING from `symbols`. Empty is the normal case; anything here means this
+    /// listing is incomplete and must not be treated as an inventory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<crate::relations::SkippedDefinition>,
     /// Time taken in milliseconds
     pub duration_ms: u64,
 }

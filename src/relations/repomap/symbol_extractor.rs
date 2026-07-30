@@ -8,7 +8,7 @@ use chrono::Utc;
 use tree_sitter::{Language, Node, Parser};
 
 use crate::indexer::FileInfo;
-use crate::relations::types::{Definition, SymbolId, SymbolKind, Visibility};
+use crate::relations::types::{Definition, SkippedDefinition, SymbolId, SymbolKind, Visibility};
 
 /// Extracts symbol definitions from source code using AST parsing.
 pub struct SymbolExtractor {
@@ -23,12 +23,26 @@ impl SymbolExtractor {
 
     /// Extract all symbol definitions from a file
     pub fn extract_definitions(&self, file_info: &FileInfo) -> Result<Vec<Definition>> {
+        let (definitions, _skipped) = self.extract_definitions_reporting(file_info)?;
+        Ok(definitions)
+    }
+
+    /// Extract all symbol definitions, and report every node that was recognised as a
+    /// definition but could not be named.
+    ///
+    /// Those nodes are omitted from the returned definitions -- they used to be dropped
+    /// with no diagnostic at all, which made an incomplete listing indistinguishable
+    /// from a complete one.
+    pub fn extract_definitions_reporting(
+        &self,
+        file_info: &FileInfo,
+    ) -> Result<(Vec<Definition>, Vec<SkippedDefinition>)> {
         let extension = file_info.extension.as_deref().unwrap_or("");
 
         // Get language and parser
         let (language, language_name) = match get_language_for_extension(extension) {
             Some(lang) => lang,
-            None => return Ok(Vec::new()), // Unsupported language
+            None => return Ok((Vec::new(), Vec::new())), // Unsupported language
         };
 
         let mut parser = Parser::new();
@@ -42,6 +56,7 @@ impl SymbolExtractor {
 
         let root_node = tree.root_node();
         let mut definitions = Vec::new();
+        let mut skipped = Vec::new();
 
         // Extract definitions recursively
         self.extract_from_node(
@@ -51,9 +66,19 @@ impl SymbolExtractor {
             file_info,
             None,
             &mut definitions,
+            &mut skipped,
         );
 
-        Ok(definitions)
+        if !skipped.is_empty() {
+            tracing::warn!(
+                file = %file_info.relative_path,
+                skipped = skipped.len(),
+                found = definitions.len(),
+                "symbol extraction omitted definition nodes it could not name; the symbol list for this file is incomplete"
+            );
+        }
+
+        Ok((definitions, skipped))
     }
 
     /// Extract definitions from a node and its children
@@ -65,6 +90,7 @@ impl SymbolExtractor {
         file_info: &FileInfo,
         parent_id: Option<String>,
         result: &mut Vec<Definition>,
+        skipped: &mut Vec<SkippedDefinition>,
     ) {
         let kind = node.kind();
 
@@ -85,16 +111,46 @@ impl SymbolExtractor {
                         file_info,
                         new_parent_id.clone(),
                         result,
+                        skipped,
                     );
                 }
                 return;
             }
+
+            // This node IS a definition but no name could be extracted from it, so it
+            // will not appear in the symbol list. Record it rather than dropping it
+            // silently -- the caller cannot otherwise tell that the listing is short.
+            let line = node.start_position().row + 1;
+            let snippet = source
+                .get(node.start_byte()..node.end_byte().min(source.len()))
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(120)
+                .collect::<String>();
+            skipped.push(SkippedDefinition {
+                line,
+                kind: kind.to_string(),
+                reason: "could not extract a name from this node".to_string(),
+                snippet,
+            });
         }
 
         // Recurse into children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            self.extract_from_node(child, source, language, file_info, parent_id.clone(), result);
+            self.extract_from_node(
+                child,
+                source,
+                language,
+                file_info,
+                parent_id.clone(),
+                result,
+                skipped,
+            );
         }
     }
 
@@ -354,8 +410,13 @@ fn find_name_node<'a>(node: Node<'a>, language: &str) -> Option<Node<'a>> {
         "C" | "C++" => {
             // C/C++: declarator contains the name
             if let Some(declarator) = node.child_by_field_name("declarator") {
-                // Navigate through possible pointer/reference declarators
-                return find_innermost_identifier(declarator);
+                // Navigate through possible pointer/reference declarators.
+                // Only return on success: returning None here would skip the generic
+                // identifier fallback at the end of this function, which is what made
+                // unnameable-but-valid definitions disappear without a trace.
+                if let Some(id) = find_innermost_identifier(declarator) {
+                    return Some(id);
+                }
             }
             // For struct/class, name is in the type specifier
             if kind == "struct_specifier" || kind == "class_specifier" || kind == "enum_specifier" {
@@ -403,9 +464,12 @@ fn find_innermost_identifier<'a>(node: Node<'a>) -> Option<Node<'a>> {
         return Some(node);
     }
 
-    // Check for name field
+    // Check for name field. Only return on success -- an unconditional return here
+    // skips the child scan below, which is the same defect as in find_name_node.
     if let Some(name_node) = node.child_by_field_name("declarator") {
-        return find_innermost_identifier(name_node);
+        if let Some(id) = find_innermost_identifier(name_node) {
+            return Some(id);
+        }
     }
 
     // Fallback: look through children

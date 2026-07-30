@@ -1447,9 +1447,9 @@ impl RagClient {
         let language = file_info.language.as_deref().unwrap_or("Unknown");
         let precision = self.relations_provider.precision_level(language);
 
-        let definitions = self
+        let (definitions, skipped) = self
             .relations_provider
-            .extract_definitions(&file_info)
+            .extract_definitions_reporting(&file_info)
             .context("Failed to extract definitions")?;
 
         let wanted: Vec<String> = request.kinds.iter().map(|k| k.to_lowercase()).collect();
@@ -1475,6 +1475,7 @@ impl RagClient {
             total_count: symbols.len(),
             symbols,
             precision: format!("{:?}", precision).to_lowercase(),
+            skipped,
             duration_ms: start.elapsed().as_millis() as u64,
         })
     }
