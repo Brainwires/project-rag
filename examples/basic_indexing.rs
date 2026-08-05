@@ -16,9 +16,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     // Get codebase path from command line or use current directory
-    let codebase_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| ".".to_string());
+    let codebase_path = env::args().nth(1).unwrap_or_else(|| ".".to_string());
 
     println!("=== Project RAG - Basic Indexing Example ===\n");
 

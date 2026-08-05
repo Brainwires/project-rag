@@ -58,9 +58,15 @@ impl ReferenceFinder {
                     // Determine reference kind based on context
                     let reference_kind = self.determine_reference_kind(line, mat.start(), name);
 
-                    // Get the best matching definition
-                    // For now, just use the first one (could be improved with scope analysis)
-                    if let Some(def) = definitions.first() {
+                    // Get the best matching definition. Prefer a real definition over
+                    // an import binding of the same name: an import is where a symbol
+                    // ENTERS a file, not where it is defined, so a reference resolved
+                    // to the import would point at the wrong place.
+                    let target = definitions
+                        .iter()
+                        .find(|d| d.kind() != crate::relations::types::SymbolKind::Import)
+                        .or_else(|| definitions.first());
+                    if let Some(def) = target {
                         references.push(Reference {
                             file_path: file_info.relative_path.clone(),
                             root_path: Some(file_info.root_path.clone()),
@@ -96,12 +102,7 @@ impl ReferenceFinder {
     }
 
     /// Determine the kind of reference based on context
-    fn determine_reference_kind(
-        &self,
-        line: &str,
-        position: usize,
-        name: &str,
-    ) -> ReferenceKind {
+    fn determine_reference_kind(&self, line: &str, position: usize, name: &str) -> ReferenceKind {
         // Get text before the identifier
         let before = &line[..position];
 
@@ -257,7 +258,11 @@ fn greet(name: &str) {
 
         // First occurrence is a write, second is a read
         assert!(references.len() >= 1);
-        assert!(references.iter().any(|r| r.reference_kind == ReferenceKind::Write));
+        assert!(
+            references
+                .iter()
+                .any(|r| r.reference_kind == ReferenceKind::Write)
+        );
     }
 
     #[test]
@@ -275,7 +280,11 @@ fn greet(name: &str) {
         let references = finder.find_references(&file_info, &symbol_index).unwrap();
 
         assert!(!references.is_empty());
-        assert!(references.iter().any(|r| r.reference_kind == ReferenceKind::Import));
+        assert!(
+            references
+                .iter()
+                .any(|r| r.reference_kind == ReferenceKind::Import)
+        );
     }
 
     #[test]
@@ -293,7 +302,11 @@ fn greet(name: &str) {
         let references = finder.find_references(&file_info, &symbol_index).unwrap();
 
         assert!(!references.is_empty());
-        assert!(references.iter().any(|r| r.reference_kind == ReferenceKind::Instantiation));
+        assert!(
+            references
+                .iter()
+                .any(|r| r.reference_kind == ReferenceKind::Instantiation)
+        );
     }
 
     #[test]

@@ -38,9 +38,17 @@ mod tests {
         let s = "аб";
         assert_eq!(s.len(), 4, "test string should be 4 bytes");
         assert_eq!(floor_char_boundary(s, 0), 0);
-        assert_eq!(floor_char_boundary(s, 1), 0, "offset 1 splits the first char");
+        assert_eq!(
+            floor_char_boundary(s, 1),
+            0,
+            "offset 1 splits the first char"
+        );
         assert_eq!(floor_char_boundary(s, 2), 2);
-        assert_eq!(floor_char_boundary(s, 3), 2, "offset 3 splits the second char");
+        assert_eq!(
+            floor_char_boundary(s, 3),
+            2,
+            "offset 3 splits the second char"
+        );
         assert_eq!(floor_char_boundary(s, 4), 4);
     }
 

@@ -159,11 +159,16 @@ fn test_statistics_response() {
                 chunk_count: 100,
             },
         ],
+        total_definitions: 250,
+        total_references: 0,
+        files_with_definitions: 90,
     };
 
     assert_eq!(stats.total_files, 100);
     assert_eq!(stats.language_breakdown.len(), 2);
     assert_eq!(stats.language_breakdown[0].language, "Rust");
+    assert_eq!(stats.total_definitions, 250);
+    assert_eq!(stats.files_with_definitions, 90);
 }
 
 // ===== Validation Tests =====
@@ -607,6 +612,9 @@ fn test_statistics_response_serialization() {
             file_count: 100,
             chunk_count: 500,
         }],
+        total_definitions: 250,
+        total_references: 10,
+        files_with_definitions: 90,
     };
 
     let json = serde_json::to_string(&response).unwrap();
@@ -618,6 +626,15 @@ fn test_statistics_response_serialization() {
         response.language_breakdown.len(),
         deserialized.language_breakdown.len()
     );
+    assert_eq!(response.total_definitions, deserialized.total_definitions);
+    assert_eq!(response.total_references, deserialized.total_references);
+
+    // Old payloads without the relations fields must still deserialize.
+    let legacy = r#"{"total_files":1,"total_chunks":2,"total_embeddings":2,"database_size_bytes":10,"language_breakdown":[]}"#;
+    let parsed: StatisticsResponse = serde_json::from_str(legacy).unwrap();
+    assert_eq!(parsed.total_definitions, 0);
+    assert_eq!(parsed.total_references, 0);
+    assert_eq!(parsed.files_with_definitions, 0);
 }
 
 #[test]

@@ -94,9 +94,30 @@ impl SymbolExtractor {
     ) {
         let kind = node.kind();
 
+        // Import nodes bind names into scope; each bound name becomes its own
+        // SymbolKind::Import definition (`use a::{B, C}` yields two). A statement
+        // that binds no checkable name (globs, side-effect imports) is recorded as
+        // skipped so the listing is visibly incomplete rather than silently short.
+        if super::import_extractor::is_import_node(kind, language) {
+            let imports = super::import_extractor::extract_imports(
+                node, source, language, file_info, &parent_id,
+            );
+            if imports.is_empty() {
+                skipped.push(skipped_from_node(
+                    node,
+                    source,
+                    "could not extract bound names from this import",
+                ));
+            } else {
+                result.extend(imports);
+            }
+            return; // nothing definable nests inside an import statement
+        }
+
         // Check if this node is a definition we care about
         if is_definition_node(kind, language) {
-            if let Some(def) = self.node_to_definition(node, source, language, file_info, &parent_id)
+            if let Some(def) =
+                self.node_to_definition(node, source, language, file_info, &parent_id)
             {
                 let new_parent_id = Some(def.to_storage_id());
                 result.push(def);
@@ -120,23 +141,11 @@ impl SymbolExtractor {
             // This node IS a definition but no name could be extracted from it, so it
             // will not appear in the symbol list. Record it rather than dropping it
             // silently -- the caller cannot otherwise tell that the listing is short.
-            let line = node.start_position().row + 1;
-            let snippet = source
-                .get(node.start_byte()..node.end_byte().min(source.len()))
-                .unwrap_or("")
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .chars()
-                .take(120)
-                .collect::<String>();
-            skipped.push(SkippedDefinition {
-                line,
-                kind: kind.to_string(),
-                reason: "could not extract a name from this node".to_string(),
-                snippet,
-            });
+            skipped.push(skipped_from_node(
+                node,
+                source,
+                "could not extract a name from this node",
+            ));
         }
 
         // Recurse into children
@@ -210,31 +219,71 @@ impl Default for SymbolExtractor {
     }
 }
 
+/// Build the skipped-definition record for a node whose name (or bound names)
+/// could not be extracted.
+fn skipped_from_node(node: Node, source: &str, reason: &str) -> SkippedDefinition {
+    let snippet = source
+        .get(node.start_byte()..node.end_byte().min(source.len()))
+        .unwrap_or("")
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(120)
+        .collect::<String>();
+    SkippedDefinition {
+        line: node.start_position().row + 1,
+        kind: node.kind().to_string(),
+        reason: reason.to_string(),
+        snippet,
+    }
+}
+
+/// Extractor-taxonomy language name for a file extension.
+///
+/// Single source of truth for language dispatch: get_language_for_extension
+/// derives its grammar from this name, so a file whose imports were extracted
+/// under one language name can never be usage-checked under another. Headers
+/// map to "C++" -- that grammar accepts C structs and enums and additionally
+/// yields classes and namespaces, which the C grammar cannot.
+pub fn language_name_for_extension(extension: &str) -> Option<&'static str> {
+    Some(match extension.to_lowercase().as_str() {
+        "rs" => "Rust",
+        "py" => "Python",
+        "js" | "mjs" | "cjs" | "jsx" => "JavaScript",
+        "ts" | "tsx" => "TypeScript",
+        "go" => "Go",
+        "java" => "Java",
+        "swift" => "Swift",
+        "c" => "C",
+        "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "C++",
+        "cs" => "C#",
+        "rb" => "Ruby",
+        "php" => "PHP",
+        _ => return None,
+    })
+}
+
 /// Get the tree-sitter language for a file extension
 fn get_language_for_extension(extension: &str) -> Option<(Language, String)> {
-    match extension.to_lowercase().as_str() {
-        "rs" => Some((tree_sitter_rust::LANGUAGE.into(), "Rust".to_string())),
-        "py" => Some((tree_sitter_python::LANGUAGE.into(), "Python".to_string())),
-        "js" | "mjs" | "cjs" | "jsx" => Some((
-            tree_sitter_javascript::LANGUAGE.into(),
-            "JavaScript".to_string(),
-        )),
-        "ts" | "tsx" => Some((
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "TypeScript".to_string(),
-        )),
-        "go" => Some((tree_sitter_go::LANGUAGE.into(), "Go".to_string())),
-        "java" => Some((tree_sitter_java::LANGUAGE.into(), "Java".to_string())),
-        "swift" => Some((tree_sitter_swift::LANGUAGE.into(), "Swift".to_string())),
-        "c" | "h" => Some((tree_sitter_c::LANGUAGE.into(), "C".to_string())),
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => {
-            Some((tree_sitter_cpp::LANGUAGE.into(), "C++".to_string()))
-        }
-        "cs" => Some((tree_sitter_c_sharp::LANGUAGE.into(), "C#".to_string())),
-        "rb" => Some((tree_sitter_ruby::LANGUAGE.into(), "Ruby".to_string())),
-        "php" => Some((tree_sitter_php::LANGUAGE_PHP.into(), "PHP".to_string())),
-        _ => None,
-    }
+    let name = language_name_for_extension(extension)?;
+    let language: Language = match name {
+        "Rust" => tree_sitter_rust::LANGUAGE.into(),
+        "Python" => tree_sitter_python::LANGUAGE.into(),
+        "JavaScript" => tree_sitter_javascript::LANGUAGE.into(),
+        "TypeScript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "Go" => tree_sitter_go::LANGUAGE.into(),
+        "Java" => tree_sitter_java::LANGUAGE.into(),
+        "Swift" => tree_sitter_swift::LANGUAGE.into(),
+        "C" => tree_sitter_c::LANGUAGE.into(),
+        "C++" => tree_sitter_cpp::LANGUAGE.into(),
+        "C#" => tree_sitter_c_sharp::LANGUAGE.into(),
+        "Ruby" => tree_sitter_ruby::LANGUAGE.into(),
+        "PHP" => tree_sitter_php::LANGUAGE_PHP.into(),
+        _ => return None,
+    };
+    Some((language, name.to_string()))
 }
 
 /// Check if a node kind represents a definition
@@ -418,8 +467,13 @@ fn find_name_node<'a>(node: Node<'a>, language: &str) -> Option<Node<'a>> {
                     return Some(id);
                 }
             }
-            // For struct/class, name is in the type specifier
-            if kind == "struct_specifier" || kind == "class_specifier" || kind == "enum_specifier" {
+            // For struct/class/enum/namespace, the name is its own field. The
+            // namespace name node's kind is namespace_identifier, which the
+            // generic identifier fallback below does not match.
+            if matches!(
+                kind,
+                "struct_specifier" | "class_specifier" | "enum_specifier" | "namespace_definition"
+            ) {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     return Some(name_node);
                 }
@@ -690,5 +744,27 @@ class Calculator {
         let def = &definitions[0];
         let storage_id = def.to_storage_id();
         assert!(storage_id.contains("foo"));
+    }
+
+    #[test]
+    fn test_language_name_for_extension_c_family() {
+        assert_eq!(language_name_for_extension("c"), Some("C"));
+        for ext in ["h", "hh", "hxx", "hpp", "cpp", "cc", "cxx"] {
+            assert_eq!(language_name_for_extension(ext), Some("C++"), "{}", ext);
+        }
+        assert_eq!(language_name_for_extension("xyz"), None);
+    }
+
+    #[test]
+    fn test_header_extracted_with_cpp_grammar() {
+        let source = "class KioskNotify {\npublic:\n  void fire();\n};\nnamespace kiosk {\nstruct S {};\n}\n";
+        let file_info = make_file_info(source, "h");
+        let extractor = SymbolExtractor::new();
+        let definitions = extractor.extract_definitions(&file_info).unwrap();
+
+        // The C grammar yielded no class or namespace nodes for headers.
+        assert!(definitions.iter().any(|d| d.name() == "KioskNotify"));
+        assert!(definitions.iter().any(|d| d.name() == "kiosk"));
+        assert!(definitions.iter().any(|d| d.name() == "S"));
     }
 }

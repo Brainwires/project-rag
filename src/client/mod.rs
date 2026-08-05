@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::embedding::{EmbeddingProvider, FastEmbedManager};
 use crate::git_cache::GitCache;
 use crate::indexer::{CodeChunker, FileInfo, detect_language};
+use crate::relations::storage::{LanceRelationsStore, RelationsStore};
 use crate::relations::{
     DefinitionResult, HybridRelationsProvider, ReferenceResult, RelationsProvider,
 };
@@ -36,6 +37,12 @@ pub(crate) use fs_lock::FsLockGuard;
 // Index locking mechanism (uses fs_lock for cross-process, broadcast for in-process)
 mod index_lock;
 pub(crate) use index_lock::{IndexLockGuard, IndexLockResult, IndexingOperation};
+
+// read_file/edit_file: single-file read and write-then-reindex operations
+mod file_ops;
+
+// find_unused: unused import and dead-symbol candidate detection
+mod find_unused;
 
 /// Main client for interacting with the RAG system
 ///
@@ -87,6 +94,8 @@ pub struct RagClient {
     pub(crate) indexing_ops: Arc<RwLock<HashMap<String, IndexingOperation>>>,
     // Relations provider for code navigation (find definition, references, call graph)
     pub(crate) relations_provider: Arc<HybridRelationsProvider>,
+    // Persistent store for extracted definitions/references (shares the LanceDB directory)
+    pub(crate) relations_store: Arc<LanceRelationsStore>,
 }
 
 impl RagClient {
@@ -194,6 +203,14 @@ impl RagClient {
                 .context("Failed to initialize relations provider")?,
         );
 
+        // Relations store lives in the same LanceDB directory as the embeddings
+        // table, so one database directory holds everything the index knows.
+        let relations_store = Arc::new(
+            LanceRelationsStore::new(config.vector_db.lancedb_path.clone())
+                .await
+                .context("Failed to initialize relations store")?,
+        );
+
         Ok(Self {
             embedding_provider,
             vector_db,
@@ -205,6 +222,7 @@ impl RagClient {
             config: Arc::new(config),
             indexing_ops: Arc::new(RwLock::new(HashMap::new())),
             relations_provider,
+            relations_store,
         })
     }
 
@@ -222,6 +240,13 @@ impl RagClient {
 
     /// Create FileInfo from a file path for relations analysis
     fn create_file_info(&self, file_path: &str, project: Option<String>) -> Result<FileInfo> {
+        Self::build_file_info(file_path, project)
+    }
+
+    /// Associated form of create_file_info: it uses no client state, and the
+    /// include resolver in find_unused needs it inside a spawn_blocking closure
+    /// that cannot borrow the client.
+    pub(crate) fn build_file_info(file_path: &str, project: Option<String>) -> Result<FileInfo> {
         use std::path::Path;
 
         let path = Path::new(file_path);
@@ -236,12 +261,10 @@ impl RagClient {
             .and_then(|e| e.to_str())
             .map(|s| s.to_string());
 
-        let language = extension.as_ref().and_then(|ext| {
-            detect_language(ext)
-        });
+        let language = extension.as_ref().and_then(|ext| detect_language(ext));
 
         // Compute file hash
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         let hash = format!("{:x}", hasher.finalize());
@@ -484,6 +507,7 @@ impl RagClient {
     /// let request = QueryRequest {
     ///     query: "authentication logic".to_string(),
     ///     project: Some("my-project".to_string()),
+    ///     path: None,
     ///     limit: 10,
     ///     min_score: 0.7,
     ///     hybrid: true,
@@ -660,6 +684,13 @@ impl RagClient {
             .await
             .context("Failed to get statistics")?;
 
+        // Relations counts are best-effort: statistics must not fail just
+        // because the relations tables are unreadable.
+        let relations_stats = self.relations_store.get_stats().await.unwrap_or_else(|e| {
+            tracing::warn!("Failed to get relations statistics: {:#}", e);
+            Default::default()
+        });
+
         let language_breakdown = stats
             .language_breakdown
             .into_iter()
@@ -676,6 +707,9 @@ impl RagClient {
             total_embeddings: stats.total_vectors,
             database_size_bytes: stats.database_size_bytes,
             language_breakdown,
+            total_definitions: relations_stats.definition_count,
+            total_references: relations_stats.reference_count,
+            files_with_definitions: relations_stats.files_with_definitions,
         })
     }
 
@@ -714,6 +748,11 @@ impl RagClient {
                 }
                 if let Err(e) = git_cache.save(&self.git_cache_path) {
                     tracing::warn!("Failed to save cleared git cache: {}", e);
+                }
+
+                // Also clear stored definitions/references
+                if let Err(e) = self.relations_store.clear().await {
+                    tracing::warn!("Failed to clear relations store: {}", e);
                 }
 
                 if let Err(e) = self
@@ -872,10 +911,18 @@ impl RagClient {
         };
 
         if let Some(name) = Self::identifier_at(content, line, column) {
+            // Prefer a real definition over an import binding of the same name:
+            // `use foo::helper;` plus `fn helper()` in one file must resolve to the
+            // function. Import defs span one line, so on span alone they would win.
             let exact = definitions
                 .iter()
                 .filter(|d| d.symbol_id.name == name && is_candidate(d))
-                .min_by_key(|d| d.end_line.saturating_sub(d.symbol_id.start_line));
+                .min_by_key(|d| {
+                    (
+                        d.symbol_id.kind == crate::relations::SymbolKind::Import,
+                        d.end_line.saturating_sub(d.symbol_id.start_line),
+                    )
+                });
             if exact.is_some() {
                 return exact;
             }
@@ -883,9 +930,7 @@ impl RagClient {
 
         definitions
             .iter()
-            .filter(|d| {
-                is_candidate(d) && line >= d.symbol_id.start_line && line <= d.end_line
-            })
+            .filter(|d| is_candidate(d) && line >= d.symbol_id.start_line && line <= d.end_line)
             .min_by_key(|d| d.end_line.saturating_sub(d.symbol_id.start_line))
     }
 
@@ -930,7 +975,10 @@ impl RagClient {
         Ok(files)
     }
 
-    pub async fn find_definition(&self, request: FindDefinitionRequest) -> Result<FindDefinitionResponse> {
+    pub async fn find_definition(
+        &self,
+        request: FindDefinitionRequest,
+    ) -> Result<FindDefinitionResponse> {
         let start = Instant::now();
 
         // Validate request
@@ -978,7 +1026,10 @@ impl RagClient {
     /// # Returns
     ///
     /// A response containing the list of references found
-    pub async fn find_references(&self, request: FindReferencesRequest) -> Result<FindReferencesResponse> {
+    pub async fn find_references(
+        &self,
+        request: FindReferencesRequest,
+    ) -> Result<FindReferencesResponse> {
         let start = Instant::now();
 
         // Validate request
@@ -1039,7 +1090,11 @@ impl RagClient {
         // from elsewhere, which is the normal case for a public API.
         let mut scan_targets: Vec<std::path::PathBuf> = vec![file_info.path.clone()];
         match self
-            .files_mentioning(&symbol_name_str, request.project.clone(), request.limit.max(20))
+            .files_mentioning(
+                &symbol_name_str,
+                request.project.clone(),
+                request.limit.max(20),
+            )
             .await
         {
             Ok(found) => {
@@ -1049,7 +1104,10 @@ impl RagClient {
                     }
                 }
             }
-            Err(e) => tracing::warn!("Candidate lookup failed, scanning defining file only: {}", e),
+            Err(e) => tracing::warn!(
+                "Candidate lookup failed, scanning defining file only: {}",
+                e
+            ),
         }
 
         let mut matching_refs: Vec<ReferenceResult> = Vec::new();
@@ -1107,9 +1165,22 @@ impl RagClient {
     fn is_call_like_keyword(name: &str) -> bool {
         matches!(
             name,
-            "if" | "for" | "while" | "switch" | "catch" | "return" | "sizeof"
-                | "do" | "else" | "new" | "delete" | "throw" | "defined"
-                | "static_cast" | "dynamic_cast" | "reinterpret_cast" | "const_cast"
+            "if" | "for"
+                | "while"
+                | "switch"
+                | "catch"
+                | "return"
+                | "sizeof"
+                | "do"
+                | "else"
+                | "new"
+                | "delete"
+                | "throw"
+                | "defined"
+                | "static_cast"
+                | "dynamic_cast"
+                | "reinterpret_cast"
+                | "const_cast"
         )
     }
     /// Identifiers that appear immediately before an opening parenthesis inside the
@@ -1130,7 +1201,8 @@ impl RagClient {
             while i < bytes.len() {
                 if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
                     let start = i;
-                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                    {
                         i += 1;
                     }
                     let mut j = i;
@@ -1165,7 +1237,10 @@ impl RagClient {
     /// # Returns
     ///
     /// A response containing the root symbol and its call graph
-    pub async fn get_call_graph(&self, request: GetCallGraphRequest) -> Result<GetCallGraphResponse> {
+    pub async fn get_call_graph(
+        &self,
+        request: GetCallGraphRequest,
+    ) -> Result<GetCallGraphResponse> {
         let start = Instant::now();
 
         // Validate request
@@ -1266,7 +1341,8 @@ impl RagClient {
                 if !probed_files.insert(f.clone()) {
                     continue;
                 }
-                let fi = match self.create_file_info(&f.to_string_lossy(), request.project.clone()) {
+                let fi = match self.create_file_info(&f.to_string_lossy(), request.project.clone())
+                {
                     Ok(fi) => fi,
                     Err(e) => {
                         tracing::debug!("Skipping unreadable callee candidate {:?}: {}", f, e);
@@ -1276,7 +1352,10 @@ impl RagClient {
                 match self.relations_provider.extract_definitions(&fi) {
                     Ok(defs) => {
                         for d in defs {
-                            callee_index.entry(d.symbol_id.name.clone()).or_default().push(d);
+                            callee_index
+                                .entry(d.symbol_id.name.clone())
+                                .or_default()
+                                .push(d);
                         }
                     }
                     Err(e) => tracing::debug!("Definition extraction failed for {:?}: {}", f, e),
@@ -1314,7 +1393,10 @@ impl RagClient {
                     }
                 }
             }
-            Err(e) => tracing::warn!("Candidate lookup failed, scanning defining file only: {}", e),
+            Err(e) => tracing::warn!(
+                "Candidate lookup failed, scanning defining file only: {}",
+                e
+            ),
         }
 
         let mut seen_callers = std::collections::HashSet::new();
@@ -1369,10 +1451,8 @@ impl RagClient {
                     .min_by_key(|def| def.end_line.saturating_sub(def.symbol_id.start_line));
 
                 if let Some(def) = enclosing
-                    && seen_callers.insert((
-                        scan_info.relative_path.clone(),
-                        def.symbol_id.name.clone(),
-                    ))
+                    && seen_callers
+                        .insert((scan_info.relative_path.clone(), def.symbol_id.name.clone()))
                 {
                     callers.push(crate::relations::CallGraphNode {
                         name: def.symbol_id.name.clone(),
@@ -1408,8 +1488,17 @@ impl RagClient {
             .filter(|name| seen_callees.insert(name.clone()))
             .filter_map(|name| {
                 // Resolve against the widened index so a callee defined in another
-                // translation unit still resolves to a definition.
-                callee_index.get(&name).and_then(|defs| defs.first()).cloned()
+                // translation unit still resolves to a definition. Skip past import
+                // bindings: the callee should be shown at its real definition, not at
+                // the `use`/`import` line that pulled it into this file.
+                callee_index
+                    .get(&name)
+                    .and_then(|defs| {
+                        defs.iter()
+                            .find(|d| d.symbol_id.kind != crate::relations::SymbolKind::Import)
+                            .or_else(|| defs.first())
+                    })
+                    .cloned()
             })
             .map(|def| crate::relations::CallGraphNode {
                 name: def.symbol_id.name.clone(),

@@ -1,6 +1,13 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+mod file_ops;
+pub use file_ops::{EditFileRequest, EditFileResponse, ReadFileRequest, ReadFileResponse};
+mod find_unused;
+pub use find_unused::{
+    FindUnusedRequest, FindUnusedResponse, SymbolRejections, UnusedCandidate, UnverifiableImport,
+};
+
 /// Request to index a codebase
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IndexRequest {
@@ -150,6 +157,16 @@ pub struct StatisticsResponse {
     pub database_size_bytes: u64,
     /// Breakdown by programming language
     pub language_breakdown: Vec<LanguageStats>,
+    /// Total symbol definitions in the relations store (populated during indexing)
+    #[serde(default)]
+    pub total_definitions: usize,
+    /// Total symbol references in the relations store (populated on demand,
+    /// e.g. by tools that verify usage; 0 unless references were stored)
+    #[serde(default)]
+    pub total_references: usize,
+    /// Number of files with at least one stored definition
+    #[serde(default)]
+    pub files_with_definitions: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -395,7 +412,10 @@ impl FindReferencesRequest {
         }
         const MAX_LIMIT: usize = 10000;
         if self.limit > MAX_LIMIT {
-            return Err(format!("limit too large: {} (max: {})", self.limit, MAX_LIMIT));
+            return Err(format!(
+                "limit too large: {} (max: {})",
+                self.limit, MAX_LIMIT
+            ));
         }
         Ok(())
     }
@@ -458,7 +478,10 @@ impl GetCallGraphRequest {
         }
         const MAX_DEPTH: usize = 10;
         if self.depth > MAX_DEPTH {
-            return Err(format!("depth too large: {} (max: {})", self.depth, MAX_DEPTH));
+            return Err(format!(
+                "depth too large: {} (max: {})",
+                self.depth, MAX_DEPTH
+            ));
         }
         Ok(())
     }

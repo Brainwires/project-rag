@@ -184,8 +184,7 @@ fn test_walk_file_info_fields() {
     let file_path = temp_dir.path().join("test.rs");
     fs::write(&file_path, "fn main() {}").unwrap();
 
-    let walker =
-        FileWalker::new(temp_dir.path(), 1024).with_project(Some("test-proj".to_string()));
+    let walker = FileWalker::new(temp_dir.path(), 1024).with_project(Some("test-proj".to_string()));
     let files = walker.walk().unwrap();
     assert_eq!(files.len(), 1);
 
@@ -278,8 +277,7 @@ fn test_matches_patterns_include_multiple() {
 
 #[test]
 fn test_matches_patterns_exclude_match() {
-    let walker =
-        FileWalker::new("/tmp", 1024).with_patterns(vec![], vec!["target".to_string()]);
+    let walker = FileWalker::new("/tmp", 1024).with_patterns(vec![], vec!["target".to_string()]);
     assert!(walker.matches_patterns(Path::new("/tmp/src/main.rs")));
     assert!(!walker.matches_patterns(Path::new("/tmp/target/debug/main")));
 }

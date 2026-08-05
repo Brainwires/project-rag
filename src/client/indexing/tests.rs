@@ -980,8 +980,14 @@ async fn test_concurrent_index_same_path_waits_for_result() {
     // - Other task waits for filesystem lock, then returns (files_indexed = 0 since it waited)
     //
     // The important thing is both succeed without errors
-    assert!(response1.errors.is_empty(), "Task 1 should succeed without errors");
-    assert!(response2.errors.is_empty(), "Task 2 should succeed without errors");
+    assert!(
+        response1.errors.is_empty(),
+        "Task 1 should succeed without errors"
+    );
+    assert!(
+        response2.errors.is_empty(),
+        "Task 2 should succeed without errors"
+    );
 
     // At least one should have done actual indexing
     let total = response1.files_indexed + response2.files_indexed;
@@ -1047,8 +1053,14 @@ async fn test_concurrent_index_different_paths_both_run() {
 
     // Both should succeed independently
     let (result1, result2) = tokio::join!(handle1, handle2);
-    assert!(result1.unwrap().is_ok(), "First path should index successfully");
-    assert!(result2.unwrap().is_ok(), "Second path should index successfully");
+    assert!(
+        result1.unwrap().is_ok(),
+        "First path should index successfully"
+    );
+    assert!(
+        result2.unwrap().is_ok(),
+        "Second path should index successfully"
+    );
 }
 
 // ===== Cancellation Tests =====
@@ -1277,10 +1289,16 @@ async fn test_uncancelled_token_completes_normally() {
 async fn test_cancel_token_cancellation_is_detected() {
     // Test that our check_cancelled macro works correctly
     let cancel_token = CancellationToken::new();
-    assert!(!cancel_token.is_cancelled(), "Should not be cancelled initially");
+    assert!(
+        !cancel_token.is_cancelled(),
+        "Should not be cancelled initially"
+    );
 
     cancel_token.cancel();
-    assert!(cancel_token.is_cancelled(), "Should be cancelled after cancel()");
+    assert!(
+        cancel_token.is_cancelled(),
+        "Should be cancelled after cancel()"
+    );
 }
 
 #[tokio::test]
@@ -1296,7 +1314,9 @@ async fn test_cancellation_during_embedding_batch() {
             data_dir.join(format!("file{}.rs", i)),
             format!(
                 "fn func_{} () {{\n    let x = {};\n    let y = {};\n    println!(\"test\");\n}}",
-                i, i, i * 2
+                i,
+                i,
+                i * 2
             ),
         )
         .unwrap();

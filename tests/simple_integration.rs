@@ -38,7 +38,10 @@ async fn test_path_normalization() -> Result<()> {
     // Test path normalization with current directory
     let normalized = RagMcpServer::normalize_path(".")?;
     assert!(normalized.len() > 1);
-    assert!(normalized.starts_with('/') || normalized.chars().nth(1) == Some(':'));
+    // Canonicalization must yield an absolute path. Checked via Path rather
+    // than string shape: on Windows the result is the verbatim form
+    // (`\\?\C:\...`), which has neither a leading '/' nor ':' at index 1.
+    assert!(std::path::Path::new(&normalized).is_absolute());
 
     Ok(())
 }

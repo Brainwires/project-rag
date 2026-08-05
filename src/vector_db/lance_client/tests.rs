@@ -245,15 +245,7 @@ mod tests {
 
         // Query text matches ONLY target.rs; query vector is closest to the near*.rs rows.
         let results = db
-            .search(
-                vec![0.1; 384],
-                "zzzuniquesymbol",
-                10,
-                0.0,
-                None,
-                None,
-                true,
-            )
+            .search(vec![0.1; 384], "zzzuniquesymbol", 10, 0.0, None, None, true)
             .await
             .unwrap();
 
@@ -306,15 +298,7 @@ mod tests {
         .unwrap();
 
         let results = db
-            .search(
-                vec![0.5; 384],
-                "zzzuniquecommit",
-                10,
-                0.0,
-                None,
-                None,
-                true,
-            )
+            .search(vec![0.5; 384], "zzzuniquecommit", 10, 0.0, None, None, true)
             .await
             .unwrap();
 

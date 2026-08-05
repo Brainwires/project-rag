@@ -50,6 +50,7 @@
 //!     let query_req = QueryRequest {
 //!         query: "authentication logic".to_string(),
 //!         project: Some("my-project".to_string()),
+//!         path: None,
 //!         limit: 10,
 //!         min_score: 0.7,
 //!         hybrid: true,
@@ -72,11 +73,9 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     // Create server (internally creates a RagClient)
-//!     let server = RagMcpServer::new().await?;
-//!
-//!     // Serve over stdio (MCP protocol)
-//!     server.serve_stdio().await?;
+//!     // Serve over stdio (MCP protocol). This associated function creates the
+//!     // server (and its RagClient) internally and runs until the client disconnects.
+//!     RagMcpServer::serve_stdio().await?;
 //!
 //!     Ok(())
 //! }
@@ -86,6 +85,7 @@
 //!
 //! ```no_run
 //! use project_rag::{RagClient, mcp_server::RagMcpServer};
+//! use rmcp::ServiceExt;
 //! use std::sync::Arc;
 //!
 //! #[tokio::main]
@@ -93,10 +93,9 @@
 //!     // Create client with custom configuration
 //!     let client = RagClient::new().await?;
 //!
-//!     // Wrap client in MCP server
+//!     // Wrap client in MCP server and serve it over stdio
 //!     let server = RagMcpServer::with_client(Arc::new(client))?;
-//!
-//!     server.serve_stdio().await?;
+//!     server.serve(rmcp::transport::io::stdio()).await?.waiting().await?;
 //!     Ok(())
 //! }
 //! ```

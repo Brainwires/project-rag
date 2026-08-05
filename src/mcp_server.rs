@@ -225,7 +225,9 @@ impl RagMcpServer {
         serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
     }
 
-    #[tool(description = "Find the definition of a symbol at a given file location (line and column)")]
+    #[tool(
+        description = "Find the definition of a symbol at a given file location (line and column)"
+    )]
     async fn find_definition(
         &self,
         Parameters(req): Parameters<FindDefinitionRequest>,
@@ -259,7 +261,9 @@ impl RagMcpServer {
         serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
     }
 
-    #[tool(description = "Get the call graph for a function at a given file location (callers and callees)")]
+    #[tool(
+        description = "Get the call graph for a function at a given file location (callers and callees)"
+    )]
     async fn get_call_graph(
         &self,
         Parameters(req): Parameters<GetCallGraphRequest>,
@@ -289,6 +293,60 @@ impl RagMcpServer {
         let response = self
             .client
             .list_symbols(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
+
+    #[tool(
+        description = "Read a slice (or all) of a file's current on-disk content. The file must be inside an already-indexed project root. Returns a SHA256 file_hash to pass as expected_hash to edit_file so edits can be rejected if the file changed since this read. Large ranges are capped per call (truncated: true) rather than dropped silently - page through with start_line/end_line."
+    )]
+    async fn read_file(
+        &self,
+        Parameters(req): Parameters<ReadFileRequest>,
+    ) -> Result<String, String> {
+        req.validate()?;
+
+        let response = self
+            .client
+            .read_file(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
+
+    #[tool(
+        description = "Replace a line range (or the whole file) in a file inside an already-indexed project root, then automatically reindex that root so search results stay current. Pass expected_hash (from read_file) to guard against overwriting a change you haven't seen - a mismatch returns status: \"hash_conflict\" instead of applying the edit. Omit start_line/end_line to replace or create the whole file. Set start_line to end_line + 1 to insert content without deleting anything."
+    )]
+    async fn edit_file(
+        &self,
+        Parameters(req): Parameters<EditFileRequest>,
+    ) -> Result<String, String> {
+        req.validate()?;
+
+        let response = self
+            .client
+            .edit_file(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
+
+    #[tool(
+        description = "Find unused imports and dead-code candidates in a file or directory. check: \"imports\" flags import/use/include bindings never referenced in their file (index-free); \"symbols\" flags definitions nothing references, using the index to verify cross-file usage (requires index_codebase first); \"all\" (default) does both. Candidates carry a confidence level (high/medium/low) - the analysis is text-based, so dynamic dispatch, macros and framework wiring are invisible to it. Treat results as leads to verify, never as safe to auto-delete."
+    )]
+    async fn find_unused(
+        &self,
+        Parameters(req): Parameters<FindUnusedRequest>,
+    ) -> Result<String, String> {
+        req.validate()?;
+
+        let response = self
+            .client
+            .find_unused(req)
             .await
             .map_err(|e| format!("{:#}", e))?;
 
@@ -462,6 +520,61 @@ impl RagMcpServer {
             ),
         )])
     }
+
+    #[prompt(
+        name = "read",
+        description = "Read a slice (or all) of a file's current content"
+    )]
+    async fn read_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let file = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
+
+        Ok(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!("Please read the file '{}'.", file),
+        )])
+    }
+
+    #[prompt(
+        name = "edit",
+        description = "Edit a file inside an indexed project and reindex it automatically"
+    )]
+    async fn edit_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let file = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
+
+        Ok(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Please edit the file '{}'. First read it with read_file to get its current content and file_hash, then call edit_file with the new content and that expected_hash.",
+                file
+            ),
+        )])
+    }
+
+    #[prompt(
+        name = "unused",
+        description = "Find unused imports and dead-code candidates in a file or directory"
+    )]
+    async fn unused_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+
+        Ok(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Please run the find_unused tool on '{}' and summarize the findings grouped by confidence. \
+                 Remind me that candidates are leads to verify, not guaranteed dead code.",
+                path
+            ),
+        )])
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -484,7 +597,10 @@ impl ServerHandler for RagMcpServer {
             instructions: Some(
                 "RAG-based codebase indexing and semantic search. \
                 Use index_codebase to create embeddings (automatically performs full or incremental indexing), \
-                query_codebase to search, and search_by_filters for advanced queries."
+                query_codebase to search, and search_by_filters for advanced queries. \
+                Use read_file and edit_file to read and modify files inside an indexed project; \
+                edit_file automatically reindexes the affected file. \
+                Use find_unused to surface unused imports and dead-code candidates for cleanup."
                     .into(),
             ),
         }

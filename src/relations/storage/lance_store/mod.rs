@@ -1,0 +1,431 @@
+//! LanceDB-based storage for code relationships.
+//!
+//! Definitions and references live in two tables (`relations_definitions`,
+//! `relations_references`) inside the same LanceDB directory as the embeddings
+//! table, so one database directory holds everything the index knows.
+//!
+//! Writes are idempotent per file: storing rows for a file first deletes
+//! whatever that file had, so re-indexing never accumulates duplicates.
+
+mod codec;
+
+use anyhow::{Context, Result};
+use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
+use arrow_schema::Schema;
+use async_trait::async_trait;
+use futures::stream::TryStreamExt;
+use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::{Connection, Table};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use super::{RelationsStats, RelationsStore};
+use crate::relations::types::{CallEdge, Definition, Reference, ReferenceKind, SymbolKind};
+
+const DEFINITIONS_TABLE: &str = "relations_definitions";
+const REFERENCES_TABLE: &str = "relations_references";
+
+/// Delete filters are built as `file_path IN (...)`; chunked so a large batch
+/// of files cannot produce an absurdly long filter string.
+const DELETE_CHUNK: usize = 400;
+
+/// LanceDB-based relations store.
+pub struct LanceRelationsStore {
+    /// Path to the database directory
+    db_path: PathBuf,
+    /// Database connection (lazy initialized)
+    db: Arc<RwLock<Option<Connection>>>,
+}
+
+impl LanceRelationsStore {
+    /// Create a new LanceDB relations store
+    pub async fn new(db_path: PathBuf) -> Result<Self> {
+        tokio::fs::create_dir_all(&db_path)
+            .await
+            .context("Failed to create relations database directory")?;
+
+        Ok(Self {
+            db_path,
+            db: Arc::new(RwLock::new(None)),
+        })
+    }
+
+    /// Get or create the database connection
+    async fn get_connection(&self) -> Result<Connection> {
+        let mut db_guard = self.db.write().await;
+
+        if let Some(ref db) = *db_guard {
+            return Ok(db.clone());
+        }
+
+        let db = lancedb::connect(self.db_path.to_string_lossy().as_ref())
+            .execute()
+            .await
+            .context("Failed to connect to LanceDB")?;
+
+        *db_guard = Some(db.clone());
+        Ok(db)
+    }
+
+    /// Open a table, creating it empty with the given schema if it does not exist.
+    async fn open_or_create(&self, name: &str, schema: Arc<Schema>) -> Result<Table> {
+        let db = self.get_connection().await?;
+
+        if let Ok(table) = db.open_table(name).execute().await {
+            return Ok(table);
+        }
+
+        let empty = RecordBatch::new_empty(schema.clone());
+        let batches = RecordBatchIterator::new(vec![empty].into_iter().map(Ok), schema);
+        match db.create_table(name, Box::new(batches)).execute().await {
+            Ok(table) => Ok(table),
+            // Lost a creation race; the table exists now, so open it.
+            Err(_) => db
+                .open_table(name)
+                .execute()
+                .await
+                .with_context(|| format!("Failed to open or create table {}", name)),
+        }
+    }
+
+    async fn definitions_table(&self) -> Result<Table> {
+        self.open_or_create(DEFINITIONS_TABLE, codec::definitions_schema())
+            .await
+    }
+
+    async fn references_table(&self) -> Result<Table> {
+        self.open_or_create(REFERENCES_TABLE, codec::references_schema())
+            .await
+    }
+
+    async fn collect_batches(table: &Table, filter: &str) -> Result<Vec<RecordBatch>> {
+        let stream = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .with_context(|| format!("Failed to query with filter: {}", filter))?;
+        stream
+            .try_collect()
+            .await
+            .context("Failed to collect query results")
+    }
+
+    async fn query_definitions(&self, filter: &str) -> Result<Vec<Definition>> {
+        let table = self.definitions_table().await?;
+        let batches = Self::collect_batches(&table, filter).await?;
+        let mut out = Vec::new();
+        for batch in &batches {
+            out.extend(codec::batch_to_definitions(batch)?);
+        }
+        Ok(out)
+    }
+
+    async fn query_references(&self, filter: &str) -> Result<Vec<Reference>> {
+        let table = self.references_table().await?;
+        let batches = Self::collect_batches(&table, filter).await?;
+        let mut out = Vec::new();
+        for batch in &batches {
+            out.extend(codec::batch_to_references(batch)?);
+        }
+        Ok(out)
+    }
+
+    /// Delete every row belonging to the given files.
+    async fn delete_files(table: &Table, files: &[String]) -> Result<()> {
+        for chunk in files.chunks(DELETE_CHUNK) {
+            let filter = format!("file_path IN ({})", codec::sql_in_list(chunk));
+            table
+                .delete(&filter)
+                .await
+                .context("Failed to delete rows by file")?;
+        }
+        Ok(())
+    }
+
+    /// The innermost function or method in `definitions` whose span contains `line`.
+    fn enclosing_function(definitions: &[Definition], line: usize) -> Option<&Definition> {
+        definitions
+            .iter()
+            .filter(|d| {
+                matches!(d.symbol_id.kind, SymbolKind::Function | SymbolKind::Method)
+                    && line >= d.symbol_id.start_line
+                    && line <= d.end_line
+            })
+            .min_by_key(|d| d.end_line.saturating_sub(d.symbol_id.start_line))
+    }
+}
+
+#[async_trait]
+impl RelationsStore for LanceRelationsStore {
+    async fn store_definitions(
+        &self,
+        definitions: Vec<Definition>,
+        _root_path: &str,
+    ) -> Result<usize> {
+        if definitions.is_empty() {
+            return Ok(0);
+        }
+
+        let table = self.definitions_table().await?;
+
+        // Idempotent per file: replace whatever rows those files had.
+        let files: Vec<String> = definitions
+            .iter()
+            .map(|d| d.file_path().to_string())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        Self::delete_files(&table, &files).await?;
+
+        let batch = codec::definitions_to_batch(&definitions)?;
+        let count = batch.num_rows();
+        let batches =
+            RecordBatchIterator::new(vec![batch].into_iter().map(Ok), codec::definitions_schema());
+        table
+            .add(Box::new(batches))
+            .execute()
+            .await
+            .context("Failed to store definitions")?;
+
+        tracing::debug!("Stored {} definitions for {} files", count, files.len());
+        Ok(count)
+    }
+
+    async fn store_references(
+        &self,
+        references: Vec<Reference>,
+        _root_path: &str,
+    ) -> Result<usize> {
+        if references.is_empty() {
+            return Ok(0);
+        }
+
+        let table = self.references_table().await?;
+
+        let files: Vec<String> = references
+            .iter()
+            .map(|r| r.file_path.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        Self::delete_files(&table, &files).await?;
+
+        let batch = codec::references_to_batch(&references)?;
+        let count = batch.num_rows();
+        let batches =
+            RecordBatchIterator::new(vec![batch].into_iter().map(Ok), codec::references_schema());
+        table
+            .add(Box::new(batches))
+            .execute()
+            .await
+            .context("Failed to store references")?;
+
+        tracing::debug!("Stored {} references for {} files", count, files.len());
+        Ok(count)
+    }
+
+    async fn find_definition_at(
+        &self,
+        file_path: &str,
+        line: usize,
+        _column: usize,
+    ) -> Result<Option<Definition>> {
+        let filter = format!(
+            "file_path = '{}' AND start_line <= {} AND end_line >= {}",
+            codec::escape_sql(file_path),
+            line,
+            line
+        );
+        let matches = self.query_definitions(&filter).await?;
+        // Innermost definition wins: the nested symbol, not its container.
+        Ok(matches
+            .into_iter()
+            .min_by_key(|d| d.end_line.saturating_sub(d.symbol_id.start_line)))
+    }
+
+    async fn find_definitions_by_name(&self, name: &str) -> Result<Vec<Definition>> {
+        let filter = format!("name = '{}'", codec::escape_sql(name));
+        self.query_definitions(&filter).await
+    }
+
+    async fn find_references(&self, target_symbol_id: &str) -> Result<Vec<Reference>> {
+        let filter = format!(
+            "target_symbol_id = '{}'",
+            codec::escape_sql(target_symbol_id)
+        );
+        self.query_references(&filter).await
+    }
+
+    async fn get_callers(&self, symbol_id: &str) -> Result<Vec<CallEdge>> {
+        let filter = format!(
+            "target_symbol_id = '{}' AND reference_kind = '{}'",
+            codec::escape_sql(symbol_id),
+            codec::enum_to_str(&ReferenceKind::Call)
+        );
+        let call_refs = self.query_references(&filter).await?;
+        if call_refs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Attribute each call site to the innermost function containing it in
+        // the file where the call occurs.
+        let files: Vec<String> = call_refs
+            .iter()
+            .map(|r| r.file_path.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let defs_filter = format!("file_path IN ({})", codec::sql_in_list(&files));
+        let defs = self.query_definitions(&defs_filter).await?;
+
+        let mut defs_by_file: HashMap<&str, Vec<Definition>> = HashMap::new();
+        for def in &defs {
+            defs_by_file
+                .entry(def.file_path())
+                .or_default()
+                .push(def.clone());
+        }
+
+        let mut seen = HashSet::new();
+        let mut edges = Vec::new();
+        for r in &call_refs {
+            let enclosing = defs_by_file
+                .get(r.file_path.as_str())
+                .and_then(|file_defs| Self::enclosing_function(file_defs, r.start_line));
+            if let Some(def) = enclosing {
+                let caller_id = def.to_storage_id();
+                if seen.insert((caller_id.clone(), r.start_line)) {
+                    edges.push(CallEdge {
+                        caller_id,
+                        callee_id: symbol_id.to_string(),
+                        call_site_file: r.file_path.clone(),
+                        call_site_line: r.start_line,
+                        call_site_col: r.start_col,
+                    });
+                }
+            }
+        }
+        Ok(edges)
+    }
+
+    async fn get_callees(&self, symbol_id: &str) -> Result<Vec<CallEdge>> {
+        let filter = format!("id = '{}'", codec::escape_sql(symbol_id));
+        let defs = self.query_definitions(&filter).await?;
+        let Some(def) = defs.first() else {
+            return Ok(Vec::new());
+        };
+
+        let refs_filter = format!(
+            "file_path = '{}' AND reference_kind = '{}' AND start_line >= {} AND start_line <= {}",
+            codec::escape_sql(def.file_path()),
+            codec::enum_to_str(&ReferenceKind::Call),
+            def.start_line(),
+            def.end_line
+        );
+        let call_refs = self.query_references(&refs_filter).await?;
+
+        let mut seen = HashSet::new();
+        Ok(call_refs
+            .into_iter()
+            .filter(|r| seen.insert((r.target_symbol_id.clone(), r.start_line)))
+            .map(|r| CallEdge {
+                caller_id: symbol_id.to_string(),
+                callee_id: r.target_symbol_id,
+                call_site_file: r.file_path,
+                call_site_line: r.start_line,
+                call_site_col: r.start_col,
+            })
+            .collect())
+    }
+
+    async fn delete_by_file(&self, file_path: &str) -> Result<usize> {
+        let filter = format!("file_path = '{}'", codec::escape_sql(file_path));
+
+        let defs_table = self.definitions_table().await?;
+        let refs_table = self.references_table().await?;
+
+        // LanceDB's delete does not report a count, so count first.
+        let removed = defs_table
+            .count_rows(Some(filter.clone()))
+            .await
+            .unwrap_or(0)
+            + refs_table
+                .count_rows(Some(filter.clone()))
+                .await
+                .unwrap_or(0);
+
+        defs_table
+            .delete(&filter)
+            .await
+            .context("Failed to delete definitions for file")?;
+        refs_table
+            .delete(&filter)
+            .await
+            .context("Failed to delete references for file")?;
+
+        Ok(removed)
+    }
+
+    async fn clear(&self) -> Result<()> {
+        let db = self.get_connection().await?;
+        for name in [DEFINITIONS_TABLE, REFERENCES_TABLE] {
+            if let Err(e) = db.drop_table(name, &[]).await {
+                // Dropping a table that was never created is not an error worth failing on.
+                tracing::debug!("Dropping relations table {} failed: {}", name, e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_stats(&self) -> Result<RelationsStats> {
+        let defs_table = self.definitions_table().await?;
+        let refs_table = self.references_table().await?;
+
+        let definition_count = defs_table
+            .count_rows(None)
+            .await
+            .context("Failed to count definitions")?;
+        let reference_count = refs_table
+            .count_rows(None)
+            .await
+            .context("Failed to count references")?;
+
+        // Distinct files with definitions.
+        let stream = defs_table
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "file_path".to_string(),
+            ]))
+            .execute()
+            .await
+            .context("Failed to query definition files")?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .context("Failed to collect definition files")?;
+
+        let mut files = HashSet::new();
+        for batch in &batches {
+            if let Some(paths) = batch
+                .column_by_name("file_path")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            {
+                for i in 0..batch.num_rows() {
+                    files.insert(paths.value(i).to_string());
+                }
+            }
+        }
+
+        Ok(RelationsStats {
+            definition_count,
+            reference_count,
+            files_with_definitions: files.len(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests;

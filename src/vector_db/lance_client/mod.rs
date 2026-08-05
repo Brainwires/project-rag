@@ -631,8 +631,8 @@ impl VectorDatabase for LanceVectorDB {
                     // For hybrid search, apply min_score intelligently:
                     // Accept if EITHER vector or keyword score meets threshold
                     // This allows pure keyword matches (weak vector) and pure semantic matches (weak keyword)
-                    let passes_filter = vector_score >= min_score
-                        || keyword_score.is_some_and(|k| k >= min_score);
+                    let passes_filter =
+                        vector_score >= min_score || keyword_score.is_some_and(|k| k >= min_score);
 
                     if !passes_filter {
                         continue;
@@ -820,7 +820,8 @@ impl VectorDatabase for LanceVectorDB {
         // the pool when a filter is actually present. The keyword arm helps here too now
         // that fusion works: a commit whose message contains the query terms is surfaced by
         // BM25 directly rather than having to win on vector distance.
-        let filtered = !file_extensions.is_empty() || !languages.is_empty() || !path_patterns.is_empty();
+        let filtered =
+            !file_extensions.is_empty() || !languages.is_empty() || !path_patterns.is_empty();
         let search_limit = if filtered {
             (limit * 20).max(200)
         } else {

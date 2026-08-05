@@ -1,14 +1,16 @@
 use super::RagClient;
 use crate::embedding::EmbeddingProvider;
-use crate::indexer::{CodeChunk, FileWalker};
+use crate::indexer::{CodeChunk, FileInfo, FileWalker};
+use crate::relations::RelationsProvider;
+use crate::relations::storage::RelationsStore;
 use crate::types::{ChunkMetadata, IndexResponse};
 use crate::vector_db::VectorDatabase;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rmcp::{Peer, RoleServer, model::ProgressNotificationParam, model::ProgressToken};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -20,6 +22,54 @@ macro_rules! check_cancelled {
             anyhow::bail!("Indexing was cancelled");
         }
     };
+}
+
+/// Extract symbol definitions (functions, classes, imports, ...) from the given
+/// files and persist them in the relations store.
+///
+/// Storage is idempotent per file, so calling this for modified files replaces
+/// their old symbols. Best-effort: a failure degrades relations queries but must
+/// not fail the indexing run, so it is reported through `errors` instead.
+async fn extract_and_store_definitions(
+    client: &RagClient,
+    files: &[FileInfo],
+    root_path: &str,
+    errors: &mut Vec<String>,
+) -> usize {
+    let provider = client.relations_provider.clone();
+    let definitions: Vec<_> = files
+        .par_iter()
+        .flat_map(|file| {
+            provider.extract_definitions(file).unwrap_or_else(|e| {
+                tracing::debug!(
+                    "Definition extraction failed for {}: {}",
+                    file.relative_path,
+                    e
+                );
+                Vec::new()
+            })
+        })
+        .collect();
+
+    if definitions.is_empty() {
+        return 0;
+    }
+
+    match client
+        .relations_store
+        .store_definitions(definitions, root_path)
+        .await
+    {
+        Ok(stored) => {
+            tracing::info!("Stored {} definitions for {} files", stored, files.len());
+            stored
+        }
+        Err(e) => {
+            tracing::warn!("Failed to store definitions: {:#}", e);
+            errors.push(format!("Failed to store definitions: {:#}", e));
+            0
+        }
+    }
 }
 
 /// Result of embedding generation with cancellation support
@@ -88,11 +138,8 @@ async fn generate_embeddings_with_cancellation(
             let provider = client.embedding_provider.clone();
             let embed_future = tokio::task::spawn_blocking(move || provider.embed_batch(texts));
 
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                embed_future,
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), embed_future)
+                .await
             {
                 Ok(Ok(Ok(embeddings))) => {
                     batch_embeddings.extend(embeddings);
@@ -126,8 +173,8 @@ async fn generate_embeddings_with_cancellation(
 
         // Send progress during embedding
         if let (Some(peer), Some(token)) = (peer, progress_token) {
-            let progress =
-                progress_start + ((batch_idx + 1) as f64 / total_batches as f64) * (progress_end - progress_start);
+            let progress = progress_start
+                + ((batch_idx + 1) as f64 / total_batches as f64) * (progress_end - progress_start);
             let _ = peer
                 .notify_progress(ProgressNotificationParam {
                     progress_token: token.clone(),
@@ -295,7 +342,10 @@ pub async fn do_index(
         .iter()
         .map(|c| c.metadata.clone())
         .collect();
-    let contents: Vec<String> = successful_chunks.iter().map(|c| c.content.clone()).collect();
+    let contents: Vec<String> = successful_chunks
+        .iter()
+        .map(|c| c.content.clone())
+        .collect();
 
     // Sanity check: ensure all arrays have the same length to prevent RecordBatch errors
     debug_assert_eq!(
@@ -319,6 +369,10 @@ pub async fn do_index(
             .await
             .context("Failed to store embeddings")?;
     }
+
+    // Persist symbol definitions (functions, classes, imports) alongside the
+    // embeddings so relations queries can be served from the database.
+    extract_and_store_definitions(client, &files, &path, &mut errors).await;
 
     // Send progress before saving cache
     if let (Some(peer), Some(token)) = (&peer, &progress_token) {
@@ -516,6 +570,9 @@ pub async fn do_incremental_update(
             if let Err(e) = client.vector_db.delete_by_file(old_file).await {
                 tracing::warn!("Failed to delete embeddings for removed file: {}", e);
             }
+            if let Err(e) = client.relations_store.delete_by_file(old_file).await {
+                tracing::warn!("Failed to delete relations for removed file: {}", e);
+            }
         }
     }
 
@@ -597,7 +654,10 @@ pub async fn do_incremental_update(
             .iter()
             .map(|c| c.metadata.clone())
             .collect();
-        let contents: Vec<String> = successful_chunks.iter().map(|c| c.content.clone()).collect();
+        let contents: Vec<String> = successful_chunks
+            .iter()
+            .map(|c| c.content.clone())
+            .collect();
 
         if !all_embeddings.is_empty() {
             client
@@ -606,6 +666,10 @@ pub async fn do_incremental_update(
                 .await
                 .context("Failed to store embeddings")?;
         }
+
+        // Refresh stored definitions for the changed files. Storage replaces rows
+        // per file, so modified files do not accumulate stale symbols.
+        extract_and_store_definitions(client, &files_to_index, &path, &mut Vec::new()).await;
 
         (all_embeddings.len(), embed_result.errors)
     } else {
@@ -703,7 +767,10 @@ pub async fn do_index_smart(
     match lock_result {
         IndexLockResult::WaitForResult(mut receiver) => {
             // Another task in THIS PROCESS is indexing, wait for its result via broadcast
-            tracing::info!("Waiting for existing indexing operation in this process to complete for: {}", path);
+            tracing::info!(
+                "Waiting for existing indexing operation in this process to complete for: {}",
+                path
+            );
 
             // Send progress notification if we have a peer
             if let (Some(peer), Some(token)) = (&peer, &progress_token) {
@@ -712,7 +779,9 @@ pub async fn do_index_smart(
                         progress_token: token.clone(),
                         progress: 0.0,
                         total: Some(100.0),
-                        message: Some("Waiting for existing indexing operation to complete...".into()),
+                        message: Some(
+                            "Waiting for existing indexing operation to complete...".into(),
+                        ),
                     })
                     .await;
             }
@@ -948,7 +1017,7 @@ async fn validate_dirty_flag(
 
 /// Inner implementation of smart indexing (called when we have the lock)
 #[allow(clippy::too_many_arguments)]
-async fn do_index_smart_inner(
+pub(crate) async fn do_index_smart_inner(
     client: &RagClient,
     path: String,
     project: Option<String>,
@@ -994,7 +1063,10 @@ async fn do_index_smart_inner(
                             progress_token: token.clone(),
                             progress: 0.0,
                             total: Some(100.0),
-                            message: Some(format!("Corrupted index detected ({}), clearing...", reason)),
+                            message: Some(format!(
+                                "Corrupted index detected ({}), clearing...",
+                                reason
+                            )),
                         })
                         .await;
                 }
@@ -1044,7 +1116,10 @@ async fn do_index_smart_inner(
                 let mut cache = client.hash_cache.write().await;
                 cache.clear_dirty(&normalized_path);
                 if let Err(e) = cache.save(&client.cache_path) {
-                    tracing::warn!("Failed to save cache after clearing stale dirty flag: {}", e);
+                    tracing::warn!(
+                        "Failed to save cache after clearing stale dirty flag: {}",
+                        e
+                    );
                 }
                 drop(cache);
                 // Proceed with incremental update
@@ -1067,7 +1142,9 @@ async fn do_index_smart_inner(
                             progress_token: token.clone(),
                             progress: 0.0,
                             total: Some(100.0),
-                            message: Some("Index appears complete, clearing stale dirty flag...".into()),
+                            message: Some(
+                                "Index appears complete, clearing stale dirty flag...".into(),
+                            ),
                         })
                         .await;
                 }
@@ -1149,7 +1226,10 @@ async fn do_index_smart_inner(
             let mut cache = client.hash_cache.write().await;
             cache.clear_dirty(&normalized_path);
             if let Err(e) = cache.save(&client.cache_path) {
-                tracing::warn!("Failed to clear dirty flag after successful indexing: {}", e);
+                tracing::warn!(
+                    "Failed to clear dirty flag after successful indexing: {}",
+                    e
+                );
                 // Don't fail the whole operation for this
             }
             tracing::debug!("Cleared dirty flag for: {}", normalized_path);
@@ -1177,10 +1257,17 @@ async fn clear_path_data(client: &RagClient, normalized_path: &str) -> Result<()
         .unwrap_or_default();
     drop(cache);
 
-    // Delete embeddings for each file
+    // Delete embeddings and stored relations for each file
     for file_path in file_paths {
         if let Err(e) = client.vector_db.delete_by_file(&file_path).await {
-            tracing::warn!("Failed to delete embeddings for file '{}': {}", file_path, e);
+            tracing::warn!(
+                "Failed to delete embeddings for file '{}': {}",
+                file_path,
+                e
+            );
+        }
+        if let Err(e) = client.relations_store.delete_by_file(&file_path).await {
+            tracing::warn!("Failed to delete relations for file '{}': {}", file_path, e);
         }
     }
 

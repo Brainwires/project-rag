@@ -156,6 +156,17 @@ impl RelationsProvider for HybridRelationsProvider {
             .extract_definitions(file_info)
     }
 
+    fn extract_definitions_reporting(
+        &self,
+        file_info: &FileInfo,
+    ) -> Result<(Vec<Definition>, Vec<SkippedDefinition>)> {
+        // Without this override the default trait impl answers with an empty
+        // skipped list, hiding every omission behind the hybrid dispatch.
+        let language = file_info.language.as_deref().unwrap_or("Unknown");
+        self.provider_for_language(language)
+            .extract_definitions_reporting(file_info)
+    }
+
     fn extract_references(
         &self,
         file_info: &FileInfo,

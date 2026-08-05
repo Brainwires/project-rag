@@ -127,6 +127,17 @@ impl SymbolKind {
             | "type_declaration" // Go
             => Self::TypeAlias,
 
+            // Imports
+            "use_declaration" // Rust
+            | "extern_crate_declaration" // Rust
+            | "import_statement" // Python, JS/TS
+            | "import_from_statement" // Python
+            | "import_declaration" // Go, Java, Swift
+            | "preproc_include" // C/C++
+            | "using_directive" // C#
+            | "namespace_use_declaration" // PHP
+            => Self::Import,
+
             _ => Self::Unknown,
         }
     }
@@ -578,10 +589,22 @@ mod tests {
 
     #[test]
     fn test_symbol_kind_from_ast_kind() {
-        assert_eq!(SymbolKind::from_ast_kind("function_item"), SymbolKind::Function);
-        assert_eq!(SymbolKind::from_ast_kind("class_definition"), SymbolKind::Class);
-        assert_eq!(SymbolKind::from_ast_kind("method_definition"), SymbolKind::Method);
-        assert_eq!(SymbolKind::from_ast_kind("unknown_node"), SymbolKind::Unknown);
+        assert_eq!(
+            SymbolKind::from_ast_kind("function_item"),
+            SymbolKind::Function
+        );
+        assert_eq!(
+            SymbolKind::from_ast_kind("class_definition"),
+            SymbolKind::Class
+        );
+        assert_eq!(
+            SymbolKind::from_ast_kind("method_definition"),
+            SymbolKind::Method
+        );
+        assert_eq!(
+            SymbolKind::from_ast_kind("unknown_node"),
+            SymbolKind::Unknown
+        );
     }
 
     #[test]
@@ -594,9 +617,18 @@ mod tests {
     #[test]
     fn test_visibility_from_keywords() {
         assert_eq!(Visibility::from_keywords("pub fn foo"), Visibility::Public);
-        assert_eq!(Visibility::from_keywords("public void bar"), Visibility::Public);
-        assert_eq!(Visibility::from_keywords("protected int x"), Visibility::Protected);
-        assert_eq!(Visibility::from_keywords("fn private_func"), Visibility::Private);
+        assert_eq!(
+            Visibility::from_keywords("public void bar"),
+            Visibility::Public
+        );
+        assert_eq!(
+            Visibility::from_keywords("protected int x"),
+            Visibility::Protected
+        );
+        assert_eq!(
+            Visibility::from_keywords("fn private_func"),
+            Visibility::Private
+        );
     }
 
     #[test]
