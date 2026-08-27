@@ -45,7 +45,9 @@ fn test_all_tools_and_prompts_are_routed() {
         "list_symbols",
         "read_file",
         "edit_file",
+        "apply_patch",
         "find_unused",
+        "validate_removal",
     ] {
         assert!(
             tool_names.iter().any(|n| n == expected),
@@ -56,7 +58,7 @@ fn test_all_tools_and_prompts_are_routed() {
     }
     assert_eq!(
         tool_names.len(),
-        13,
+        15,
         "unexpected tool count: {:?}",
         tool_names
     );
@@ -71,9 +73,11 @@ fn test_all_tools_and_prompts_are_routed() {
         "prompt 'unused' is not routed; routed prompts: {:?}",
         prompt_names
     );
+    assert!(prompt_names.iter().any(|n| n == "patch"));
+    assert!(prompt_names.iter().any(|n| n == "validate-removal"));
     assert_eq!(
         prompt_names.len(),
-        12,
+        14,
         "unexpected prompt count: {:?}",
         prompt_names
     );
@@ -135,6 +139,65 @@ fn test_find_unused_tool_schema() {
             .is_some_and(|d| d.contains("never as safe to auto-delete")),
         "tool description lost its safety warning"
     );
+}
+
+#[test]
+fn test_m5_editing_and_removal_tool_schemas() {
+    let router = RagMcpServer::tool_router();
+    let tools = router.list_all();
+
+    let patch_tool = tools
+        .iter()
+        .find(|tool| tool.name == "apply_patch")
+        .expect("apply_patch not routed");
+    let patch_schema = serde_json::to_value(&*patch_tool.input_schema).unwrap();
+    let patch_properties = patch_schema["properties"]
+        .as_object()
+        .expect("apply_patch schema has no properties");
+    assert!(patch_properties.contains_key("patches"));
+    assert!(patch_properties.contains_key("dry_run"));
+    assert!(patch_properties.contains_key("project"));
+    assert_eq!(patch_schema["required"], serde_json::json!(["patches"]));
+    let item_schema = &patch_properties["patches"]["items"];
+    let resolved_item_schema = item_schema
+        .get("$ref")
+        .and_then(|reference| reference.as_str())
+        .and_then(|reference| reference.strip_prefix('#'))
+        .and_then(|pointer| patch_schema.pointer(pointer))
+        .unwrap_or(item_schema);
+    let item_properties = resolved_item_schema["properties"]
+        .as_object()
+        .expect("FilePatch schema has no properties");
+    for field in [
+        "file_path",
+        "content",
+        "start_line",
+        "end_line",
+        "expected_hash",
+        "delete",
+    ] {
+        assert!(
+            item_properties.contains_key(field),
+            "schema missing '{field}'"
+        );
+    }
+    assert_eq!(
+        resolved_item_schema["required"],
+        serde_json::json!(["file_path"])
+    );
+
+    let removal_tool = tools
+        .iter()
+        .find(|tool| tool.name == "validate_removal")
+        .expect("validate_removal not routed");
+    let removal_schema = serde_json::to_value(&*removal_tool.input_schema).unwrap();
+    let removal_properties = removal_schema["properties"]
+        .as_object()
+        .expect("validate_removal schema has no properties");
+    assert!(removal_properties.contains_key("symbol_id"));
+    assert!(removal_properties.contains_key("configurations"));
+    assert!(removal_properties.contains_key("project"));
+    assert_eq!(removal_schema["required"], serde_json::json!(["symbol_id"]));
 }
 
 #[tokio::test]

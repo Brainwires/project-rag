@@ -117,7 +117,7 @@ search_by_filters(query="JWT validation", file_extensions=["rs", "go"])
 
 ## MCP Tools
 
-The server provides 13 tools that can be used directly:
+The server provides 15 tools that can be used directly:
 
 1. **index_codebase** - Smartly index a codebase directory
    - Automatically performs full indexing for new codebases
@@ -199,13 +199,23 @@ Normal retrieval never searches Git history implicitly. History results expose v
    - Accepts an expected hash to prevent overwriting unseen changes
    - Automatically reindexes the affected project
 
-13. **find_unused** - Conservative configuration-scoped unused analysis
+13. **apply_patch** - Atomic multi-file editing transaction
+   - Validates canonical paths, hashes, line ranges, encodings, newline styles, and sizes before writing
+   - Supports dry-run, creation, replacement, insertion, deletion, rollback, and one reindex per transaction
+   - Publishes one monotonic index generation or marks analysis stale on reindex failure
+
+14. **find_unused** - Conservative configuration-scoped unused analysis
    - Auto-discovers `compile_commands.json` and supports explicit build configurations
    - Tracks include paths, definitions, language standards, forced includes, and generated headers
    - Reports `unused_in_analyzed_configurations` or `inconclusive`, never context-free universal unused claims
    - Exposes analyzed config IDs, preprocessor state, completeness, unresolved dependency kinds, and limitations
    - Dynamic registration, reflection, generated wiring, missing configurations, and parser omissions prevent destructive-edit safety
    - `safe_for_destructive_edit` remains false; use findings as evidence to investigate, not permission to delete
+
+15. **validate_removal** - Scoped removal-safety validation
+   - Returns `SAFE`, `UNSAFE`, or `INCONCLUSIVE` for one authoritative current-tree symbol
+   - Checks resolved/uncertain references, build and preprocessor scope, generated wiring, and dynamic dispatch
+   - Reports evidence, limitations, blocking references, and the exact index generation analyzed
 
 ## Prerequisites
 

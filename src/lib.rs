@@ -167,12 +167,14 @@ pub mod mcp_server;
 
 // Re-export commonly used types for convenience
 pub use types::{
-    AdvancedSearchRequest, AnalysisCompleteness, ClearRequest, ClearResponse,
-    FindDefinitionRequest, FindDefinitionResponse, FindReferencesRequest, FindReferencesResponse,
-    FindUnusedRequest, FindUnusedResponse, GetCallGraphRequest, GetCallGraphResponse,
-    GitSearchResult, GraphContinuation, GraphTotals, IndexRequest, IndexResponse, IndexingMode,
-    LanguageStats, QueryRequest, QueryResponse, ReferenceStatistics, SearchGitHistoryRequest,
-    SearchGitHistoryResponse, SearchResult, StatisticsRequest, StatisticsResponse, UnusedStatus,
+    AdvancedSearchRequest, AnalysisCompleteness, ApplyPatchRequest, ApplyPatchResponse,
+    ClearRequest, ClearResponse, FindDefinitionRequest, FindDefinitionResponse,
+    FindReferencesRequest, FindReferencesResponse, FindUnusedRequest, FindUnusedResponse,
+    GetCallGraphRequest, GetCallGraphResponse, GitSearchResult, GraphContinuation, GraphTotals,
+    IndexRequest, IndexResponse, IndexingMode, LanguageStats, QueryRequest, QueryResponse,
+    ReferenceStatistics, RemovalVerdict, SearchGitHistoryRequest, SearchGitHistoryResponse,
+    SearchResult, StatisticsRequest, StatisticsResponse, UnusedStatus, ValidateRemovalRequest,
+    ValidateRemovalResponse,
 };
 
 pub use build_config::{

@@ -3,6 +3,15 @@ use serde::{Deserialize, Serialize};
 
 mod file_ops;
 pub use file_ops::{EditFileRequest, EditFileResponse, ReadFileRequest, ReadFileResponse};
+mod patching;
+pub use patching::{
+    ApplyPatchRequest, ApplyPatchResponse, FilePatch, PatchConflict, PatchedFileResult,
+};
+mod removal;
+pub use removal::{
+    RemovalAnalysisScope, RemovalEvidence, RemovalVerdict, ValidateRemovalRequest,
+    ValidateRemovalResponse,
+};
 mod find_unused;
 pub use find_unused::{
     AnalysisCompleteness, FindUnusedRequest, FindUnusedResponse, SymbolRejections, UnusedCandidate,
@@ -711,6 +720,12 @@ pub struct GetCallGraphResponse {
     /// Filters actually applied after defaults were expanded.
     pub applied_edge_kinds: Vec<crate::relations::ReferenceKind>,
     pub applied_resolution_statuses: Vec<crate::relations::ResolutionStatus>,
+    /// Successfully published index generation used for this graph.
+    #[serde(default)]
+    pub index_generation: u64,
+    /// True when returned from the generation-scoped in-memory cache.
+    #[serde(default)]
+    pub cache_hit: bool,
     /// Precision level of the results
     pub precision: String,
     /// Time taken in milliseconds

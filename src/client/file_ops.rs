@@ -6,13 +6,13 @@
 //! prevents reading or writing arbitrary filesystem paths outside a project the
 //! user has explicitly asked us to index.
 
-use super::{IndexLockResult, RagClient};
+use super::RagClient;
 use crate::types::*;
 use anyhow::{Context, Result};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::path::Path;
-use std::time::Instant;
 
 /// Maximum number of lines returned by a single read_file call. Larger ranges
 /// are capped (not silently dropped - `truncated` is set so the caller can page).
@@ -73,6 +73,7 @@ fn compute_read_window(
     }
 }
 
+#[cfg(test)]
 fn sha256_hex(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
@@ -80,7 +81,7 @@ fn sha256_hex(text: &str) -> String {
 }
 
 /// Same heuristic as `FileWalker::is_text_file`: >=30% non-printable bytes means binary.
-fn is_probably_binary(bytes: &[u8]) -> bool {
+pub(crate) fn is_probably_binary(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
     }
@@ -102,12 +103,14 @@ fn split_lines(text: &str) -> Vec<&str> {
     }
 }
 
+#[cfg(test)]
 fn count_lines(text: &str) -> usize {
     split_lines(text).len()
 }
 
 /// Splice `request.content` into `current_text` at the requested line range and
 /// return the resulting full file content plus its new line count.
+#[cfg(test)]
 fn build_new_content(
     current_text: Option<&str>,
     request: &EditFileRequest,
@@ -184,11 +187,9 @@ impl RagClient {
 
         let bytes = std::fs::read(&canonical)
             .with_context(|| format!("Failed to read file: {}", request.file_path))?;
-        if is_probably_binary(&bytes) {
-            anyhow::bail!("Cannot read binary file: {}", request.file_path);
-        }
-        let text = String::from_utf8(bytes)
-            .map_err(|_| anyhow::anyhow!("File is not valid UTF-8: {}", request.file_path))?;
+        let decoded = super::patching::decode_text_file(&bytes)
+            .with_context(|| format!("Cannot decode text file: {}", request.file_path))?;
+        let text = decoded.text;
 
         let lines = split_lines(&text);
         let total_lines = lines.len();
@@ -237,7 +238,7 @@ impl RagClient {
             end_line: returned_end_line,
             total_lines,
             truncated: window.content_truncated,
-            file_hash: sha256_hex(&text),
+            file_hash: super::patching::sha256_bytes(&bytes),
             language,
         })
     }
@@ -255,137 +256,42 @@ impl RagClient {
     /// knows search results for this file may be stale until the next
     /// `index_codebase` call repairs it.
     pub async fn edit_file(&self, request: EditFileRequest) -> Result<EditFileResponse> {
-        let start = Instant::now();
         request.validate().map_err(|e| anyhow::anyhow!(e))?;
-
-        let (resolved, root) = self
-            .resolve_project_path(&request.file_path, request.project.as_deref(), true)
+        let patch_response = self
+            .apply_patch_internal(
+                ApplyPatchRequest {
+                    patches: vec![FilePatch {
+                        file_path: request.file_path,
+                        content: request.content,
+                        start_line: request.start_line,
+                        end_line: request.end_line,
+                        expected_hash: request.expected_hash.clone(),
+                        delete: false,
+                    }],
+                    dry_run: false,
+                    project: request.project,
+                },
+                false,
+            )
             .await?;
-        let canonical = resolved.absolute;
-        let exists = canonical.exists();
-
-        if !exists && request.start_line.is_some() {
-            anyhow::bail!(
-                "Cannot edit a line range: file does not exist: {}",
-                request.file_path
-            );
+        if let Some(error) = patch_response.validation_errors.first() {
+            anyhow::bail!("{}", error);
         }
-
-        let current_text: Option<String> =
-            if exists {
-                let bytes = std::fs::read(&canonical)
-                    .with_context(|| format!("Failed to read file: {}", request.file_path))?;
-                if is_probably_binary(&bytes) {
-                    anyhow::bail!("Cannot edit binary file: {}", request.file_path);
-                }
-                Some(String::from_utf8(bytes).map_err(|_| {
-                    anyhow::anyhow!("File is not valid UTF-8: {}", request.file_path)
-                })?)
-            } else {
-                None
-            };
-
-        let actual_hash = current_text.as_ref().map(|t| sha256_hex(t));
-        if let Some(expected) = &request.expected_hash
-            && actual_hash.as_deref() != Some(expected.as_str())
-        {
-            return Ok(EditFileResponse {
-                status: "hash_conflict".to_string(),
-                file_hash: None,
-                total_lines: None,
-                expected_hash: Some(expected.clone()),
-                actual_hash,
-                reindexed: false,
-                warning: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-
-        let (new_content, total_lines) = build_new_content(current_text.as_deref(), &request)?;
-
-        let max_file_size = self.config.indexing.max_file_size;
-        if new_content.len() as u64 > max_file_size as u64 {
-            anyhow::bail!(
-                "Resulting file would be {} bytes, over the configured max_file_size ({} bytes); split the edit into smaller calls",
-                new_content.len(),
-                max_file_size
-            );
-        }
-
-        if !exists
-            && let Some(parent) = canonical.parent()
-            && !parent.exists()
-        {
-            anyhow::bail!("Parent directory does not exist: {:?}", parent);
-        }
-
-        // Acquire the same lock index_codebase uses, BEFORE writing, so the write
-        // and the reindex that picks it up happen atomically with respect to any
-        // other indexing operation on this root.
-        let lock = match self.try_acquire_index_lock(&root).await? {
-            IndexLockResult::Acquired(lock) => lock,
-            IndexLockResult::WaitForResult(_) | IndexLockResult::WaitForFilesystemLock(_) => {
-                anyhow::bail!(
-                    "Another indexing operation is in progress for '{}'; retry the edit shortly",
-                    root
-                );
-            }
-        };
-
-        std::fs::write(&canonical, &new_content)
-            .with_context(|| format!("Failed to write file: {}", request.file_path))?;
-
-        let reindex_result = crate::client::indexing::do_index_smart_inner(
-            self,
-            root.clone(),
-            request.project.clone(),
-            vec![],
-            vec![],
-            max_file_size,
-            None,
-            None,
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await;
-
-        let (reindexed, warning) = match &reindex_result {
-            Ok(response) => {
-                lock.broadcast_result(response);
-                (true, None)
-            }
-            Err(e) => {
-                tracing::error!("Reindex after edit failed for root '{}': {}", root, e);
-                let error_response = IndexResponse {
-                    mode: IndexingMode::Incremental,
-                    files_indexed: 0,
-                    chunks_created: 0,
-                    embeddings_generated: 0,
-                    duration_ms: 0,
-                    errors: vec![format!("Reindex failed: {}", e)],
-                    files_updated: 0,
-                    files_removed: 0,
-                };
-                lock.broadcast_result(&error_response);
-                (
-                    false,
-                    Some(format!(
-                        "File was written but reindexing failed ({}); index for '{}' is marked dirty and will self-heal on the next index_codebase call",
-                        e, root
-                    )),
-                )
-            }
-        };
-        lock.release().await;
-
+        let file = patch_response.files.first();
+        let conflict = patch_response.conflicts.first();
         Ok(EditFileResponse {
-            status: "ok".to_string(),
-            file_hash: Some(sha256_hex(&new_content)),
-            total_lines: Some(total_lines),
-            expected_hash: None,
-            actual_hash: None,
-            reindexed,
-            warning,
-            duration_ms: start.elapsed().as_millis() as u64,
+            status: match patch_response.status.as_str() {
+                "conflict" => "hash_conflict".to_string(),
+                "reindex_failed" => "ok".to_string(),
+                _ => patch_response.status,
+            },
+            file_hash: file.and_then(|file| file.new_hash.clone()),
+            total_lines: file.and_then(|file| file.total_lines),
+            expected_hash: conflict.and_then(|conflict| conflict.expected_hash.clone()),
+            actual_hash: conflict.and_then(|conflict| conflict.actual_hash.clone()),
+            reindexed: patch_response.reindexed,
+            warning: patch_response.warning,
+            duration_ms: patch_response.duration_ms,
         })
     }
 }

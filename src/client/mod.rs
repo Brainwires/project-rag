@@ -31,6 +31,9 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 
+mod analysis_cache;
+use analysis_cache::AnalysisCache;
+
 // Filesystem locking for cross-process coordination
 mod fs_lock;
 pub(crate) use fs_lock::FsLockGuard;
@@ -41,6 +44,8 @@ pub(crate) use index_lock::{IndexLockGuard, IndexLockResult, IndexingOperation};
 
 // read_file/edit_file: single-file read and write-then-reindex operations
 mod file_ops;
+mod patching;
+mod removal_validation;
 
 // find_unused: unused import and dead-symbol candidate detection
 mod find_unused;
@@ -170,9 +175,21 @@ pub struct RagClient {
     pub(crate) relations_provider: Arc<HybridRelationsProvider>,
     // Persistent store for extracted definitions/references (shares the LanceDB directory)
     pub(crate) relations_store: Arc<LanceRelationsStore>,
+    pub(crate) analysis_cache: Arc<RwLock<AnalysisCache>>,
 }
 
 impl RagClient {
+    async fn analysis_generation_fingerprint(&self) -> String {
+        let cache = self.hash_cache.read().await;
+        let mut roots = cache.roots.keys().collect::<Vec<_>>();
+        roots.sort();
+        roots
+            .into_iter()
+            .map(|root| format!("{}={}", root, cache.generation(root)))
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
     /// Create a new RAG client with default configuration
     ///
     /// This will initialize the embedding model, vector database, and load
@@ -297,6 +314,7 @@ impl RagClient {
             indexing_ops: Arc::new(RwLock::new(HashMap::new())),
             relations_provider,
             relations_store,
+            analysis_cache: Arc::new(RwLock::new(AnalysisCache::default())),
         })
     }
 
@@ -369,6 +387,7 @@ impl RagClient {
         let (resolved, root) = self
             .resolve_project_path(file_path, project.as_deref(), false)
             .await?;
+        self.check_path_not_dirty(Some(&root)).await?;
         let project_id = self
             .hash_cache
             .read()
@@ -457,6 +476,14 @@ impl RagClient {
                     "Index for '{}' is dirty (previous indexing was interrupted). \
                     Please re-run index_codebase to rebuild the index before querying.",
                     p
+                );
+            }
+        } else {
+            let dirty = self.get_dirty_paths().await;
+            if !dirty.is_empty() {
+                anyhow::bail!(
+                    "Authoritative index generation is stale for: {}. Re-run index_codebase before querying.",
+                    dirty.join(", ")
                 );
             }
         }
@@ -659,6 +686,21 @@ impl RagClient {
             .transpose()?;
 
         let start = Instant::now();
+        let generations = self.analysis_generation_fingerprint().await;
+        let cache_key = format!(
+            "query:{}:{}",
+            search_root.as_deref().unwrap_or("*"),
+            serde_json::to_string(&request)?
+        );
+        if let Some(mut cached) = self
+            .analysis_cache
+            .read()
+            .await
+            .query(&cache_key, &generations)
+        {
+            cached.duration_ms = start.elapsed().as_millis() as u64;
+            return Ok(cached);
+        }
 
         let query_embedding = self
             .embedding_provider
@@ -721,7 +763,7 @@ impl RagClient {
 
         let (results, total_matches, results_truncated) =
             apply_search_budget(&request.query, results, request.limit);
-        Ok(QueryResponse {
+        let response = QueryResponse {
             returned_matches: results.len(),
             results,
             duration_ms: start.elapsed().as_millis() as u64,
@@ -730,7 +772,12 @@ impl RagClient {
             total_matches,
             results_truncated,
             next_cursor: None,
-        })
+        };
+        self.analysis_cache
+            .write()
+            .await
+            .insert_query(cache_key, generations, response.clone());
+        Ok(response)
     }
 
     /// Advanced search with filters for file type, language, and path patterns
@@ -749,6 +796,21 @@ impl RagClient {
             .transpose()?;
 
         let start = Instant::now();
+        let generations = self.analysis_generation_fingerprint().await;
+        let cache_key = format!(
+            "filtered-query:{}:{}",
+            search_root.as_deref().unwrap_or("*"),
+            serde_json::to_string(&request)?
+        );
+        if let Some(mut cached) = self
+            .analysis_cache
+            .read()
+            .await
+            .query(&cache_key, &generations)
+        {
+            cached.duration_ms = start.elapsed().as_millis() as u64;
+            return Ok(cached);
+        }
 
         let query_embedding = self
             .embedding_provider
@@ -818,7 +880,7 @@ impl RagClient {
 
         let (results, total_matches, results_truncated) =
             apply_search_budget(&request.query, results, request.limit);
-        Ok(QueryResponse {
+        let response = QueryResponse {
             returned_matches: results.len(),
             results,
             duration_ms: start.elapsed().as_millis() as u64,
@@ -827,7 +889,12 @@ impl RagClient {
             total_matches,
             results_truncated,
             next_cursor: None,
-        })
+        };
+        self.analysis_cache
+            .write()
+            .await
+            .insert_query(cache_key, generations, response.clone());
+        Ok(response)
     }
 
     /// Get statistics about the indexed codebase
@@ -1568,6 +1635,27 @@ impl RagClient {
         let file_info = self
             .create_file_info(&request.file_path, request.project.clone())
             .await?;
+        let index_generation = self
+            .hash_cache
+            .read()
+            .await
+            .generation(&file_info.root_path);
+        let cache_key = format!(
+            "{}:{}:{}",
+            file_info.root_path,
+            file_info.relative_path,
+            serde_json::to_string(&request)?
+        );
+        if let Some(mut cached) = self
+            .analysis_cache
+            .read()
+            .await
+            .graph(&cache_key, index_generation)
+        {
+            cached.cache_hit = true;
+            cached.duration_ms = start.elapsed().as_millis() as u64;
+            return Ok(cached);
+        }
 
         // Get precision level for this language
         let language = file_info.language.as_deref().unwrap_or("Unknown");
@@ -1605,7 +1693,7 @@ impl RagClient {
         };
 
         let Some(root_definition) = target_function.cloned() else {
-            return Ok(GetCallGraphResponse {
+            let response = GetCallGraphResponse {
                 root_symbol: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
@@ -1621,9 +1709,17 @@ impl RagClient {
                 continuation: None,
                 applied_edge_kinds: edge_kinds,
                 applied_resolution_statuses: resolution_statuses,
+                index_generation,
+                cache_hit: false,
                 precision: format!("{:?}", precision).to_lowercase(),
                 duration_ms: start.elapsed().as_millis() as u64,
-            });
+            };
+            self.analysis_cache.write().await.insert_graph(
+                cache_key,
+                index_generation,
+                response.clone(),
+            );
+            return Ok(response);
         };
         let root_symbol = crate::relations::SymbolInfo {
             symbol_id: root_definition.to_storage_id(),
@@ -1660,7 +1756,7 @@ impl RagClient {
         let returned_nodes = graph.nodes.len();
         let returned_edges = graph.edges.len();
 
-        Ok(GetCallGraphResponse {
+        let response = GetCallGraphResponse {
             root_symbol: Some(root_symbol),
             nodes: graph.nodes,
             edges: graph.edges,
@@ -1672,9 +1768,17 @@ impl RagClient {
             continuation: graph.continuation,
             applied_edge_kinds: edge_kinds,
             applied_resolution_statuses: resolution_statuses,
+            index_generation,
+            cache_hit: false,
             precision: format!("{:?}", precision).to_lowercase(),
             duration_ms: start.elapsed().as_millis() as u64,
-        })
+        };
+        self.analysis_cache.write().await.insert_graph(
+            cache_key,
+            index_generation,
+            response.clone(),
+        );
+        Ok(response)
     }
 
     /// List every symbol defined in a single file.

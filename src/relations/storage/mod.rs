@@ -50,6 +50,14 @@ pub trait RelationsStore: Send + Sync {
         root_path: &str,
     ) -> Result<Vec<Definition>>;
 
+    async fn find_definitions_in_root(&self, root_path: &str) -> Result<Vec<Definition>>;
+
+    async fn find_definitions_by_files_in_root(
+        &self,
+        file_paths: &[String],
+        root_path: &str,
+    ) -> Result<Vec<Definition>>;
+
     /// Find the innermost persisted reference occurrence at a source position.
     async fn find_reference_at_in_root(
         &self,
@@ -68,6 +76,12 @@ pub trait RelationsStore: Send + Sync {
     async fn find_references_by_name_in_root(
         &self,
         symbol_name: &str,
+        root_path: &str,
+    ) -> Result<Vec<Reference>>;
+
+    async fn find_references_by_names_in_root(
+        &self,
+        symbol_names: &[String],
         root_path: &str,
     ) -> Result<Vec<Reference>>;
 
@@ -98,6 +112,18 @@ pub trait RelationsStore: Send + Sync {
 
     /// Delete relationships for one canonical file identity in one project root.
     async fn delete_by_file_in_root(&self, file_path: &str, root_path: &str) -> Result<usize>;
+
+    async fn delete_definitions_by_files_in_root(
+        &self,
+        file_paths: &[String],
+        root_path: &str,
+    ) -> Result<usize>;
+
+    async fn delete_references_by_files_in_root(
+        &self,
+        file_paths: &[String],
+        root_path: &str,
+    ) -> Result<usize>;
 
     /// Remove the complete relations generation for one project root.
     async fn delete_by_root(&self, root_path: &str) -> Result<usize>;

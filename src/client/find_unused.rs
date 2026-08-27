@@ -129,15 +129,17 @@ impl RagClient {
         // be told apart from a full one, and the cross-file probe has nothing to
         // search, so everything would look unused -- the dangerous direction.
         let indexed_root = self.find_indexed_root(&normalized).await;
+        if let Some(ref root) = indexed_root {
+            self.check_path_not_dirty(Some(root)).await?;
+        }
         if request.check_symbols() {
-            let Some(ref root) = indexed_root else {
+            let Some(_) = indexed_root else {
                 anyhow::bail!(
                     "'{}' is not inside an indexed root; run index_codebase first, \
                      or use check: \"imports\" for index-free import analysis",
                     request.path
                 );
             };
-            self.check_path_not_dirty(Some(root)).await?;
         }
         // Probes are needed only when the scan covers less than the indexed
         // root; scanning the whole root makes the in-memory corpus authoritative.

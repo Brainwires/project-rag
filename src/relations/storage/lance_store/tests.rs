@@ -494,6 +494,128 @@ async fn reference_store_maintains_incoming_and_outgoing_adjacency_indexes() {
 }
 
 #[tokio::test]
+async fn dependency_invalidation_batches_names_files_and_relation_kinds() {
+    let (_directory, store) = make_store().await;
+    let alpha = make_def("Alpha", "src/a.cpp", 1, 4, SymbolKind::Function);
+    let beta = make_def("Beta", "src/b.cpp", 1, 4, SymbolKind::Function);
+    let mut reference = make_call_ref(&alpha.to_storage_id(), "src/c.cpp", 2);
+    reference.target_name = "Alpha".to_string();
+    store
+        .store_definitions(vec![alpha.clone(), beta.clone()], "/test")
+        .await
+        .unwrap();
+    store
+        .store_references(vec![reference], "/test")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.find_definitions_in_root("/test").await.unwrap().len(),
+        2
+    );
+    assert_eq!(
+        store
+            .find_definitions_by_files_in_root(&["src/a.cpp".to_string()], "/test")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .find_references_by_names_in_root(&["Alpha".to_string()], "/test")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    store
+        .delete_definitions_by_files_in_root(&["src/a.cpp".to_string()], "/test")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .find_references(&alpha.to_storage_id())
+            .await
+            .unwrap()
+            .len()
+            == 1
+    );
+    let remaining = store.find_definitions_in_root("/test").await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].to_storage_id(), beta.to_storage_id());
+    store
+        .delete_references_by_files_in_root(&["src/c.cpp".to_string()], "/test")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .find_references(&alpha.to_storage_id())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+#[ignore = "manual M5 dependency-invalidation lookup/delete measurement"]
+async fn benchmark_m5_incremental_relation_invalidation() {
+    let (_directory, store) = make_store().await;
+    let definitions = (0..500)
+        .map(|index| {
+            make_def(
+                &format!("symbol_{index}"),
+                &format!("src/file_{}.cpp", index / 10),
+                index + 1,
+                index + 2,
+                SymbolKind::Function,
+            )
+        })
+        .collect::<Vec<_>>();
+    let references = (0..2_000)
+        .map(|index| {
+            let target = &definitions[index % definitions.len()];
+            let mut reference = make_call_ref(
+                &target.to_storage_id(),
+                &format!("src/caller_{}.cpp", index / 20),
+                index + 1,
+            );
+            reference.target_name = target.name().to_string();
+            reference.location_id = format!("loc:v5:invalidation:{index}");
+            reference
+        })
+        .collect::<Vec<_>>();
+    store.store_definitions(definitions, "/test").await.unwrap();
+    store.store_references(references, "/test").await.unwrap();
+    let names = (0..10)
+        .map(|index| format!("symbol_{index}"))
+        .collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let affected = store
+        .find_references_by_names_in_root(&names, "/test")
+        .await
+        .unwrap();
+    let affected_files = affected
+        .iter()
+        .map(|reference| reference.file_path.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    store
+        .delete_references_by_files_in_root(&affected_files, "/test")
+        .await
+        .unwrap();
+    println!(
+        "m5 invalidation: changed_symbols=10 affected_rows={} affected_files={} elapsed_ms={}",
+        affected.len(),
+        affected_files.len(),
+        started.elapsed().as_millis()
+    );
+    assert!(!affected.is_empty());
+}
+
+#[tokio::test]
 async fn test_clear_and_stats() {
     let (_dir, store) = make_store().await;
 

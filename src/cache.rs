@@ -5,10 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Persistent analysis schema. Version 4 adds build-configuration and
-/// preprocessor scope to relation rows. Retrieval data remains physically
-/// compatible; one indexing pass publishes the v4 relation generation.
-pub const INDEX_SCHEMA_VERSION: u32 = 4;
+/// Persistent analysis schema. Version 5 adds per-root publication generations
+/// for coherent transactions and generation-safe analysis caches.
+pub const INDEX_SCHEMA_VERSION: u32 = 5;
 
 /// Information about a dirty (in-progress) indexing operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +75,9 @@ pub struct HashCache {
     /// Stable project id persisted independently from the project's location.
     #[serde(default)]
     pub project_ids: HashMap<String, String>,
+    /// Monotonic successfully-published index generation for each root.
+    #[serde(default)]
+    pub generations: HashMap<String, u64>,
     /// Map of root paths that are currently being indexed (dirty state) with metadata
     /// If a root is in this map, its index may be incomplete/corrupted
     #[serde(default)]
@@ -91,6 +93,7 @@ impl Default for HashCache {
             schema_version: INDEX_SCHEMA_VERSION,
             roots: HashMap::new(),
             project_ids: HashMap::new(),
+            generations: HashMap::new(),
             dirty_roots: HashMap::new(),
             diagnostics: Vec::new(),
         }
@@ -128,16 +131,19 @@ impl HashCache {
 
         // Try to parse as new format first
         if let Ok(mut cache) = serde_json::from_str::<HashCache>(&content) {
-            if matches!(cache.schema_version, 2 | 3) {
+            if matches!(cache.schema_version, 2..=4) {
                 let previous = cache.schema_version;
                 cache.schema_version = INDEX_SCHEMA_VERSION;
-                cache.diagnostics.push(
-                    "Relations schema upgraded to v4; run indexing once to attach build-configuration and preprocessor scope"
-                        .to_string(),
-                );
+                cache.diagnostics.push(if previous == 4 {
+                    "Index metadata upgraded to v5; the next successful index publishes generation 1"
+                        .to_string()
+                } else {
+                    "Relations schema upgraded to v5; run indexing once to publish build-configuration and preprocessor scope plus generation metadata"
+                        .to_string()
+                });
                 cache.save(cache_path)?;
                 tracing::info!(
-                    "Migrated cache metadata from schema {} to 4 while preserving project identities",
+                    "Migrated cache metadata from schema {} to 5 while preserving project identities",
                     previous
                 );
                 return Ok(cache);
@@ -203,10 +209,21 @@ impl HashCache {
         self.project_ids.insert(root, project_id);
     }
 
+    pub fn generation(&self, root: &str) -> u64 {
+        self.generations.get(root).copied().unwrap_or(0)
+    }
+
+    pub fn publish_generation(&mut self, root: &str) -> u64 {
+        let next = self.generation(root).saturating_add(1);
+        self.generations.insert(root.to_string(), next);
+        next
+    }
+
     /// Remove a root path from the cache
     pub fn remove_root(&mut self, root: &str) {
         self.roots.remove(root);
         self.project_ids.remove(root);
+        self.generations.remove(root);
         self.dirty_roots.remove(root);
     }
 
@@ -671,7 +688,8 @@ mod tests {
         fs::write(&cache_path, v3).unwrap();
 
         let loaded = HashCache::load(&cache_path).unwrap();
-        assert_eq!(loaded.schema_version, 4);
+        assert_eq!(loaded.schema_version, INDEX_SCHEMA_VERSION);
+        assert_eq!(loaded.generation("C:/project"), 0);
         assert_eq!(loaded.project_id("C:/project"), Some("stable-project"));
         assert_eq!(
             loaded
@@ -693,6 +711,40 @@ mod tests {
         let info = DirtyInfo::default();
         assert!(info.timestamp > 0);
         assert!(info.expected_files.is_none());
+    }
+
+    #[test]
+    fn generation_advances_only_when_explicitly_published() {
+        let mut cache = HashCache::default();
+        assert_eq!(cache.generation("C:/project"), 0);
+        assert_eq!(cache.publish_generation("C:/project"), 1);
+        cache.mark_dirty("C:/project");
+        assert_eq!(cache.generation("C:/project"), 1);
+        cache.clear_dirty("C:/project");
+        assert_eq!(cache.publish_generation("C:/project"), 2);
+    }
+
+    #[test]
+    fn v4_cache_migrates_with_generation_zero() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let cache_path = temp_file.path().to_path_buf();
+        let v4 = r#"{
+            "schema_version": 4,
+            "roots": {"C:/project": {"src/lib.cpp": "hash"}},
+            "project_ids": {"C:/project": "stable-project"},
+            "dirty_roots": {},
+            "diagnostics": []
+        }"#;
+        fs::write(&cache_path, v4).unwrap();
+        let loaded = HashCache::load(&cache_path).unwrap();
+        assert_eq!(loaded.schema_version, INDEX_SCHEMA_VERSION);
+        assert_eq!(loaded.generation("C:/project"), 0);
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("generation 1"))
+        );
     }
 
     #[test]

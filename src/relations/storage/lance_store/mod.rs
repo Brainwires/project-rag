@@ -354,6 +354,27 @@ impl RelationsStore for LanceRelationsStore {
         self.query_definitions(&filter).await
     }
 
+    async fn find_definitions_in_root(&self, root_path: &str) -> Result<Vec<Definition>> {
+        self.query_definitions(&format!("root_path = '{}'", codec::escape_sql(root_path)))
+            .await
+    }
+
+    async fn find_definitions_by_files_in_root(
+        &self,
+        file_paths: &[String],
+        root_path: &str,
+    ) -> Result<Vec<Definition>> {
+        if file_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.query_definitions(&format!(
+            "root_path = '{}' AND file_path IN ({})",
+            codec::escape_sql(root_path),
+            codec::sql_in_list(file_paths)
+        ))
+        .await
+    }
+
     async fn find_reference_at_in_root(
         &self,
         file_path: &str,
@@ -403,6 +424,22 @@ impl RelationsStore for LanceRelationsStore {
             codec::escape_sql(root_path)
         );
         self.query_references(&filter).await
+    }
+
+    async fn find_references_by_names_in_root(
+        &self,
+        symbol_names: &[String],
+        root_path: &str,
+    ) -> Result<Vec<Reference>> {
+        if symbol_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.query_references(&format!(
+            "target_name IN ({}) AND root_path = '{}'",
+            codec::sql_in_list(symbol_names),
+            codec::escape_sql(root_path)
+        ))
+        .await
     }
 
     async fn get_outgoing_references_in_root(
@@ -570,6 +607,32 @@ impl RelationsStore for LanceRelationsStore {
             .context("Failed to delete references for scoped file")?;
 
         Ok(removed)
+    }
+
+    async fn delete_definitions_by_files_in_root(
+        &self,
+        file_paths: &[String],
+        root_path: &str,
+    ) -> Result<usize> {
+        if file_paths.is_empty() {
+            return Ok(0);
+        }
+        let table = self.definitions_table().await?;
+        Self::delete_files_in_root(&table, file_paths, root_path).await?;
+        Ok(file_paths.len())
+    }
+
+    async fn delete_references_by_files_in_root(
+        &self,
+        file_paths: &[String],
+        root_path: &str,
+    ) -> Result<usize> {
+        if file_paths.is_empty() {
+            return Ok(0);
+        }
+        let table = self.references_table().await?;
+        Self::delete_files_in_root(&table, file_paths, root_path).await?;
+        Ok(file_paths.len())
     }
 
     async fn delete_by_root(&self, root_path: &str) -> Result<usize> {
