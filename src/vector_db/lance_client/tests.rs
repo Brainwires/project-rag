@@ -1,5 +1,5 @@
 mod tests {
-    use crate::types::ChunkMetadata;
+    use crate::types::{ChunkMetadata, RecordOrigin};
     use crate::vector_db::{LanceVectorDB, VectorDatabase};
     use tempfile::{TempDir, tempdir};
 
@@ -14,6 +14,7 @@ mod tests {
             extension: Some("rs".to_string()),
             file_hash: "test_hash_123".to_string(),
             indexed_at: 1234567890,
+            origin: crate::types::RecordOrigin::Current,
         }
     }
 
@@ -30,7 +31,7 @@ mod tests {
         assert!(db.is_ok());
 
         let db = db.unwrap();
-        assert_eq!(db.table_name, "code_embeddings");
+        assert_eq!(db.table_name, "code_embeddings_v2");
         assert_eq!(db.db_path, db_path);
     }
 
@@ -50,7 +51,7 @@ mod tests {
 
         // Table should now exist
         let table_names = db.connection.table_names().execute().await.unwrap();
-        assert!(table_names.contains(&"code_embeddings".to_string()));
+        assert!(table_names.contains(&"code_embeddings_v2".to_string()));
     }
 
     #[tokio::test]
@@ -115,7 +116,16 @@ mod tests {
         // Verify storage by searching
         let query = vec![0.1; 384];
         let results = db
-            .search(query, "main", 10, 0.0, None, None, false)
+            .search(
+                query,
+                "main",
+                10,
+                0.0,
+                None,
+                None,
+                false,
+                RecordOrigin::Current,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -143,7 +153,16 @@ mod tests {
         // Search with pure vector (hybrid=false)
         let query = vec![0.1; 384];
         let results = db
-            .search(query, "main", 10, 0.0, None, None, false)
+            .search(
+                query,
+                "main",
+                10,
+                0.0,
+                None,
+                None,
+                false,
+                RecordOrigin::Current,
+            )
             .await
             .unwrap();
 
@@ -176,7 +195,16 @@ mod tests {
         // Search with hybrid (hybrid=true)
         let query = vec![0.1; 384];
         let results = db
-            .search(query, "println", 10, 0.0, None, None, true)
+            .search(
+                query,
+                "println",
+                10,
+                0.0,
+                None,
+                None,
+                true,
+                RecordOrigin::Current,
+            )
             .await
             .unwrap();
 
@@ -238,7 +266,16 @@ mod tests {
 
         // Query text matches ONLY target.rs; query vector is closest to the near*.rs rows.
         let results = db
-            .search(vec![0.1; 384], "zzzuniquesymbol", 10, 0.0, None, None, true)
+            .search(
+                vec![0.1; 384],
+                "zzzuniquesymbol",
+                10,
+                0.0,
+                None,
+                None,
+                true,
+                RecordOrigin::Current,
+            )
             .await
             .unwrap();
 
@@ -256,7 +293,7 @@ mod tests {
         assert_eq!(hit.end_line, 110);
     }
 
-    /// Git commits all share `file_path = git://<repo>` and `start_line = 0`, so a fusion
+    /// History chunks use one record per commit. `file_hash` (the commit hash) is what
     /// key of path+line alone collapses an entire history onto one id and the BM25 index
     /// holds a single document for it. `file_hash` (the commit hash) is what separates
     /// them. Guards that chunks differing ONLY by file_hash stay individually retrievable.
@@ -272,9 +309,10 @@ mod tests {
         db.initialize(384).await.unwrap();
 
         let commit_meta = |hash: &str| {
-            let mut m = create_test_metadata("git://repo", 0, 0);
+            let mut m = create_test_metadata("history://commit", 0, 0);
             m.file_hash = hash.to_string();
             m.language = Some("git-commit".to_string());
+            m.origin = RecordOrigin::History;
             m
         };
 
@@ -291,7 +329,16 @@ mod tests {
         .unwrap();
 
         let results = db
-            .search(vec![0.5; 384], "zzzuniquecommit", 10, 0.0, None, None, true)
+            .search(
+                vec![0.5; 384],
+                "zzzuniquecommit",
+                10,
+                0.0,
+                None,
+                None,
+                true,
+                RecordOrigin::History,
+            )
             .await
             .unwrap();
 
@@ -307,6 +354,85 @@ mod tests {
         assert!(
             matched.keyword_score.is_some(),
             "commit chunks must participate in keyword fusion"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_search_excludes_history_records() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("lancedb")
+            .to_string_lossy()
+            .to_string();
+        let db = LanceVectorDB::with_path(&db_path).await.unwrap();
+        db.initialize(384).await.unwrap();
+
+        let current = create_test_metadata("src/current.rs", 1, 1);
+        let mut history = create_test_metadata("history://0123456789abcdef", 0, 0);
+        history.origin = RecordOrigin::History;
+        history.language = Some("git-commit".to_string());
+
+        db.store_embeddings(
+            vec![vec![0.5; 384]],
+            vec![current],
+            vec!["unique retrieval term".to_string()],
+            "/project",
+        )
+        .await
+        .unwrap();
+        db.store_embeddings(
+            vec![vec![0.5; 384]],
+            vec![history],
+            vec!["unique retrieval term obsolete".to_string()],
+            "/project",
+        )
+        .await
+        .unwrap();
+
+        let current_results = db
+            .search(
+                vec![0.5; 384],
+                "unique retrieval term",
+                10,
+                0.0,
+                None,
+                None,
+                true,
+                RecordOrigin::Current,
+            )
+            .await
+            .unwrap();
+        assert!(!current_results.is_empty());
+        assert!(
+            current_results
+                .iter()
+                .all(|result| result.origin == RecordOrigin::Current)
+        );
+        assert!(
+            current_results
+                .iter()
+                .all(|result| !result.file_path.starts_with("history://"))
+        );
+
+        let history_results = db
+            .search(
+                vec![0.5; 384],
+                "obsolete",
+                10,
+                0.0,
+                None,
+                None,
+                true,
+                RecordOrigin::History,
+            )
+            .await
+            .unwrap();
+        assert!(!history_results.is_empty());
+        assert!(
+            history_results
+                .iter()
+                .all(|result| result.origin == RecordOrigin::History)
         );
     }
 
@@ -332,7 +458,16 @@ mod tests {
         // Search with high min_score (should filter out results)
         let query = vec![0.9; 384]; // Very different from stored embedding
         let results = db
-            .search(query, "main", 10, 0.99, None, None, false)
+            .search(
+                query,
+                "main",
+                10,
+                0.99,
+                None,
+                None,
+                false,
+                RecordOrigin::Current,
+            )
             .await
             .unwrap();
 
@@ -375,6 +510,7 @@ mod tests {
                 Some("project-a".to_string()),
                 None,
                 false,
+                RecordOrigin::Current,
             )
             .await
             .unwrap();
@@ -422,6 +558,7 @@ mod tests {
                 vec!["rs".to_string()],
                 vec![],
                 vec![],
+                RecordOrigin::Current,
             )
             .await
             .unwrap();
@@ -466,6 +603,7 @@ mod tests {
                 vec![],
                 vec!["Rust".to_string()],
                 vec![],
+                RecordOrigin::Current,
             )
             .await
             .unwrap();
@@ -513,6 +651,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec!["src/".to_string()],
+                RecordOrigin::Current,
             )
             .await
             .unwrap();
@@ -553,7 +692,16 @@ mod tests {
         // Verify deletion
         let query = vec![0.15; 384];
         let results = db
-            .search(query, "main", 10, 0.0, None, None, false)
+            .search(
+                query,
+                "main",
+                10,
+                0.0,
+                None,
+                None,
+                false,
+                RecordOrigin::Current,
+            )
             .await
             .unwrap();
 
@@ -561,6 +709,75 @@ mod tests {
         for result in &results {
             assert_ne!(result.file_path, "test1.rs");
         }
+    }
+
+    #[tokio::test]
+    async fn test_scoped_delete_preserves_same_relative_path_in_other_project() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("lancedb")
+            .to_string_lossy()
+            .to_string();
+        let db = LanceVectorDB::with_path(&db_path).await.unwrap();
+        db.initialize(384).await.unwrap();
+
+        let mut first = create_test_metadata("src/lib.rs", 1, 10);
+        first.project = Some("project-a".to_string());
+        db.store_embeddings(
+            vec![vec![0.1; 384]],
+            vec![first],
+            vec!["project a".to_string()],
+            "/root/a",
+        )
+        .await
+        .unwrap();
+
+        let mut second = create_test_metadata("src/lib.rs", 1, 10);
+        second.project = Some("project-b".to_string());
+        db.store_embeddings(
+            vec![vec![0.1; 384]],
+            vec![second],
+            vec!["project b".to_string()],
+            "/root/b",
+        )
+        .await
+        .unwrap();
+
+        db.delete_by_file_in_root("src/lib.rs", "/root/a")
+            .await
+            .unwrap();
+
+        let in_first = db
+            .search(
+                vec![0.1; 384],
+                "project",
+                10,
+                0.0,
+                None,
+                Some("/root/a".to_string()),
+                false,
+                RecordOrigin::Current,
+            )
+            .await
+            .unwrap();
+        let in_second = db
+            .search(
+                vec![0.1; 384],
+                "project",
+                10,
+                0.0,
+                None,
+                Some("/root/b".to_string()),
+                false,
+                RecordOrigin::Current,
+            )
+            .await
+            .unwrap();
+
+        assert!(in_first.is_empty());
+        assert_eq!(in_second.len(), 1);
+        assert_eq!(in_second[0].project.as_deref(), Some("project-b"));
     }
 
     #[tokio::test]
@@ -724,8 +941,8 @@ mod tests {
     async fn test_create_schema() {
         let schema = LanceVectorDB::create_schema(384);
 
-        // Verify schema has expected fields (12 fields including root_path)
-        assert_eq!(schema.fields().len(), 12);
+        // Schema v2 adds explicit current/history origin.
+        assert_eq!(schema.fields().len(), 13);
         assert_eq!(schema.field(0).name(), "vector");
         assert_eq!(schema.field(1).name(), "id");
         assert_eq!(schema.field(2).name(), "file_path");
@@ -738,6 +955,7 @@ mod tests {
         assert_eq!(schema.field(9).name(), "indexed_at");
         assert_eq!(schema.field(10).name(), "content");
         assert_eq!(schema.field(11).name(), "project");
+        assert_eq!(schema.field(12).name(), "origin");
     }
 
     #[tokio::test]
@@ -755,7 +973,7 @@ mod tests {
 
         let batch = batch.unwrap();
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 12); // 12 columns including root_path
+        assert_eq!(batch.num_columns(), 13);
     }
 
     #[tokio::test]
@@ -781,7 +999,16 @@ mod tests {
         for _ in 0..3 {
             let query = vec![0.1; 384];
             let results = db
-                .search(query, "main", 10, 0.0, None, None, false)
+                .search(
+                    query,
+                    "main",
+                    10,
+                    0.0,
+                    None,
+                    None,
+                    false,
+                    RecordOrigin::Current,
+                )
                 .await
                 .unwrap();
             assert_eq!(results.len(), 1);
@@ -840,7 +1067,16 @@ mod tests {
         // Verify both projects can be searched (hybrid search across all BM25 indexes)
         let query = vec![0.15; 384];
         let results = db
-            .search(query.clone(), "main", 10, 0.0, None, None, true)
+            .search(
+                query.clone(),
+                "main",
+                10,
+                0.0,
+                None,
+                None,
+                true,
+                RecordOrigin::Current,
+            )
             .await
             .unwrap();
 
@@ -852,8 +1088,8 @@ mod tests {
         assert_eq!(bm25_indexes.len(), 2, "Should have 2 separate BM25 indexes");
 
         // Verify the hashes are different for different root paths
-        let hash1 = LanceVectorDB::hash_root_path("/normalized/project1");
-        let hash2 = LanceVectorDB::hash_root_path("/normalized/project2");
+        let hash1 = LanceVectorDB::bm25_key("/normalized/project1", RecordOrigin::Current);
+        let hash2 = LanceVectorDB::bm25_key("/normalized/project2", RecordOrigin::Current);
         assert_ne!(
             hash1, hash2,
             "Different root paths should have different hashes"

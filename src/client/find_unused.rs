@@ -143,7 +143,20 @@ impl RagClient {
         let provider = self.relations_provider.clone();
         let single_file = Path::new(&normalized).is_file();
         let files = if single_file {
-            vec![self.create_file_info(&normalized, request.project.clone())?]
+            if indexed_root.is_some() {
+                vec![
+                    self.create_file_info(&normalized, request.project.clone())
+                        .await?,
+                ]
+            } else {
+                let path = Path::new(&normalized);
+                let root = path.parent().unwrap_or(path);
+                vec![RagClient::build_file_info_in_root(
+                    path,
+                    &root.to_string_lossy(),
+                    request.project.clone(),
+                )?]
+            }
         } else {
             let walker = FileWalker::new(&normalized, request.max_file_size)
                 .with_project(request.project.clone());
@@ -422,9 +435,11 @@ impl IncludeResolver {
             if let Some(cached) = self.cache.get(&canonical) {
                 return Some(cached.clone());
             }
-            let Ok(info) =
-                RagClient::build_file_info(&canonical.to_string_lossy(), self.project.clone())
-            else {
+            let Ok(info) = RagClient::build_file_info_in_root(
+                &canonical,
+                &self.scan_root.to_string_lossy(),
+                self.project.clone(),
+            ) else {
                 return None;
             };
             let Ok((defs, _skipped)) = self.provider.extract_definitions_reporting(&info) else {

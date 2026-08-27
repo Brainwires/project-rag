@@ -3,6 +3,7 @@
 use super::file_info::FileInfo;
 use super::language::detect_language;
 use super::pdf_extractor::extract_pdf_to_markdown;
+use crate::project_path::ProjectPathResolver;
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
@@ -72,9 +73,12 @@ impl FileWalker {
             anyhow::bail!("Root path is not a directory: {:?}", self.root);
         }
 
+        let resolver = ProjectPathResolver::new(&self.root)?;
+        let canonical_root = resolver.root().to_path_buf();
         let mut files = Vec::new();
+        let mut identities = std::collections::HashSet::new();
 
-        let walker = WalkBuilder::new(&self.root)
+        let walker = WalkBuilder::new(&canonical_root)
             .standard_filters(true) // Respect .gitignore, .ignore, etc.
             .hidden(false) // Don't skip hidden files by default
             .git_ignore(true) // Respect .gitignore files
@@ -155,21 +159,30 @@ impl FileWalker {
             // Calculate hash
             let hash = self.calculate_hash(&content);
 
-            // Get relative path
-            let relative_path = path
-                .strip_prefix(&self.root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
+            // Resolve through the same canonical identity layer used by reads,
+            // edits, and analysis. This also rejects symlink/junction escapes.
+            let resolved = resolver.resolve_existing(&path.to_string_lossy())?;
+            let relative_path = resolved.relative;
+
+            #[cfg(windows)]
+            let identity_key = relative_path.to_lowercase();
+            #[cfg(not(windows))]
+            let identity_key = relative_path.clone();
+            if !identities.insert(identity_key) {
+                anyhow::bail!(
+                    "Duplicate canonical file identity while indexing: {}",
+                    relative_path
+                );
+            }
 
             // Detect language
             let extension = path.extension().and_then(|e| e.to_str()).map(String::from);
             let language = extension.as_ref().and_then(|ext| detect_language(ext));
 
             files.push(FileInfo {
-                path: path.to_path_buf(),
+                path: resolved.absolute,
                 relative_path,
-                root_path: self.root.to_string_lossy().to_string(),
+                root_path: canonical_root.to_string_lossy().to_string(),
                 project: self.project.clone(),
                 extension,
                 language,
@@ -201,7 +214,9 @@ impl FileWalker {
         // matching the absolute path lets any ancestor directory name (a username,
         // a temp-dir suffix, anything containing the pattern as a substring) produce
         // false positives that have nothing to do with the file itself.
-        let relative = path.strip_prefix(&self.root).unwrap_or(path);
+        let canonical_root =
+            std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        let relative = path.strip_prefix(&canonical_root).unwrap_or(path);
         let path_str = relative.to_string_lossy();
 
         // If include patterns are specified, file must match at least one

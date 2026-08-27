@@ -104,6 +104,48 @@ async fn test_store_is_idempotent_per_file() {
 }
 
 #[tokio::test]
+async fn test_store_and_delete_are_scoped_by_project_root() {
+    let (_dir, store) = make_store().await;
+
+    let mut first = make_def("greet", "src/lib.rs", 10, 20, SymbolKind::Function);
+    first.root_path = Some("/root/a".to_string());
+    first.project = Some("project-a".to_string());
+    store
+        .store_definitions(vec![first], "/root/a")
+        .await
+        .unwrap();
+
+    let mut second = make_def("greet", "src/lib.rs", 10, 20, SymbolKind::Function);
+    second.root_path = Some("/root/b".to_string());
+    second.project = Some("project-b".to_string());
+    store
+        .store_definitions(vec![second.clone()], "/root/b")
+        .await
+        .unwrap();
+
+    // Replacing root A must not remove root B's same relative path.
+    let mut replacement = second.clone();
+    replacement.root_path = Some("/root/a".to_string());
+    replacement.project = Some("project-a".to_string());
+    store
+        .store_definitions(vec![replacement], "/root/a")
+        .await
+        .unwrap();
+    assert_eq!(store.get_stats().await.unwrap().definition_count, 2);
+
+    let removed = store
+        .delete_by_file_in_root("src/lib.rs", "/root/a")
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+
+    let remaining = store.find_definitions_by_name("greet").await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].root_path.as_deref(), Some("/root/b"));
+    assert_eq!(remaining[0].project.as_deref(), Some("project-b"));
+}
+
+#[tokio::test]
 async fn test_find_definition_at_innermost() {
     let (_dir, store) = make_store().await;
 

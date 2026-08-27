@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 pub struct GitCache {
     /// Map of repository path -> set of indexed commit hashes
     pub repos: HashMap<String, HashSet<String>>,
+    #[serde(default)]
+    pub invalid_records: usize,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
 }
 
 impl GitCache {
@@ -81,6 +85,15 @@ impl GitCache {
             .extend(commit_hashes);
     }
 
+    pub fn record_invalid(&mut self, diagnostics: &[String]) {
+        self.invalid_records = self.invalid_records.saturating_add(diagnostics.len());
+        for diagnostic in diagnostics {
+            if !self.diagnostics.contains(diagnostic) {
+                self.diagnostics.push(diagnostic.clone());
+            }
+        }
+    }
+
     /// Update commits for a repository (replaces existing)
     pub fn update_repo(&mut self, repo_path: String, commit_hashes: HashSet<String>) {
         self.repos.insert(repo_path, commit_hashes);
@@ -94,6 +107,8 @@ impl GitCache {
     /// Clear all cached repositories
     pub fn clear(&mut self) {
         self.repos.clear();
+        self.invalid_records = 0;
+        self.diagnostics.clear();
     }
 
     /// Get total number of indexed commits across all repos

@@ -94,6 +94,9 @@ fn test_search_result_creation() {
         file_path: "src/main.rs".to_string(),
         root_path: None,
         content: "fn main() {}".to_string(),
+        full_start_line: 1,
+        full_end_line: 10,
+        content_truncated: false,
         score: 0.95,
         vector_score: 0.92,
         keyword_score: Some(0.85),
@@ -101,6 +104,9 @@ fn test_search_result_creation() {
         end_line: 10,
         language: "Rust".to_string(),
         project: None,
+        origin: RecordOrigin::Current,
+        source_id: None,
+        indexed_at: 0,
     };
 
     assert_eq!(result.score, 0.95);
@@ -121,6 +127,7 @@ fn test_chunk_metadata_creation() {
         extension: Some("rs".to_string()),
         file_hash: "abc123".to_string(),
         indexed_at: 1234567890,
+        origin: RecordOrigin::Current,
     };
 
     assert_eq!(metadata.start_line, 1);
@@ -162,6 +169,9 @@ fn test_statistics_response() {
         total_definitions: 250,
         total_references: 0,
         files_with_definitions: 90,
+        index_schema_version: 2,
+        invalid_history_records: 0,
+        index_diagnostics: vec![],
     };
 
     assert_eq!(stats.total_files, 100);
@@ -578,6 +588,9 @@ fn test_query_response_serialization() {
             file_path: "test.rs".to_string(),
             root_path: None,
             content: "test content".to_string(),
+            full_start_line: 1,
+            full_end_line: 10,
+            content_truncated: false,
             score: 0.9,
             vector_score: 0.85,
             keyword_score: Some(0.95),
@@ -585,10 +598,17 @@ fn test_query_response_serialization() {
             end_line: 10,
             language: "Rust".to_string(),
             project: None,
+            origin: RecordOrigin::Current,
+            source_id: None,
+            indexed_at: 0,
         }],
         duration_ms: 100,
         threshold_used: 0.7,
         threshold_lowered: false,
+        total_matches: 1,
+        returned_matches: 1,
+        results_truncated: false,
+        next_cursor: None,
     };
 
     let json = serde_json::to_string(&response).unwrap();
@@ -615,6 +635,9 @@ fn test_statistics_response_serialization() {
         total_definitions: 250,
         total_references: 10,
         files_with_definitions: 90,
+        index_schema_version: 2,
+        invalid_history_records: 0,
+        index_diagnostics: vec![],
     };
 
     let json = serde_json::to_string(&response).unwrap();
@@ -736,15 +759,19 @@ fn test_search_git_history_request_serialization() {
 fn test_git_search_result_serialization() {
     let result = GitSearchResult {
         commit_hash: "abc123".to_string(),
+        subject: "Test commit".to_string(),
         commit_message: "Test commit".to_string(),
         author: "John Doe".to_string(),
         author_email: "john@example.com".to_string(),
+        author_date: 1234567800,
         commit_date: 1234567890,
         score: 0.95,
         vector_score: 0.92,
         keyword_score: Some(0.88),
         files_changed: vec!["src/main.rs".to_string(), "README.md".to_string()],
+        path_at_commit: vec!["src/main.rs".to_string(), "README.md".to_string()],
         diff_snippet: "diff --git a/src/main.rs".to_string(),
+        origin: RecordOrigin::History,
     };
 
     let json = serde_json::to_string(&result).unwrap();
@@ -767,19 +794,25 @@ fn test_search_git_history_response_serialization() {
     let response = SearchGitHistoryResponse {
         results: vec![GitSearchResult {
             commit_hash: "abc123".to_string(),
+            subject: "Test commit".to_string(),
             commit_message: "Test commit".to_string(),
             author: "John Doe".to_string(),
             author_email: "john@example.com".to_string(),
+            author_date: 1234567800,
             commit_date: 1234567890,
             score: 0.95,
             vector_score: 0.92,
             keyword_score: Some(0.88),
             files_changed: vec!["src/main.rs".to_string()],
+            path_at_commit: vec!["src/main.rs".to_string()],
             diff_snippet: "diff --git a/src/main.rs".to_string(),
+            origin: RecordOrigin::History,
         }],
         commits_indexed: 10,
         total_cached_commits: 50,
         duration_ms: 500,
+        invalid_records: 0,
+        diagnostics: vec![],
     };
 
     let json = serde_json::to_string(&response).unwrap();

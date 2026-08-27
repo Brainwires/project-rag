@@ -1,7 +1,7 @@
 //! LanceDB-based storage for code relationships.
 //!
-//! Definitions and references live in two tables (`relations_definitions`,
-//! `relations_references`) inside the same LanceDB directory as the embeddings
+//! Definitions and references live in two schema-v2 tables
+//! (`relations_definitions_v2`, `relations_references_v2`) inside the same LanceDB directory as the embeddings
 //! table, so one database directory holds everything the index knows.
 //!
 //! Writes are idempotent per file: storing rows for a file first deletes
@@ -24,8 +24,8 @@ use tokio::sync::RwLock;
 use super::{RelationsStats, RelationsStore};
 use crate::relations::types::{CallEdge, Definition, Reference, ReferenceKind, SymbolKind};
 
-const DEFINITIONS_TABLE: &str = "relations_definitions";
-const REFERENCES_TABLE: &str = "relations_references";
+const DEFINITIONS_TABLE: &str = "relations_definitions_v2";
+const REFERENCES_TABLE: &str = "relations_references_v2";
 
 /// Delete filters are built as `file_path IN (...)`; chunked so a large batch
 /// of files cannot produce an absurdly long filter string.
@@ -133,10 +133,14 @@ impl LanceRelationsStore {
         Ok(out)
     }
 
-    /// Delete every row belonging to the given files.
-    async fn delete_files(table: &Table, files: &[String]) -> Result<()> {
+    /// Delete every row belonging to the given files within one project root.
+    async fn delete_files_in_root(table: &Table, files: &[String], root_path: &str) -> Result<()> {
         for chunk in files.chunks(DELETE_CHUNK) {
-            let filter = format!("file_path IN ({})", codec::sql_in_list(chunk));
+            let filter = format!(
+                "root_path = '{}' AND file_path IN ({})",
+                codec::escape_sql(root_path),
+                codec::sql_in_list(chunk)
+            );
             table
                 .delete(&filter)
                 .await
@@ -162,11 +166,23 @@ impl LanceRelationsStore {
 impl RelationsStore for LanceRelationsStore {
     async fn store_definitions(
         &self,
-        definitions: Vec<Definition>,
-        _root_path: &str,
+        mut definitions: Vec<Definition>,
+        root_path: &str,
     ) -> Result<usize> {
         if definitions.is_empty() {
             return Ok(0);
+        }
+
+        for definition in &mut definitions {
+            match definition.root_path.as_deref() {
+                Some(stored_root) if stored_root != root_path => anyhow::bail!(
+                    "Definition root '{}' does not match storage root '{}'",
+                    stored_root,
+                    root_path
+                ),
+                None => definition.root_path = Some(root_path.to_string()),
+                _ => {}
+            }
         }
 
         let table = self.definitions_table().await?;
@@ -178,7 +194,7 @@ impl RelationsStore for LanceRelationsStore {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        Self::delete_files(&table, &files).await?;
+        Self::delete_files_in_root(&table, &files, root_path).await?;
 
         let batch = codec::definitions_to_batch(&definitions)?;
         let count = batch.num_rows();
@@ -196,11 +212,23 @@ impl RelationsStore for LanceRelationsStore {
 
     async fn store_references(
         &self,
-        references: Vec<Reference>,
-        _root_path: &str,
+        mut references: Vec<Reference>,
+        root_path: &str,
     ) -> Result<usize> {
         if references.is_empty() {
             return Ok(0);
+        }
+
+        for reference in &mut references {
+            match reference.root_path.as_deref() {
+                Some(stored_root) if stored_root != root_path => anyhow::bail!(
+                    "Reference root '{}' does not match storage root '{}'",
+                    stored_root,
+                    root_path
+                ),
+                None => reference.root_path = Some(root_path.to_string()),
+                _ => {}
+            }
         }
 
         let table = self.references_table().await?;
@@ -211,7 +239,7 @@ impl RelationsStore for LanceRelationsStore {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        Self::delete_files(&table, &files).await?;
+        Self::delete_files_in_root(&table, &files, root_path).await?;
 
         let batch = codec::references_to_batch(&references)?;
         let count = batch.num_rows();
@@ -365,6 +393,38 @@ impl RelationsStore for LanceRelationsStore {
             .delete(&filter)
             .await
             .context("Failed to delete references for file")?;
+
+        Ok(removed)
+    }
+
+    async fn delete_by_file_in_root(&self, file_path: &str, root_path: &str) -> Result<usize> {
+        let filter = format!(
+            "file_path = '{}' AND root_path = '{}'",
+            codec::escape_sql(file_path),
+            codec::escape_sql(root_path)
+        );
+
+        let defs_table = self.definitions_table().await?;
+        let refs_table = self.references_table().await?;
+
+        // LanceDB's delete does not report a count, so count first.
+        let removed = defs_table
+            .count_rows(Some(filter.clone()))
+            .await
+            .unwrap_or(0)
+            + refs_table
+                .count_rows(Some(filter.clone()))
+                .await
+                .unwrap_or(0);
+
+        defs_table
+            .delete(&filter)
+            .await
+            .context("Failed to delete definitions for scoped file")?;
+        refs_table
+            .delete(&filter)
+            .await
+            .context("Failed to delete references for scoped file")?;
 
         Ok(removed)
     }

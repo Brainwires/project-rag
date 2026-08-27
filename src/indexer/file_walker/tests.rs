@@ -189,7 +189,7 @@ fn test_walk_file_info_fields() {
     assert_eq!(files.len(), 1);
 
     let file_info = &files[0];
-    assert_eq!(file_info.path, file_path);
+    assert_eq!(file_info.path, std::fs::canonicalize(&file_path).unwrap());
     assert_eq!(file_info.relative_path, "test.rs");
     assert_eq!(file_info.project, Some("test-proj".to_string()));
     assert_eq!(file_info.extension, Some("rs".to_string()));

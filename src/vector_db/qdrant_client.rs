@@ -1,6 +1,6 @@
 use super::{DatabaseStats, VectorDatabase};
 use crate::glob_utils;
-use crate::types::{ChunkMetadata, SearchResult};
+use crate::types::{ChunkMetadata, RecordOrigin, SearchResult};
 use anyhow::{Context, Result};
 use qdrant_client::qdrant::vectors_config::Config;
 use qdrant_client::qdrant::{
@@ -13,7 +13,33 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-const COLLECTION_NAME: &str = "code_embeddings";
+const COLLECTION_NAME: &str = "code_embeddings_v2";
+
+fn origin_name(origin: RecordOrigin) -> &'static str {
+    match origin {
+        RecordOrigin::Current => "current",
+        RecordOrigin::History => "history",
+    }
+}
+
+fn stable_point_id(meta: &ChunkMetadata) -> u64 {
+    use sha2::{Digest, Sha256};
+    let namespace = meta
+        .project
+        .as_deref()
+        .or(meta.root_path.as_deref())
+        .unwrap_or("");
+    let key = format!(
+        "{}:{}:{}:{}:{}",
+        origin_name(meta.origin),
+        namespace,
+        meta.file_path,
+        meta.start_line,
+        meta.file_hash
+    );
+    let digest = Sha256::digest(key.as_bytes());
+    u64::from_le_bytes(digest[..8].try_into().expect("SHA256 has at least 8 bytes"))
+}
 
 /// Document frequency statistics for IDF calculation
 #[derive(Debug, Clone, Default)]
@@ -224,12 +250,24 @@ impl VectorDatabase for QdrantVectorDB {
     async fn store_embeddings(
         &self,
         embeddings: Vec<Vec<f32>>,
-        metadata: Vec<ChunkMetadata>,
+        mut metadata: Vec<ChunkMetadata>,
         contents: Vec<String>,
-        _root_path: &str,
+        root_path: &str,
     ) -> Result<usize> {
         if embeddings.is_empty() {
             return Ok(0);
+        }
+
+        for item in &mut metadata {
+            match item.root_path.as_deref() {
+                Some(stored_root) if stored_root != root_path => anyhow::bail!(
+                    "Embedding root '{}' does not match storage root '{}'",
+                    stored_root,
+                    root_path
+                ),
+                None => item.root_path = Some(root_path.to_string()),
+                _ => {}
+            }
         }
 
         let count = embeddings.len();
@@ -239,10 +277,11 @@ impl VectorDatabase for QdrantVectorDB {
             .into_iter()
             .zip(metadata.into_iter())
             .zip(contents.into_iter())
-            .enumerate()
-            .map(|(idx, ((embedding, meta), content))| {
+            .map(|((embedding, meta), content)| {
+                let point_id = stable_point_id(&meta);
                 let payload: Payload = json!({
                     "file_path": meta.file_path,
+                    "root_path": meta.root_path,
                     "project": meta.project,
                     "start_line": meta.start_line,
                     "end_line": meta.end_line,
@@ -250,12 +289,13 @@ impl VectorDatabase for QdrantVectorDB {
                     "extension": meta.extension,
                     "file_hash": meta.file_hash,
                     "indexed_at": meta.indexed_at,
+                    "origin": origin_name(meta.origin),
                     "content": content,
                 })
                 .try_into()
                 .unwrap();
 
-                PointStruct::new(idx as u64, embedding, payload)
+                PointStruct::new(point_id, embedding, payload)
             })
             .collect();
 
@@ -281,6 +321,7 @@ impl VectorDatabase for QdrantVectorDB {
         project: Option<String>,
         root_path: Option<String>,
         hybrid: bool,
+        origin: RecordOrigin,
     ) -> Result<Vec<SearchResult>> {
         self.search_filtered(
             query_vector,
@@ -293,6 +334,7 @@ impl VectorDatabase for QdrantVectorDB {
             vec![],
             vec![],
             vec![],
+            origin,
         )
         .await
     }
@@ -309,6 +351,7 @@ impl VectorDatabase for QdrantVectorDB {
         file_extensions: Vec<String>,
         languages: Vec<String>,
         path_patterns: Vec<String>,
+        origin: RecordOrigin,
     ) -> Result<Vec<SearchResult>> {
         tracing::debug!(
             "Searching with limit={}, min_score={}, project={:?}, root_path={:?}, hybrid={}, filters: ext={:?}, lang={:?}, path={:?}",
@@ -328,6 +371,13 @@ impl VectorDatabase for QdrantVectorDB {
         // Add project filter
         if let Some(proj) = project {
             must_conditions.push(Condition::matches("project", proj));
+        }
+        must_conditions.push(Condition::matches(
+            "origin",
+            origin_name(origin).to_string(),
+        ));
+        if let Some(ref requested_root) = root_path {
+            must_conditions.push(Condition::matches("root_path", requested_root.clone()));
         }
 
         // Add file extension filter
@@ -416,6 +466,13 @@ impl VectorDatabase for QdrantVectorDB {
             let result_root_path = payload
                 .get("root_path")
                 .and_then(|v| v.as_str().map(String::from));
+            let source_id = payload
+                .get("file_hash")
+                .and_then(|v| v.as_str().map(String::from));
+            let indexed_at = payload
+                .get("indexed_at")
+                .and_then(|v| v.as_integer())
+                .unwrap_or_default();
 
             // Filter by root_path if specified
             if let Some(ref filter_path) = root_path {
@@ -428,6 +485,9 @@ impl VectorDatabase for QdrantVectorDB {
                 file_path,
                 root_path: result_root_path,
                 content,
+                full_start_line: start_line,
+                full_end_line: end_line,
+                content_truncated: false,
                 score: final_score,
                 vector_score,
                 keyword_score,
@@ -435,6 +495,9 @@ impl VectorDatabase for QdrantVectorDB {
                 end_line,
                 language,
                 project,
+                origin,
+                source_id,
+                indexed_at,
             });
         }
 
@@ -467,6 +530,19 @@ impl VectorDatabase for QdrantVectorDB {
 
         // Note: Qdrant doesn't return the count of deleted points directly
         // We return 0 as a placeholder
+        Ok(0)
+    }
+
+    async fn delete_by_file_in_root(&self, file_path: &str, root_path: &str) -> Result<usize> {
+        let filter = Filter::must([
+            Condition::matches("file_path", file_path.to_string()),
+            Condition::matches("root_path", root_path.to_string()),
+            Condition::matches("origin", "current".to_string()),
+        ]);
+        self.client
+            .delete_points(DeletePointsBuilder::new(COLLECTION_NAME).points(filter))
+            .await
+            .context("Failed to delete scoped file points")?;
         Ok(0)
     }
 

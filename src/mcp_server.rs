@@ -300,7 +300,7 @@ impl RagMcpServer {
     }
 
     #[tool(
-        description = "Read a slice (or all) of a file's current on-disk content. The file must be inside an already-indexed project root. Returns a SHA256 file_hash to pass as expected_hash to edit_file so edits can be rejected if the file changed since this read. Large ranges are capped per call (truncated: true) rather than dropped silently - page through with start_line/end_line."
+        description = "Read a bounded slice of a file inside an indexed project root. Defaults to start_line=1 and line_count=30. Explicit larger reads are allowed up to the server hard limit. The legacy inclusive end_line field remains supported but cannot be combined with line_count. range_clamped reports EOF clamping; content_truncated reports a server cap. Returns a SHA256 file_hash for guarded edits."
     )]
     async fn read_file(
         &self,

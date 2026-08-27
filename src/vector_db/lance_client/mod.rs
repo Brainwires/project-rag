@@ -10,7 +10,7 @@
 
 use crate::bm25_search::BM25Search;
 use crate::glob_utils;
-use crate::types::{ChunkMetadata, SearchResult};
+use crate::types::{ChunkMetadata, RecordOrigin, SearchResult};
 use crate::vector_db::{DatabaseStats, LanguageBreakdown, VectorDatabase};
 use anyhow::{Context, Result};
 use arrow_array::{
@@ -69,7 +69,9 @@ impl LanceVectorDB {
 
         Ok(Self {
             connection,
-            table_name: "code_embeddings".to_string(),
+            // A new table name is an explicit schema boundary: v1 rows used
+            // incompatible absolute/history identities and must never coexist.
+            table_name: "code_embeddings_v2".to_string(),
             db_path: db_path.to_string(),
             bm25_indexes,
         })
@@ -85,14 +87,29 @@ impl LanceVectorDB {
     }
 
     /// Get the BM25 index path for a specific root path
-    fn bm25_path_for_root(&self, root_path: &str) -> String {
-        let hash = Self::hash_root_path(root_path);
-        format!("{}/bm25_{}", self.db_path, hash)
+    fn origin_name(origin: RecordOrigin) -> &'static str {
+        match origin {
+            RecordOrigin::Current => "current",
+            RecordOrigin::History => "history",
+        }
+    }
+
+    fn bm25_key(root_path: &str, origin: RecordOrigin) -> String {
+        format!(
+            "{}:{}",
+            Self::origin_name(origin),
+            Self::hash_root_path(root_path)
+        )
+    }
+
+    fn bm25_path_for_root(&self, root_path: &str, origin: RecordOrigin) -> String {
+        let key = Self::bm25_key(root_path, origin).replace(':', "_");
+        format!("{}/bm25_v2_{}", self.db_path, key)
     }
 
     /// Get or create a BM25 index for a specific root path
-    fn get_or_create_bm25(&self, root_path: &str) -> Result<()> {
-        let hash = Self::hash_root_path(root_path);
+    fn get_or_create_bm25(&self, root_path: &str, origin: RecordOrigin) -> Result<()> {
+        let hash = Self::bm25_key(root_path, origin);
 
         // Check if already exists (read lock)
         {
@@ -115,7 +132,7 @@ impl LanceVectorDB {
             return Ok(());
         }
 
-        let bm25_path = self.bm25_path_for_root(root_path);
+        let bm25_path = self.bm25_path_for_root(root_path, origin);
         tracing::info!(
             "Creating BM25 index for root path '{}' at: {}",
             root_path,
@@ -140,7 +157,19 @@ impl LanceVectorDB {
     /// and the BM25 index would hold a single document for the entire history. For code
     /// chunks the hash is constant within a file, so start_line still provides uniqueness.
     fn chunk_id(meta: &ChunkMetadata) -> String {
-        format!("{}:{}:{}", meta.file_path, meta.start_line, meta.file_hash)
+        let namespace = meta
+            .project
+            .as_deref()
+            .or(meta.root_path.as_deref())
+            .unwrap_or("");
+        format!(
+            "{}:{}:{}:{}:{}",
+            Self::origin_name(meta.origin),
+            namespace,
+            meta.file_path,
+            meta.start_line,
+            meta.file_hash
+        )
     }
 
     /// Create schema for the embeddings table
@@ -165,6 +194,7 @@ impl LanceVectorDB {
             Field::new("indexed_at", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, false),
             Field::new("project", DataType::Utf8, true),
+            Field::new("origin", DataType::Utf8, false),
         ]))
     }
 
@@ -257,6 +287,12 @@ impl LanceVectorDB {
                 .map(|m| m.project.as_deref())
                 .collect::<Vec<_>>(),
         );
+        let origin_array = StringArray::from(
+            metadata
+                .iter()
+                .map(|m| Self::origin_name(m.origin))
+                .collect::<Vec<_>>(),
+        );
 
         RecordBatch::try_new(
             schema,
@@ -273,6 +309,7 @@ impl LanceVectorDB {
                 Arc::new(indexed_at_array),
                 Arc::new(content_array),
                 Arc::new(project_array),
+                Arc::new(origin_array),
             ],
         )
         .context("Failed to create RecordBatch")
@@ -324,12 +361,24 @@ impl VectorDatabase for LanceVectorDB {
     async fn store_embeddings(
         &self,
         embeddings: Vec<Vec<f32>>,
-        metadata: Vec<ChunkMetadata>,
+        mut metadata: Vec<ChunkMetadata>,
         contents: Vec<String>,
         root_path: &str,
     ) -> Result<usize> {
         if embeddings.is_empty() {
             return Ok(0);
+        }
+
+        for item in &mut metadata {
+            match item.root_path.as_deref() {
+                Some(stored_root) if stored_root != root_path => anyhow::bail!(
+                    "Embedding root '{}' does not match storage root '{}'",
+                    stored_root,
+                    root_path
+                ),
+                None => item.root_path = Some(root_path.to_string()),
+                _ => {}
+            }
         }
 
         let dimension = embeddings[0].len();
@@ -354,7 +403,11 @@ impl VectorDatabase for LanceVectorDB {
             .context("Failed to add records to table")?;
 
         // Ensure BM25 index exists for this root path
-        self.get_or_create_bm25(root_path)?;
+        let origin = metadata[0].origin;
+        if metadata.iter().any(|item| item.origin != origin) {
+            anyhow::bail!("Cannot store current and history records in one batch");
+        }
+        self.get_or_create_bm25(root_path, origin)?;
 
         // Add documents to per-project BM25 index, keyed by the SAME stable chunk id the
         // vector table stores in its `id` column -- see Self::chunk_id. The previous
@@ -370,7 +423,7 @@ impl VectorDatabase for LanceVectorDB {
             })
             .collect();
 
-        let hash = Self::hash_root_path(root_path);
+        let hash = Self::bm25_key(root_path, origin);
         let bm25_indexes = self
             .bm25_indexes
             .read()
@@ -399,8 +452,20 @@ impl VectorDatabase for LanceVectorDB {
         project: Option<String>,
         root_path: Option<String>,
         hybrid: bool,
+        origin: RecordOrigin,
     ) -> Result<Vec<SearchResult>> {
         let table = self.get_table().await?;
+        let mut predicates = vec![format!("origin = '{}'", Self::origin_name(origin))];
+        if let Some(ref project_name) = project {
+            predicates.push(format!("project = '{}'", project_name.replace('\'', "''")));
+        }
+        if let Some(ref requested_root) = root_path {
+            predicates.push(format!(
+                "root_path = '{}'",
+                requested_root.replace('\'', "''")
+            ));
+        }
+        let predicate = predicates.join(" AND ");
 
         if hybrid {
             // Hybrid search: combine vector and BM25 results with RRF
@@ -413,15 +478,11 @@ impl VectorDatabase for LanceVectorDB {
                 .context("Failed to create vector search")?
                 .limit(search_limit);
 
-            let stream = if let Some(ref project_name) = project {
-                query
-                    .only_if(format!("project = '{}'", project_name))
-                    .execute()
-                    .await
-                    .context("Failed to execute search")?
-            } else {
-                query.execute().await.context("Failed to execute search")?
-            };
+            let stream = query
+                .only_if(predicate.clone())
+                .execute()
+                .await
+                .context("Failed to execute search")?;
 
             let results: Vec<RecordBatch> = stream
                 .try_collect()
@@ -482,7 +543,18 @@ impl VectorDatabase for LanceVectorDB {
                     .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
 
                 let mut all_bm25_results = Vec::new();
+                let requested_bm25_key = root_path
+                    .as_deref()
+                    .map(|root| Self::bm25_key(root, origin));
+                let origin_prefix = format!("{}:", Self::origin_name(origin));
                 for (root_hash, bm25) in bm25_indexes.iter() {
+                    let correct_scope = requested_bm25_key.as_ref().map_or_else(
+                        || root_hash.starts_with(&origin_prefix),
+                        |key| root_hash == key,
+                    );
+                    if !correct_scope {
+                        continue;
+                    }
                     tracing::debug!("Searching BM25 index for root hash: {}", root_hash);
                     let results = bm25
                         .search(query_text, search_limit)
@@ -529,7 +601,7 @@ impl VectorDatabase for LanceVectorDB {
                     .collect();
                 match table
                     .query()
-                    .only_if(format!("id IN ({})", quoted.join(", ")))
+                    .only_if(format!("{} AND id IN ({})", predicate, quoted.join(", ")))
                     .execute()
                     .await
                 {
@@ -588,6 +660,12 @@ impl VectorDatabase for LanceVectorDB {
                 let content_array = batch
                     .column_by_name("content")
                     .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                let file_hash_array = batch
+                    .column_by_name("file_hash")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                let indexed_at_array = batch
+                    .column_by_name("indexed_at")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
                 let project_array = batch
                     .column_by_name("project")
                     .and_then(|c| c.as_any().downcast_ref::<StringArray>());
@@ -599,6 +677,8 @@ impl VectorDatabase for LanceVectorDB {
                     Some(el),
                     Some(lang),
                     Some(cont),
+                    Some(file_hash),
+                    Some(indexed_at),
                     Some(proj),
                 ) = (
                     file_path_array,
@@ -607,6 +687,8 @@ impl VectorDatabase for LanceVectorDB {
                     end_line_array,
                     language_array,
                     content_array,
+                    file_hash_array,
+                    indexed_at_array,
                     project_array,
                 ) {
                     // Look up original scores for filtering and reporting
@@ -650,11 +732,17 @@ impl VectorDatabase for LanceVectorDB {
                         end_line: el.value(idx) as usize,
                         language: lang.value(idx).to_string(),
                         content: cont.value(idx).to_string(),
+                        full_start_line: sl.value(idx) as usize,
+                        full_end_line: el.value(idx) as usize,
+                        content_truncated: false,
                         project: if proj.is_null(idx) {
                             None
                         } else {
                             Some(proj.value(idx).to_string())
                         },
+                        origin,
+                        source_id: Some(file_hash.value(idx).to_string()),
+                        indexed_at: indexed_at.value(idx).parse().unwrap_or_default(),
                     });
                 }
             }
@@ -667,15 +755,11 @@ impl VectorDatabase for LanceVectorDB {
                 .context("Failed to create vector search")?
                 .limit(limit);
 
-            let stream = if let Some(ref project_name) = project {
-                query
-                    .only_if(format!("project = '{}'", project_name))
-                    .execute()
-                    .await
-                    .context("Failed to execute search")?
-            } else {
-                query.execute().await.context("Failed to execute search")?
-            };
+            let stream = query
+                .only_if(predicate)
+                .execute()
+                .await
+                .context("Failed to execute search")?;
 
             let results: Vec<RecordBatch> = stream
                 .try_collect()
@@ -727,6 +811,20 @@ impl VectorDatabase for LanceVectorDB {
                     .downcast_ref::<StringArray>()
                     .context("Invalid content type")?;
 
+                let file_hash_array = batch
+                    .column_by_name("file_hash")
+                    .context("Missing file_hash column")?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("Invalid file_hash type")?;
+
+                let indexed_at_array = batch
+                    .column_by_name("indexed_at")
+                    .context("Missing indexed_at column")?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("Invalid indexed_at type")?;
+
                 let project_array = batch
                     .column_by_name("project")
                     .context("Missing project column")?
@@ -769,11 +867,17 @@ impl VectorDatabase for LanceVectorDB {
                             end_line: end_line_array.value(i) as usize,
                             language: language_array.value(i).to_string(),
                             content: content_array.value(i).to_string(),
+                            full_start_line: start_line_array.value(i) as usize,
+                            full_end_line: end_line_array.value(i) as usize,
+                            content_truncated: false,
                             project: if project_array.is_null(i) {
                                 None
                             } else {
                                 Some(project_array.value(i).to_string())
                             },
+                            origin,
+                            source_id: Some(file_hash_array.value(i).to_string()),
+                            indexed_at: indexed_at_array.value(i).parse().unwrap_or_default(),
                         });
                     }
                 }
@@ -795,6 +899,7 @@ impl VectorDatabase for LanceVectorDB {
         file_extensions: Vec<String>,
         languages: Vec<String>,
         path_patterns: Vec<String>,
+        origin: RecordOrigin,
     ) -> Result<Vec<SearchResult>> {
         // These filters are applied AFTER the search, so the candidate pool has to be big
         // enough that the surviving rows can actually fill `limit`. With the old `limit * 3`
@@ -825,6 +930,7 @@ impl VectorDatabase for LanceVectorDB {
                 project.clone(),
                 root_path.clone(),
                 hybrid,
+                origin,
             )
             .await?;
 
@@ -895,6 +1001,32 @@ impl VectorDatabase for LanceVectorDB {
         tracing::info!("Deleted embeddings for file: {}", file_path);
 
         // LanceDB doesn't return count directly, return 0 as placeholder
+        Ok(0)
+    }
+
+    async fn delete_by_file_in_root(&self, file_path: &str, root_path: &str) -> Result<usize> {
+        {
+            let key = Self::bm25_key(root_path, RecordOrigin::Current);
+            let bm25_indexes = self
+                .bm25_indexes
+                .read()
+                .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
+            if let Some(bm25) = bm25_indexes.get(&key) {
+                bm25.delete_by_file_path(file_path)
+                    .context("Failed to delete from scoped BM25 index")?;
+            }
+        }
+
+        let table = self.get_table().await?;
+        let filter = format!(
+            "origin = 'current' AND root_path = '{}' AND file_path = '{}'",
+            root_path.replace('\'', "''"),
+            file_path.replace('\'', "''")
+        );
+        table
+            .delete(&filter)
+            .await
+            .context("Failed to delete scoped file records")?;
         Ok(0)
     }
 

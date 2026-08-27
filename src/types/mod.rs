@@ -8,6 +8,14 @@ pub use find_unused::{
     FindUnusedRequest, FindUnusedResponse, SymbolRejections, UnusedCandidate, UnverifiableImport,
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordOrigin {
+    #[default]
+    Current,
+    History,
+}
+
 /// Request to index a codebase
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IndexRequest {
@@ -105,10 +113,18 @@ pub struct SearchResult {
     /// File path relative to the indexed root
     pub file_path: String,
     /// Absolute path to the indexed root directory
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub root_path: Option<String>,
     /// The code chunk content
     pub content: String,
+    /// Original chunk bounds before snippet extraction.
+    #[serde(default)]
+    pub full_start_line: usize,
+    #[serde(default)]
+    pub full_end_line: usize,
+    /// True when the retrieval response contains a snippet rather than the full chunk.
+    #[serde(default)]
+    pub content_truncated: bool,
     /// Combined similarity score (0.0 to 1.0)
     pub score: f32,
     /// Vector similarity score (0.0 to 1.0)
@@ -123,6 +139,15 @@ pub struct SearchResult {
     pub language: String,
     /// Optional project name for multi-project support
     pub project: Option<String>,
+    /// Retrieval plane containing this record.
+    #[serde(default)]
+    pub origin: RecordOrigin,
+    /// Source record id (for history this is the validated commit object id).
+    #[serde(default)]
+    pub source_id: Option<String>,
+    /// Source timestamp recorded by the index.
+    #[serde(default)]
+    pub indexed_at: i64,
 }
 
 /// Response from query operation
@@ -138,6 +163,17 @@ pub struct QueryResponse {
     /// Whether the threshold was automatically lowered to find results
     #[serde(default)]
     pub threshold_lowered: bool,
+    /// Matches observed before the response result budget was applied.
+    #[serde(default)]
+    pub total_matches: usize,
+    #[serde(default)]
+    pub returned_matches: usize,
+    #[serde(default)]
+    pub results_truncated: bool,
+    /// Reserved for cursor-based pagination. None means this backend cannot
+    /// currently continue the bounded candidate set.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 /// Request to get statistics about the index
@@ -167,6 +203,12 @@ pub struct StatisticsResponse {
     /// Number of files with at least one stored definition
     #[serde(default)]
     pub files_with_definitions: usize,
+    #[serde(default)]
+    pub index_schema_version: u32,
+    #[serde(default)]
+    pub invalid_history_records: usize,
+    #[serde(default)]
+    pub index_diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -298,12 +340,16 @@ fn default_max_commits() -> usize {
 pub struct GitSearchResult {
     /// Git commit hash (SHA)
     pub commit_hash: String,
+    /// First line of the commit message.
+    pub subject: String,
     /// Commit message
     pub commit_message: String,
     /// Author name
     pub author: String,
     /// Author email
     pub author_email: String,
+    /// Author timestamp (Unix timestamp).
+    pub author_date: i64,
     /// Commit date (Unix timestamp)
     pub commit_date: i64,
     /// Combined similarity score (0.0 to 1.0)
@@ -314,8 +360,11 @@ pub struct GitSearchResult {
     pub keyword_score: Option<f32>,
     /// Files changed in this commit
     pub files_changed: Vec<String>,
+    /// Canonical project-relative paths as they appeared in this commit.
+    pub path_at_commit: Vec<String>,
     /// Diff snippet (first ~500 characters)
     pub diff_snippet: String,
+    pub origin: RecordOrigin,
 }
 
 /// Response from git history search
@@ -329,6 +378,11 @@ pub struct SearchGitHistoryResponse {
     pub total_cached_commits: usize,
     /// Time taken in milliseconds
     pub duration_ms: u64,
+    /// Invalid Git records excluded from the authoritative history index.
+    #[serde(default)]
+    pub invalid_records: usize,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
 }
 
 // ============================================================================
@@ -567,6 +621,9 @@ pub struct ChunkMetadata {
     pub file_hash: String,
     /// Timestamp when indexed
     pub indexed_at: i64,
+    /// Current-tree and history records are never searched together implicitly.
+    #[serde(default)]
+    pub origin: RecordOrigin,
 }
 
 /// Input validation for request types

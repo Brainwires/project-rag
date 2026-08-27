@@ -44,6 +44,79 @@ mod file_ops;
 // find_unused: unused import and dead-symbol candidate detection
 mod find_unused;
 
+const SEARCH_MAX_RESULTS: usize = 100;
+const SEARCH_CONTEXT_LINES: usize = 15;
+const SEARCH_MAX_CHARS_PER_RESULT: usize = 4_000;
+const SEARCH_MAX_TOTAL_CHARS: usize = 20_000;
+
+fn apply_search_budget(
+    query: &str,
+    results: Vec<SearchResult>,
+    requested_results: usize,
+) -> (Vec<SearchResult>, usize, bool) {
+    let total_matches = results.len();
+    let result_budget = requested_results.min(SEARCH_MAX_RESULTS);
+    let query_terms = query
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|term| term.len() >= 2)
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+
+    let mut returned = Vec::new();
+    let mut total_chars = 0usize;
+
+    for mut result in results.into_iter().take(result_budget) {
+        if total_chars >= SEARCH_MAX_TOTAL_CHARS {
+            break;
+        }
+
+        let full_start = result.start_line;
+        let full_end = result.end_line;
+        result.full_start_line = full_start;
+        result.full_end_line = full_end;
+
+        let lines = result.content.lines().collect::<Vec<_>>();
+        if !lines.is_empty() {
+            let anchor = lines
+                .iter()
+                .position(|line| {
+                    let lower = line.to_lowercase();
+                    query_terms.iter().any(|term| lower.contains(term))
+                })
+                .unwrap_or(0);
+            let window_start = anchor.saturating_sub(SEARCH_CONTEXT_LINES);
+            let window_end = (anchor + SEARCH_CONTEXT_LINES + 1).min(lines.len());
+            let mut snippet = lines[window_start..window_end].join("\n");
+            result.start_line = full_start + window_start;
+            result.end_line = result.start_line + window_end - window_start - 1;
+            result.content_truncated = window_start > 0 || window_end < lines.len();
+
+            let per_result_budget =
+                SEARCH_MAX_CHARS_PER_RESULT.min(SEARCH_MAX_TOTAL_CHARS.saturating_sub(total_chars));
+            if snippet.len() > per_result_budget {
+                let end = crate::git::floor_char_boundary(&snippet, per_result_budget);
+                snippet.truncate(end);
+                let returned_lines = snippet.lines().count();
+                result.end_line = if returned_lines == 0 {
+                    result.start_line
+                } else {
+                    result.start_line + returned_lines - 1
+                };
+                result.content_truncated = true;
+            }
+            result.content = snippet;
+        }
+
+        total_chars += result.content.len();
+        returned.push(result);
+    }
+
+    let results_truncated = total_matches > returned.len()
+        || requested_results > SEARCH_MAX_RESULTS
+        || returned.iter().any(|result| result.content_truncated);
+    (returned, total_matches, results_truncated)
+}
+
 /// Main client for interacting with the RAG system
 ///
 /// This client provides a high-level API for indexing codebases and performing
@@ -238,23 +311,79 @@ impl RagClient {
         Self::with_config(config).await
     }
 
-    /// Create FileInfo from a file path for relations analysis
-    fn create_file_info(&self, file_path: &str, project: Option<String>) -> Result<FileInfo> {
-        Self::build_file_info(file_path, project)
+    /// Resolve a transport path against exactly one indexed project root.
+    /// Relative inputs are project-relative, never process-CWD-relative.
+    pub(crate) async fn resolve_project_path(
+        &self,
+        file_path: &str,
+        project_id: Option<&str>,
+        for_write: bool,
+    ) -> Result<(crate::project_path::ResolvedProjectPath, String)> {
+        let roots = {
+            let cache = self.hash_cache.read().await;
+            cache
+                .roots
+                .keys()
+                .filter(|root| {
+                    project_id.is_none_or(|wanted| cache.project_id(root) == Some(wanted))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if roots.is_empty() {
+            anyhow::bail!("No indexed project root matches this request; run index_codebase first");
+        }
+
+        let mut matches = Vec::new();
+        for root in roots {
+            let resolver = match crate::project_path::ProjectPathResolver::new(&root) {
+                Ok(resolver) => resolver,
+                Err(_) => continue,
+            };
+            let resolved = if for_write {
+                resolver.resolve_for_write(file_path)
+            } else {
+                resolver.resolve_existing(file_path)
+            };
+            if let Ok(resolved) = resolved {
+                matches.push((resolved, root));
+            }
+        }
+
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => anyhow::bail!(
+                "'{}' does not resolve to a file inside an indexed project root",
+                file_path
+            ),
+            _ => anyhow::bail!(
+                "Relative path '{}' is ambiguous across indexed projects; specify project or use an absolute alias",
+                file_path
+            ),
+        }
     }
 
-    /// Associated form of create_file_info: it uses no client state, and the
-    /// include resolver in find_unused needs it inside a spawn_blocking closure
-    /// that cannot borrow the client.
-    pub(crate) fn build_file_info(file_path: &str, project: Option<String>) -> Result<FileInfo> {
-        use std::path::Path;
+    /// Create FileInfo through the canonical project path layer.
+    async fn create_file_info(&self, file_path: &str, project: Option<String>) -> Result<FileInfo> {
+        let (resolved, root) = self
+            .resolve_project_path(file_path, project.as_deref(), false)
+            .await?;
+        Self::build_file_info_in_root(&resolved.absolute, &root, project)
+    }
 
-        let path = Path::new(file_path);
-        let canonical = std::fs::canonicalize(path)
-            .with_context(|| format!("Failed to canonicalize path: {}", file_path))?;
+    /// Associated form used inside blocking analysis closures when the explicit
+    /// project root is already known.
+    pub(crate) fn build_file_info_in_root(
+        file_path: &std::path::Path,
+        root: &str,
+        project: Option<String>,
+    ) -> Result<FileInfo> {
+        let resolver = crate::project_path::ProjectPathResolver::new(root)?;
+        let resolved = resolver.resolve_existing(&file_path.to_string_lossy())?;
+        let canonical = resolved.absolute;
 
         let content = std::fs::read_to_string(&canonical)
-            .with_context(|| format!("Failed to read file: {}", file_path))?;
+            .with_context(|| format!("Failed to read file: {}", canonical.display()))?;
 
         let extension = canonical
             .extension()
@@ -269,21 +398,10 @@ impl RagClient {
         hasher.update(content.as_bytes());
         let hash = format!("{:x}", hasher.finalize());
 
-        // Determine root path (parent directory)
-        let root_path = canonical
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/".to_string());
-
-        let relative_path = canonical
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| file_path.to_string());
-
         Ok(FileInfo {
             path: canonical,
-            relative_path,
-            root_path,
+            relative_path: resolved.relative,
+            root_path: resolver.root().to_string_lossy().to_string(),
             project,
             extension,
             language,
@@ -294,7 +412,7 @@ impl RagClient {
 
     /// Normalize a path to a canonical absolute form for consistent cache lookups
     pub fn normalize_path(path: &str) -> Result<String> {
-        let path_buf = PathBuf::from(path);
+        let path_buf = crate::project_path::normalize_transport_path(path);
         let canonical = std::fs::canonicalize(&path_buf)
             .with_context(|| format!("Failed to canonicalize path: {}", path))?;
         Ok(canonical.to_string_lossy().to_string())
@@ -526,6 +644,11 @@ impl RagClient {
 
         // Check if the target path is dirty (if path filter is specified)
         self.check_path_not_dirty(request.path.as_deref()).await?;
+        let search_root = request
+            .path
+            .as_deref()
+            .map(Self::normalize_path)
+            .transpose()?;
 
         let start = Instant::now();
 
@@ -541,16 +664,18 @@ impl RagClient {
         let mut threshold_used = original_threshold;
         let mut threshold_lowered = false;
 
+        let probe_limit = request.limit.min(SEARCH_MAX_RESULTS).saturating_add(1);
         let mut results = self
             .vector_db
             .search(
                 query_embedding.clone(),
                 &request.query,
-                request.limit,
+                probe_limit,
                 threshold_used,
                 request.project.clone(),
-                request.path.clone(),
+                search_root.clone(),
                 request.hybrid,
+                RecordOrigin::Current,
             )
             .await
             .context("Failed to search")?;
@@ -568,11 +693,12 @@ impl RagClient {
                     .search(
                         query_embedding.clone(),
                         &request.query,
-                        request.limit,
+                        probe_limit,
                         threshold,
                         request.project.clone(),
-                        request.path.clone(),
+                        search_root.clone(),
                         request.hybrid,
+                        RecordOrigin::Current,
                     )
                     .await
                     .context("Failed to search")?;
@@ -585,11 +711,17 @@ impl RagClient {
             }
         }
 
+        let (results, total_matches, results_truncated) =
+            apply_search_budget(&request.query, results, request.limit);
         Ok(QueryResponse {
+            returned_matches: results.len(),
             results,
             duration_ms: start.elapsed().as_millis() as u64,
             threshold_used,
             threshold_lowered,
+            total_matches,
+            results_truncated,
+            next_cursor: None,
         })
     }
 
@@ -602,6 +734,11 @@ impl RagClient {
 
         // Check if the target path is dirty (if path filter is specified)
         self.check_path_not_dirty(request.path.as_deref()).await?;
+        let search_root = request
+            .path
+            .as_deref()
+            .map(Self::normalize_path)
+            .transpose()?;
 
         let start = Instant::now();
 
@@ -617,19 +754,21 @@ impl RagClient {
         let mut threshold_used = original_threshold;
         let mut threshold_lowered = false;
 
+        let probe_limit = request.limit.min(SEARCH_MAX_RESULTS).saturating_add(1);
         let mut results = self
             .vector_db
             .search_filtered(
                 query_embedding.clone(),
                 &request.query,
-                request.limit,
+                probe_limit,
                 threshold_used,
                 request.project.clone(),
-                request.path.clone(),
+                search_root.clone(),
                 true,
                 request.file_extensions.clone(),
                 request.languages.clone(),
                 request.path_patterns.clone(),
+                RecordOrigin::Current,
             )
             .await
             .context("Failed to search with filters")?;
@@ -648,14 +787,15 @@ impl RagClient {
                     .search_filtered(
                         query_embedding.clone(),
                         &request.query,
-                        request.limit,
+                        probe_limit,
                         threshold,
                         request.project.clone(),
-                        request.path.clone(),
+                        search_root.clone(),
                         true,
                         request.file_extensions.clone(),
                         request.languages.clone(),
                         request.path_patterns.clone(),
+                        RecordOrigin::Current,
                     )
                     .await
                     .context("Failed to search with filters")?;
@@ -668,11 +808,17 @@ impl RagClient {
             }
         }
 
+        let (results, total_matches, results_truncated) =
+            apply_search_budget(&request.query, results, request.limit);
         Ok(QueryResponse {
+            returned_matches: results.len(),
             results,
             duration_ms: start.elapsed().as_millis() as u64,
             threshold_used,
             threshold_lowered,
+            total_matches,
+            results_truncated,
+            next_cursor: None,
         })
     }
 
@@ -701,6 +847,11 @@ impl RagClient {
             })
             .collect();
 
+        let cache = self.hash_cache.read().await;
+        let git_cache = self.git_cache.read().await;
+        let mut index_diagnostics = cache.diagnostics.clone();
+        index_diagnostics.extend(git_cache.diagnostics.clone());
+
         Ok(StatisticsResponse {
             total_files: stats.total_files,
             total_chunks: stats.total_points,
@@ -710,6 +861,9 @@ impl RagClient {
             total_definitions: relations_stats.definition_count,
             total_references: relations_stats.reference_count,
             files_with_definitions: relations_stats.files_with_definitions,
+            index_schema_version: crate::cache::INDEX_SCHEMA_VERSION,
+            invalid_history_records: git_cache.invalid_records,
+            index_diagnostics,
         })
     }
 
@@ -720,7 +874,9 @@ impl RagClient {
                 // Clear hash cache (both roots and dirty_roots)
                 let mut cache = self.hash_cache.write().await;
                 cache.roots.clear();
+                cache.project_ids.clear();
                 cache.dirty_roots.clear();
+                cache.diagnostics.clear();
 
                 // Delete cache file directly for robustness (in case save fails)
                 if self.cache_path.exists() {
@@ -738,7 +894,7 @@ impl RagClient {
 
                 // Also clear git cache
                 let mut git_cache = self.git_cache.write().await;
-                git_cache.repos.clear();
+                git_cache.clear();
                 if self.git_cache_path.exists() {
                     if let Err(e) = std::fs::remove_file(&self.git_cache_path) {
                         tracing::warn!("Failed to delete git cache file: {}", e);
@@ -957,7 +1113,16 @@ impl RagClient {
 
         let results = self
             .vector_db
-            .search(embedding, symbol, limit, 0.0, project, None, true)
+            .search(
+                embedding,
+                symbol,
+                limit,
+                0.0,
+                project,
+                None,
+                true,
+                RecordOrigin::Current,
+            )
             .await
             .context("Failed to search for candidate files")?;
 
@@ -985,7 +1150,9 @@ impl RagClient {
         request.validate().map_err(|e| anyhow::anyhow!(e))?;
 
         // Create FileInfo for the file
-        let file_info = self.create_file_info(&request.file_path, request.project.clone())?;
+        let file_info = self
+            .create_file_info(&request.file_path, request.project.clone())
+            .await?;
 
         // Get precision level for this language
         let language = file_info.language.as_deref().unwrap_or("Unknown");
@@ -1036,7 +1203,9 @@ impl RagClient {
         request.validate().map_err(|e| anyhow::anyhow!(e))?;
 
         // Create FileInfo for the file
-        let file_info = self.create_file_info(&request.file_path, request.project.clone())?;
+        let file_info = self
+            .create_file_info(&request.file_path, request.project.clone())
+            .await?;
 
         // Get precision level for this language
         let language = file_info.language.as_deref().unwrap_or("Unknown");
@@ -1118,7 +1287,10 @@ impl RagClient {
             let scan_info = if target == &file_info.path {
                 file_info.clone()
             } else {
-                match self.create_file_info(&target.to_string_lossy(), request.project.clone()) {
+                match self
+                    .create_file_info(&target.to_string_lossy(), request.project.clone())
+                    .await
+                {
                     Ok(fi) => fi,
                     Err(e) => {
                         tracing::debug!("Skipping unreadable candidate {:?}: {}", target, e);
@@ -1247,7 +1419,9 @@ impl RagClient {
         request.validate().map_err(|e| anyhow::anyhow!(e))?;
 
         // Create FileInfo for the file
-        let file_info = self.create_file_info(&request.file_path, request.project.clone())?;
+        let file_info = self
+            .create_file_info(&request.file_path, request.project.clone())
+            .await?;
 
         // Get precision level for this language
         let language = file_info.language.as_deref().unwrap_or("Unknown");
@@ -1341,7 +1515,9 @@ impl RagClient {
                 if !probed_files.insert(f.clone()) {
                     continue;
                 }
-                let fi = match self.create_file_info(&f.to_string_lossy(), request.project.clone())
+                let fi = match self
+                    .create_file_info(&f.to_string_lossy(), request.project.clone())
+                    .await
                 {
                     Ok(fi) => fi,
                     Err(e) => {
@@ -1406,7 +1582,10 @@ impl RagClient {
             let (scan_info, scan_defs) = if target == &file_info.path {
                 (file_info.clone(), definitions.clone())
             } else {
-                match self.create_file_info(&target.to_string_lossy(), request.project.clone()) {
+                match self
+                    .create_file_info(&target.to_string_lossy(), request.project.clone())
+                    .await
+                {
                     Ok(fi) => {
                         let defs = self
                             .relations_provider
@@ -1532,7 +1711,9 @@ impl RagClient {
 
         request.validate().map_err(|e| anyhow::anyhow!(e))?;
 
-        let file_info = self.create_file_info(&request.file_path, request.project.clone())?;
+        let file_info = self
+            .create_file_info(&request.file_path, request.project.clone())
+            .await?;
         let language = file_info.language.as_deref().unwrap_or("Unknown");
         let precision = self.relations_provider.precision_level(language);
 

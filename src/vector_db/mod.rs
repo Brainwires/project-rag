@@ -8,7 +8,7 @@ pub mod qdrant_client;
 #[cfg(feature = "qdrant-backend")]
 pub use qdrant_client::QdrantVectorDB;
 
-use crate::types::{ChunkMetadata, SearchResult};
+use crate::types::{ChunkMetadata, RecordOrigin, SearchResult};
 use anyhow::Result;
 
 /// Trait for vector database operations
@@ -38,6 +38,7 @@ pub trait VectorDatabase: Send + Sync {
         project: Option<String>,
         root_path: Option<String>,
         hybrid: bool,
+        origin: RecordOrigin,
     ) -> Result<Vec<SearchResult>>;
 
     /// Search with filters
@@ -54,10 +55,14 @@ pub trait VectorDatabase: Send + Sync {
         file_extensions: Vec<String>,
         languages: Vec<String>,
         path_patterns: Vec<String>,
+        origin: RecordOrigin,
     ) -> Result<Vec<SearchResult>>;
 
     /// Delete embeddings for a specific file
     async fn delete_by_file(&self, file_path: &str) -> Result<usize>;
+
+    /// Delete one current-tree file identity inside one explicit project root.
+    async fn delete_by_file_in_root(&self, file_path: &str, root_path: &str) -> Result<usize>;
 
     /// Clear all embeddings
     async fn clear(&self) -> Result<()>;

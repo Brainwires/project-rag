@@ -10,12 +10,68 @@ use super::{IndexLockResult, RagClient};
 use crate::types::*;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
 use std::time::Instant;
 
 /// Maximum number of lines returned by a single read_file call. Larger ranges
 /// are capped (not silently dropped - `truncated` is set so the caller can page).
 const READ_MAX_LINES: usize = 2000;
+const READ_DEFAULT_LINES: usize = 30;
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReadWindow {
+    returned_start: usize,
+    returned_end: usize,
+    returned_count: usize,
+    eof: bool,
+    range_clamped: bool,
+    content_truncated: bool,
+    next_start: Option<usize>,
+}
+
+fn compute_read_window(
+    total_lines: usize,
+    requested_start: usize,
+    requested_count: usize,
+) -> ReadWindow {
+    let requested_end = requested_start.saturating_add(requested_count - 1);
+    let range_clamped =
+        total_lines == 0 || requested_start > total_lines || requested_end > total_lines;
+    let (returned_start, returned_end, content_truncated) =
+        if total_lines == 0 || requested_start > total_lines {
+            (0, 0, false)
+        } else {
+            let valid_end = requested_end.min(total_lines);
+            let capped_end = valid_end.min(
+                requested_start
+                    .saturating_add(READ_MAX_LINES)
+                    .saturating_sub(1),
+            );
+            (requested_start, capped_end, capped_end < valid_end)
+        };
+    let returned_count = if returned_start == 0 {
+        0
+    } else {
+        returned_end - returned_start + 1
+    };
+    let eof = returned_end == 0 || returned_end >= total_lines;
+    let next_start = if returned_end > 0 && returned_end < total_lines {
+        Some(returned_end + 1)
+    } else {
+        None
+    };
+
+    ReadWindow {
+        returned_start,
+        returned_end,
+        returned_count,
+        eof,
+        range_clamped,
+        content_truncated,
+        next_start,
+    }
+}
 
 fn sha256_hex(text: &str) -> String {
     let mut hasher = Sha256::new();
@@ -113,62 +169,18 @@ fn build_new_content(
 }
 
 impl RagClient {
-    /// Resolve a user-supplied path to its canonical form and the indexed root
-    /// that contains it. Errors if the path (or, for a not-yet-created file, its
-    /// parent directory) doesn't exist, or if it falls outside every indexed root.
-    async fn resolve_in_indexed_root(&self, file_path: &str) -> Result<(PathBuf, String, bool)> {
-        let path = Path::new(file_path);
-        let exists = path.exists();
-
-        let canonical = if exists {
-            std::fs::canonicalize(path)
-                .with_context(|| format!("Failed to canonicalize path: {}", file_path))?
-        } else {
-            let parent = match path.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p,
-                _ => Path::new("."),
-            };
-            let canonical_parent = std::fs::canonicalize(parent)
-                .with_context(|| format!("Parent directory does not exist: {:?}", parent))?;
-            let file_name = path
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("Invalid file path: {}", file_path))?;
-            canonical_parent.join(file_name)
-        };
-
-        let root = {
-            let cache = self.hash_cache.read().await;
-            let mut best_root: Option<String> = None;
-            for root in cache.roots.keys() {
-                if canonical.starts_with(Path::new(root))
-                    && best_root.as_ref().is_none_or(|b| root.len() > b.len())
-                {
-                    best_root = Some(root.clone());
-                }
-            }
-            best_root
-        };
-
-        let root = root.ok_or_else(|| {
-            anyhow::anyhow!(
-                "'{}' is outside any indexed project root; run index_codebase on its project first",
-                file_path
-            )
-        })?;
-
-        Ok((canonical, root, exists))
-    }
-
     /// Read a slice (or all) of a file's current on-disk content.
     ///
     /// The file must live under an already-indexed project root. Returns a
     /// SHA256 hash of the full file that can be passed as `expected_hash` to
     /// `edit_file` to detect concurrent modification.
     pub async fn read_file(&self, request: ReadFileRequest) -> Result<ReadFileResponse> {
-        let (canonical, _root, exists) = self.resolve_in_indexed_root(&request.file_path).await?;
-        if !exists {
-            anyhow::bail!("File not found: {}", request.file_path);
-        }
+        request.validate().map_err(|e| anyhow::anyhow!(e))?;
+        let (resolved, _root) = self
+            .resolve_project_path(&request.file_path, None, false)
+            .await?;
+        let canonical_path = resolved.relative;
+        let canonical = resolved.absolute;
 
         let bytes = std::fs::read(&canonical)
             .with_context(|| format!("Failed to read file: {}", request.file_path))?;
@@ -181,32 +193,24 @@ impl RagClient {
         let lines = split_lines(&text);
         let total_lines = lines.len();
 
-        let (start_line, end_line, truncated) = if total_lines == 0 {
-            (0, 0, false)
+        let requested_start_line = request.start_line.unwrap_or(1);
+        let requested_line_count = if let Some(line_count) = request.line_count {
+            line_count
+        } else if let Some(end_line) = request.end_line {
+            end_line.saturating_sub(requested_start_line) + 1
         } else {
-            let requested_start = request.start_line.unwrap_or(1);
-            let requested_end = request.end_line.unwrap_or(total_lines);
-
-            let clamped_start = requested_start.clamp(1, total_lines);
-            let clamped_end = requested_end.clamp(clamped_start, total_lines);
-
-            let capped_end = if clamped_end - clamped_start + 1 > READ_MAX_LINES {
-                clamped_start + READ_MAX_LINES - 1
-            } else {
-                clamped_end
-            };
-
-            let truncated = clamped_start != requested_start
-                || clamped_end != requested_end
-                || capped_end != clamped_end;
-
-            (clamped_start, capped_end, truncated)
+            READ_DEFAULT_LINES
         };
 
-        let content = if total_lines == 0 {
+        let window = compute_read_window(total_lines, requested_start_line, requested_line_count);
+        let returned_start_line = window.returned_start;
+        let returned_end_line = window.returned_end;
+        let returned_line_count = window.returned_count;
+
+        let content = if returned_line_count == 0 {
             String::new()
         } else {
-            lines[start_line - 1..end_line].concat()
+            lines[returned_start_line - 1..returned_end_line].concat()
         };
 
         let extension = canonical
@@ -219,10 +223,20 @@ impl RagClient {
 
         Ok(ReadFileResponse {
             content,
-            start_line,
-            end_line,
+            file_path: canonical_path,
+            requested_start_line,
+            requested_line_count,
+            returned_start_line,
+            returned_end_line,
+            returned_line_count,
+            eof: window.eof,
+            range_clamped: window.range_clamped,
+            content_truncated: window.content_truncated,
+            next_start_line: window.next_start,
+            start_line: returned_start_line,
+            end_line: returned_end_line,
             total_lines,
-            truncated,
+            truncated: window.content_truncated,
             file_hash: sha256_hex(&text),
             language,
         })
@@ -244,7 +258,11 @@ impl RagClient {
         let start = Instant::now();
         request.validate().map_err(|e| anyhow::anyhow!(e))?;
 
-        let (canonical, root, exists) = self.resolve_in_indexed_root(&request.file_path).await?;
+        let (resolved, root) = self
+            .resolve_project_path(&request.file_path, request.project.as_deref(), true)
+            .await?;
+        let canonical = resolved.absolute;
+        let exists = canonical.exists();
 
         if !exists && request.start_line.is_some() {
             anyhow::bail!(
@@ -423,6 +441,53 @@ mod tests {
     }
 
     #[test]
+    fn test_default_read_window_is_thirty_lines() {
+        let window = compute_read_window(100, 1, READ_DEFAULT_LINES);
+        assert_eq!(window.returned_start, 1);
+        assert_eq!(window.returned_end, 30);
+        assert_eq!(window.returned_count, 30);
+        assert!(!window.eof);
+        assert!(!window.range_clamped);
+        assert!(!window.content_truncated);
+        assert_eq!(window.next_start, Some(31));
+    }
+
+    #[test]
+    fn test_read_through_eof_is_clamped_not_truncated() {
+        let window = compute_read_window(112, 100, 30);
+        assert_eq!(window.returned_start, 100);
+        assert_eq!(window.returned_end, 112);
+        assert_eq!(window.returned_count, 13);
+        assert!(window.eof);
+        assert!(window.range_clamped);
+        assert!(!window.content_truncated);
+        assert_eq!(window.next_start, None);
+    }
+
+    #[test]
+    fn test_read_beyond_eof_returns_empty_flagged_range() {
+        let window = compute_read_window(10, 100, 30);
+        assert_eq!(window.returned_count, 0);
+        assert_eq!(window.returned_start, 0);
+        assert_eq!(window.returned_end, 0);
+        assert!(window.eof);
+        assert!(window.range_clamped);
+        assert!(!window.content_truncated);
+    }
+
+    #[test]
+    fn test_explicit_large_read_is_allowed_until_hard_limit() {
+        let within_limit = compute_read_window(500, 100, 200);
+        assert_eq!(within_limit.returned_count, 200);
+        assert!(!within_limit.content_truncated);
+
+        let capped = compute_read_window(5_000, 1, 4_000);
+        assert_eq!(capped.returned_count, READ_MAX_LINES);
+        assert!(capped.content_truncated);
+        assert_eq!(capped.next_start, Some(READ_MAX_LINES + 1));
+    }
+
+    #[test]
     fn test_build_new_content_whole_file() {
         let req = EditFileRequest {
             file_path: "x.rs".to_string(),
@@ -526,6 +591,7 @@ mod tests {
             .read_file(ReadFileRequest {
                 file_path: file.to_string_lossy().to_string(),
                 start_line: None,
+                line_count: None,
                 end_line: None,
             })
             .await;
@@ -545,6 +611,7 @@ mod tests {
             .read_file(ReadFileRequest {
                 file_path: file.to_string_lossy().to_string(),
                 start_line: None,
+                line_count: None,
                 end_line: None,
             })
             .await
@@ -574,6 +641,7 @@ mod tests {
             .read_file(ReadFileRequest {
                 file_path: file.to_string_lossy().to_string(),
                 start_line: Some(2),
+                line_count: None,
                 end_line: Some(100),
             })
             .await
@@ -581,7 +649,10 @@ mod tests {
 
         assert_eq!(response.start_line, 2);
         assert_eq!(response.end_line, 3);
-        assert!(response.truncated);
+        assert!(response.range_clamped);
+        assert!(!response.content_truncated);
+        assert!(!response.truncated);
+        assert!(response.eof);
         assert_eq!(response.content, "2\n3\n");
     }
 
@@ -598,6 +669,7 @@ mod tests {
             .read_file(ReadFileRequest {
                 file_path: missing.to_string_lossy().to_string(),
                 start_line: None,
+                line_count: None,
                 end_line: None,
             })
             .await;

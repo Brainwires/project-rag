@@ -4,7 +4,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Request to read a slice (or all) of a file's current on-disk content
+/// Request to read a bounded slice of a file's current on-disk content.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReadFileRequest {
     /// File path (relative or absolute). Must be inside an already-indexed project root.
@@ -12,7 +12,12 @@ pub struct ReadFileRequest {
     /// First line to read, 1-indexed inclusive. Omit to read from the start of the file.
     #[serde(default)]
     pub start_line: Option<usize>,
-    /// Last line to read, 1-indexed inclusive. Omit to read to the end of the file.
+    /// Number of lines to read. Defaults to 30 and may exceed 30 explicitly,
+    /// subject to the server hard response limit.
+    #[serde(default)]
+    pub line_count: Option<usize>,
+    /// Legacy inclusive end line. Preserved for compatibility; callers should
+    /// prefer `line_count`. It cannot be combined with `line_count`.
     #[serde(default)]
     pub end_line: Option<usize>,
 }
@@ -25,6 +30,12 @@ impl ReadFileRequest {
         }
         if self.start_line == Some(0) {
             return Err("start_line must be >= 1".to_string());
+        }
+        if self.line_count == Some(0) {
+            return Err("line_count must be >= 1".to_string());
+        }
+        if self.line_count.is_some() && self.end_line.is_some() {
+            return Err("line_count and end_line cannot both be set".to_string());
         }
         if let (Some(start), Some(end)) = (self.start_line, self.end_line)
             && start > end
@@ -40,14 +51,29 @@ impl ReadFileRequest {
 pub struct ReadFileResponse {
     /// The file content for the requested (and possibly clamped/capped) line range
     pub content: String,
-    /// First line actually returned, 1-indexed inclusive. 0 if the file is empty.
+    /// Canonical project-relative path.
+    pub file_path: String,
+    pub requested_start_line: usize,
+    pub requested_line_count: usize,
+    pub returned_start_line: usize,
+    pub returned_end_line: usize,
+    pub returned_line_count: usize,
+    /// Whether the returned range reaches EOF (including an empty range beyond EOF).
+    pub eof: bool,
+    /// Whether the requested range extended beyond valid file bounds.
+    pub range_clamped: bool,
+    /// Whether a server hard response limit omitted otherwise valid requested content.
+    pub content_truncated: bool,
+    /// Next readable line when file content remains.
+    pub next_start_line: Option<usize>,
+    /// Compatibility alias for `returned_start_line`.
     pub start_line: usize,
-    /// Last line actually returned, 1-indexed inclusive. 0 if the file is empty.
+    /// Compatibility alias for `returned_end_line`.
     pub end_line: usize,
     /// Total number of lines in the file
     pub total_lines: usize,
-    /// True if the requested range was clamped to file bounds or capped to the
-    /// per-call line limit; if true, `start_line`/`end_line` show what was actually returned
+    /// Compatibility alias for `content_truncated`. EOF clamping is reported
+    /// separately through `range_clamped`.
     pub truncated: bool,
     /// SHA256 hash of the full current file content. Pass this as `expected_hash`
     /// to edit_file to guard against editing a file that changed since this read.
@@ -148,6 +174,7 @@ mod tests {
         let req = ReadFileRequest {
             file_path: String::new(),
             start_line: None,
+            line_count: None,
             end_line: None,
         };
         assert!(req.validate().is_err());
@@ -158,6 +185,7 @@ mod tests {
         let req = ReadFileRequest {
             file_path: "a.rs".to_string(),
             start_line: Some(0),
+            line_count: None,
             end_line: None,
         };
         assert!(req.validate().is_err());
@@ -168,6 +196,7 @@ mod tests {
         let req = ReadFileRequest {
             file_path: "a.rs".to_string(),
             start_line: Some(10),
+            line_count: None,
             end_line: Some(5),
         };
         assert!(req.validate().is_err());
@@ -178,6 +207,7 @@ mod tests {
         let req = ReadFileRequest {
             file_path: "a.rs".to_string(),
             start_line: Some(1),
+            line_count: None,
             end_line: Some(5),
         };
         assert!(req.validate().is_ok());
@@ -188,6 +218,7 @@ mod tests {
         let req = ReadFileRequest {
             file_path: "a.rs".to_string(),
             start_line: Some(1),
+            line_count: None,
             end_line: Some(5),
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -321,6 +352,16 @@ mod tests {
     fn test_read_file_response_serde_roundtrip() {
         let resp = ReadFileResponse {
             content: "fn main() {}\n".to_string(),
+            file_path: "src/main.rs".to_string(),
+            requested_start_line: 1,
+            requested_line_count: 30,
+            returned_start_line: 1,
+            returned_end_line: 1,
+            returned_line_count: 1,
+            eof: true,
+            range_clamped: true,
+            content_truncated: false,
+            next_start_line: None,
             start_line: 1,
             end_line: 1,
             total_lines: 1,

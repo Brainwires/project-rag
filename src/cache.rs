@@ -5,6 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Persistent identity schema. Version 2 stores only canonical project-relative
+/// file keys and is paired with the `code_embeddings_v2` vector table.
+pub const INDEX_SCHEMA_VERSION: u32 = 2;
+
 /// Information about a dirty (in-progress) indexing operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirtyInfo {
@@ -60,14 +64,36 @@ impl Default for DirtyInfo {
 }
 
 /// Cache for file hashes to support incremental updates
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HashCache {
+    /// Persistent identity schema version. Incompatible older indexes are reset
+    /// rather than mixed with v2 identities.
+    #[serde(default)]
+    pub schema_version: u32,
     /// Map of root path -> (file path -> hash)
     pub roots: HashMap<String, HashMap<String, String>>,
+    /// Stable project id persisted independently from the project's location.
+    #[serde(default)]
+    pub project_ids: HashMap<String, String>,
     /// Map of root paths that are currently being indexed (dirty state) with metadata
     /// If a root is in this map, its index may be incomplete/corrupted
     #[serde(default)]
     pub dirty_roots: HashMap<String, DirtyInfo>,
+    /// Index health and migration diagnostics surfaced by statistics.
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
+impl Default for HashCache {
+    fn default() -> Self {
+        Self {
+            schema_version: INDEX_SCHEMA_VERSION,
+            roots: HashMap::new(),
+            project_ids: HashMap::new(),
+            dirty_roots: HashMap::new(),
+            diagnostics: Vec::new(),
+        }
+    }
 }
 
 /// Legacy cache format for migration (dirty_roots was a HashSet)
@@ -79,6 +105,16 @@ struct LegacyHashCache {
 }
 
 impl HashCache {
+    fn reset_incompatible(cache_path: &Path, found_version: u32) -> Result<Self> {
+        let mut cache = Self::default();
+        cache.diagnostics.push(format!(
+            "Index schema {} is incompatible with schema {}; a clean reindex is required",
+            found_version, INDEX_SCHEMA_VERSION
+        ));
+        cache.save(cache_path)?;
+        Ok(cache)
+    }
+
     /// Load cache from disk
     /// Handles migration from old format (dirty_roots as HashSet) to new format (dirty_roots as HashMap with DirtyInfo)
     pub fn load(cache_path: &Path) -> Result<Self> {
@@ -91,6 +127,14 @@ impl HashCache {
 
         // Try to parse as new format first
         if let Ok(cache) = serde_json::from_str::<HashCache>(&content) {
+            if cache.schema_version != INDEX_SCHEMA_VERSION {
+                tracing::warn!(
+                    "Resetting incompatible index cache schema {} (current {})",
+                    cache.schema_version,
+                    INDEX_SCHEMA_VERSION
+                );
+                return Self::reset_incompatible(cache_path, cache.schema_version);
+            }
             tracing::info!("Loaded cache with {} indexed roots", cache.roots.len());
             return Ok(cache);
         }
@@ -103,26 +147,8 @@ impl HashCache {
                 legacy.dirty_roots.len()
             );
 
-            // Migrate dirty_roots from HashSet to HashMap with default DirtyInfo
-            let dirty_roots: HashMap<String, DirtyInfo> = legacy
-                .dirty_roots
-                .into_iter()
-                .map(|root| (root, DirtyInfo::new()))
-                .collect();
-
-            let cache = HashCache {
-                roots: legacy.roots,
-                dirty_roots,
-            };
-
-            // Save the migrated cache immediately
-            if let Err(e) = cache.save(cache_path) {
-                tracing::warn!("Failed to save migrated cache: {}", e);
-            } else {
-                tracing::info!("Successfully migrated cache to new format");
-            }
-
-            return Ok(cache);
+            let _ = legacy;
+            return Self::reset_incompatible(cache_path, 0);
         }
 
         // Neither format worked
@@ -154,9 +180,18 @@ impl HashCache {
         self.roots.insert(root, hashes);
     }
 
+    pub fn project_id(&self, root: &str) -> Option<&str> {
+        self.project_ids.get(root).map(String::as_str)
+    }
+
+    pub fn set_project_id(&mut self, root: String, project_id: String) {
+        self.project_ids.insert(root, project_id);
+    }
+
     /// Remove a root path from the cache
     pub fn remove_root(&mut self, root: &str) {
         self.roots.remove(root);
+        self.project_ids.remove(root);
         self.dirty_roots.remove(root);
     }
 
@@ -535,8 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dirty_flag_with_old_cache_format() {
-        // Test that loading a cache without dirty_roots field works (backwards compatibility)
+    fn test_old_cache_format_requires_clean_reindex() {
         let temp_file = NamedTempFile::new().unwrap();
         let cache_path = temp_file.path().to_path_buf();
 
@@ -544,17 +578,21 @@ mod tests {
         let old_format = r#"{"roots":{"/test/path":{"file1.rs":"hash1"}}}"#;
         fs::write(&cache_path, old_format).unwrap();
 
-        // Load should succeed with empty dirty_roots
+        // Identity schema v1 must not coexist with v2 records.
         let loaded = HashCache::load(&cache_path).unwrap();
-        assert!(loaded.get_root("/test/path").is_some());
+        assert!(loaded.roots.is_empty());
+        assert_eq!(loaded.schema_version, INDEX_SCHEMA_VERSION);
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|item| item.contains("clean reindex"))
+        );
         assert!(!loaded.has_dirty_roots());
-        assert!(!loaded.is_dirty("/test/path"));
     }
 
     #[test]
-    fn test_dirty_flag_migration_from_hashset() {
-        // Test that loading a cache with old HashSet dirty_roots format works
-        // This handles migration from the old format (HashSet<String>) to new (HashMap<String, DirtyInfo>)
+    fn test_hashset_cache_format_requires_clean_reindex() {
         let temp_file = NamedTempFile::new().unwrap();
         let cache_path = temp_file.path().to_path_buf();
 
@@ -563,21 +601,20 @@ mod tests {
             r#"{"roots":{"/test/path":{"file1.rs":"hash1"}},"dirty_roots":["/test/path"]}"#;
         fs::write(&cache_path, old_format).unwrap();
 
-        // Load should successfully migrate the old format
         let loaded = HashCache::load(&cache_path).unwrap();
+        assert!(loaded.roots.is_empty());
+        assert!(loaded.dirty_roots.is_empty());
+        assert_eq!(loaded.schema_version, INDEX_SCHEMA_VERSION);
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|item| item.contains("clean reindex"))
+        );
 
-        // Verify the migration worked
-        assert!(loaded.get_root("/test/path").is_some());
-        assert!(loaded.is_dirty("/test/path"));
-        assert!(loaded.has_dirty_roots());
-
-        // Verify the dirty info has a timestamp
-        let info = loaded.get_dirty_info("/test/path").unwrap();
-        assert!(info.timestamp > 0);
-
-        // Verify the file was updated to new format
         let reloaded = HashCache::load(&cache_path).unwrap();
-        assert!(reloaded.is_dirty("/test/path"));
+        assert_eq!(reloaded.schema_version, INDEX_SCHEMA_VERSION);
+        assert!(reloaded.roots.is_empty());
     }
 
     #[test]

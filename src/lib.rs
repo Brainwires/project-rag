@@ -146,6 +146,7 @@ pub mod indexer;
 
 /// Path normalization and utility functions
 pub mod paths;
+pub mod project_path;
 
 /// Code relationships: definitions, references, call graphs
 pub mod relations;

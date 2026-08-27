@@ -14,6 +14,57 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+fn generate_project_id() -> String {
+    use sha2::{Digest, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let seed = format!(
+        "{}:{}:{:?}",
+        std::process::id(),
+        nanos,
+        std::thread::current().id()
+    );
+    let digest = Sha256::digest(seed.as_bytes());
+    format!("project-{:x}", digest)[..24].to_string()
+}
+
+async fn ensure_project_id(
+    client: &RagClient,
+    root: &str,
+    configured: Option<String>,
+) -> Result<String> {
+    let mut cache = client.hash_cache.write().await;
+    let project_id = match (cache.project_id(root), configured) {
+        (Some(existing), Some(configured)) if existing != configured => anyhow::bail!(
+            "Indexed root '{}' is already bound to project_id '{}', not '{}'",
+            root,
+            existing,
+            configured
+        ),
+        (Some(existing), _) => existing.to_string(),
+        (None, Some(configured)) => configured,
+        (None, None) => generate_project_id(),
+    };
+
+    if cache
+        .project_ids
+        .iter()
+        .any(|(other_root, id)| other_root != root && id == &project_id)
+    {
+        anyhow::bail!(
+            "project_id '{}' is already assigned to another indexed root; each root requires a distinct id",
+            project_id
+        );
+    }
+
+    cache.set_project_id(root.to_string(), project_id.clone());
+    cache.save(&client.cache_path)?;
+    Ok(project_id)
+}
+
 /// Helper macro to check for cancellation and return early if cancelled
 macro_rules! check_cancelled {
     ($cancel_token:expr) => {
@@ -551,7 +602,11 @@ pub async fn do_incremental_update(
             }
             Some(old_hash) if old_hash != &file.hash => {
                 // Modified file - delete old embeddings first
-                if let Err(e) = client.vector_db.delete_by_file(&file.relative_path).await {
+                if let Err(e) = client
+                    .vector_db
+                    .delete_by_file_in_root(&file.relative_path, &path)
+                    .await
+                {
                     tracing::warn!("Failed to delete old embeddings: {}", e);
                 }
                 files_updated += 1;
@@ -567,10 +622,18 @@ pub async fn do_incremental_update(
     for old_file in existing_hashes.keys() {
         if !new_hashes.contains_key(old_file) {
             files_removed += 1;
-            if let Err(e) = client.vector_db.delete_by_file(old_file).await {
+            if let Err(e) = client
+                .vector_db
+                .delete_by_file_in_root(old_file, &path)
+                .await
+            {
                 tracing::warn!("Failed to delete embeddings for removed file: {}", e);
             }
-            if let Err(e) = client.relations_store.delete_by_file(old_file).await {
+            if let Err(e) = client
+                .relations_store
+                .delete_by_file_in_root(old_file, &path)
+                .await
+            {
                 tracing::warn!("Failed to delete relations for removed file: {}", e);
             }
         }
@@ -1030,6 +1093,7 @@ pub(crate) async fn do_index_smart_inner(
 ) -> Result<IndexResponse> {
     // Normalize path to canonical form for consistent cache lookups
     let normalized_path = RagClient::normalize_path(&path)?;
+    let project_id = ensure_project_id(client, &normalized_path, project).await?;
 
     // Check if index is dirty (previous indexing was interrupted)
     let is_dirty = {
@@ -1189,7 +1253,7 @@ pub(crate) async fn do_index_smart_inner(
         do_incremental_update(
             client,
             normalized_path.clone(),
-            project,
+            Some(project_id),
             include_patterns,
             exclude_patterns,
             max_file_size,
@@ -1208,7 +1272,7 @@ pub(crate) async fn do_index_smart_inner(
         do_index(
             client,
             normalized_path.clone(),
-            project,
+            Some(project_id),
             include_patterns,
             exclude_patterns,
             max_file_size,
@@ -1259,14 +1323,22 @@ async fn clear_path_data(client: &RagClient, normalized_path: &str) -> Result<()
 
     // Delete embeddings and stored relations for each file
     for file_path in file_paths {
-        if let Err(e) = client.vector_db.delete_by_file(&file_path).await {
+        if let Err(e) = client
+            .vector_db
+            .delete_by_file_in_root(&file_path, normalized_path)
+            .await
+        {
             tracing::warn!(
                 "Failed to delete embeddings for file '{}': {}",
                 file_path,
                 e
             );
         }
-        if let Err(e) = client.relations_store.delete_by_file(&file_path).await {
+        if let Err(e) = client
+            .relations_store
+            .delete_by_file_in_root(&file_path, normalized_path)
+            .await
+        {
             tracing::warn!("Failed to delete relations for file '{}': {}", file_path, e);
         }
     }

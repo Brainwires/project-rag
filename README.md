@@ -125,7 +125,7 @@ The server provides 9 tools that can be used directly:
    - Respects .gitignore and exclude patterns
    - Returns mode information (full or incremental)
 
-2. **query_codebase** - Hybrid semantic + keyword search across the indexed code
+2. **query_codebase** - Snippet-first hybrid semantic + keyword search across current indexed code (history is excluded)
    - Combines vector similarity with BM25 keyword matching (enabled by default)
    - Returns relevant code chunks with both vector and keyword scores
    - Configurable result limit and score threshold
@@ -153,6 +153,8 @@ The server provides 9 tools that can be used directly:
    - Regex filtering by author name/email and file paths
    - Date range filtering (ISO 8601 or Unix timestamp)
    - Branch selection support
+
+Normal retrieval never searches Git history implicitly. History results expose validated commit metadata and `origin: "history"`; current-tree results expose `origin: "current"`.
 
 7. **find_definition** - Find where a symbol is defined (LSP-like)
    - Specify file path, line number, and column

@@ -48,6 +48,9 @@ pub trait RelationsStore: Send + Sync {
     /// Delete all relationships for a file (for incremental updates)
     async fn delete_by_file(&self, file_path: &str) -> Result<usize>;
 
+    /// Delete relationships for one canonical file identity in one project root.
+    async fn delete_by_file_in_root(&self, file_path: &str, root_path: &str) -> Result<usize>;
+
     /// Clear all relationships
     async fn clear(&self) -> Result<()>;
 

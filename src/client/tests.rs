@@ -1534,3 +1534,71 @@ async fn list_symbols_smoke_on_real_file() {
 
     assert!(resp.total_count > 0, "expected at least one symbol");
 }
+
+#[test]
+fn retrieval_budget_returns_snippets_with_exact_lines() {
+    let content = (1..=300)
+        .map(|line| {
+            if line == 200 {
+                "needle_call();".to_string()
+            } else {
+                format!("line_{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let result = SearchResult {
+        file_path: "src/large.rs".to_string(),
+        root_path: None,
+        content,
+        full_start_line: 1,
+        full_end_line: 300,
+        content_truncated: false,
+        score: 1.0,
+        vector_score: 1.0,
+        keyword_score: None,
+        start_line: 1,
+        end_line: 300,
+        language: "Rust".to_string(),
+        project: Some("project-id".to_string()),
+        origin: RecordOrigin::Current,
+        source_id: None,
+        indexed_at: 1,
+    };
+
+    let (results, total, truncated) = apply_search_budget("needle_call", vec![result], 10);
+    assert_eq!(total, 1);
+    assert_eq!(results.len(), 1);
+    assert!(truncated);
+    assert_eq!(results[0].start_line, 185);
+    assert_eq!(results[0].end_line, 215);
+    assert!(results[0].content.contains("needle_call();"));
+    assert!(!results[0].content.contains("line_1\n"));
+}
+
+#[test]
+fn retrieval_budget_caps_total_result_count() {
+    let make_result = |index: usize| SearchResult {
+        file_path: format!("src/{index}.rs"),
+        root_path: None,
+        content: "needle".to_string(),
+        full_start_line: 1,
+        full_end_line: 1,
+        content_truncated: false,
+        score: 1.0,
+        vector_score: 1.0,
+        keyword_score: None,
+        start_line: 1,
+        end_line: 1,
+        language: "Rust".to_string(),
+        project: None,
+        origin: RecordOrigin::Current,
+        source_id: None,
+        indexed_at: 1,
+    };
+    let input = (0..150).map(make_result).collect();
+    let (results, total, truncated) = apply_search_budget("needle", input, 150);
+    assert_eq!(total, 150);
+    assert_eq!(results.len(), SEARCH_MAX_RESULTS);
+    assert!(truncated);
+}
