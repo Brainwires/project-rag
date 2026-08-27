@@ -4,6 +4,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::build_config::ConfigurationState;
 use crate::relations::SymbolKind;
 
 fn default_check() -> String {
@@ -36,6 +37,9 @@ pub struct FindUnusedRequest {
     /// Maximum file size in bytes to scan (default 1 MB)
     #[serde(default = "default_max_file_size")]
     pub max_file_size: usize,
+    /// Restrict analysis to these discovered/explicit config IDs. Empty means all.
+    #[serde(default)]
+    pub configurations: Vec<String>,
 }
 
 impl FindUnusedRequest {
@@ -53,6 +57,13 @@ impl FindUnusedRequest {
         if self.limit == 0 {
             return Err("limit must be >= 1".to_string());
         }
+        if self
+            .configurations
+            .iter()
+            .any(|configuration| configuration.trim().is_empty())
+        {
+            return Err("configurations cannot contain an empty config_id".to_string());
+        }
         Ok(())
     }
 
@@ -65,6 +76,21 @@ impl FindUnusedRequest {
     pub fn check_symbols(&self) -> bool {
         matches!(self.check.as_str(), "symbols" | "all")
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UnusedStatus {
+    Referenced,
+    UnusedInAnalyzedConfigurations,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisCompleteness {
+    Complete,
+    Partial,
 }
 
 /// A definition or import binding that appears to be unused
@@ -91,6 +117,18 @@ pub struct UnusedCandidate {
     /// probed, or the header symbols probed for a C/C++ include
     #[serde(default)]
     pub probe: String,
+    pub status: UnusedStatus,
+    #[serde(default)]
+    pub analyzed_configurations: Vec<String>,
+    pub analysis_completeness: AnalysisCompleteness,
+    #[serde(default)]
+    pub configuration_states: Vec<ConfigurationState>,
+    #[serde(default)]
+    pub unresolved_dependency_kinds: Vec<String>,
+    #[serde(default)]
+    pub limitations: Vec<String>,
+    /// Never infer deletion safety from a textual unused scan.
+    pub safe_for_destructive_edit: bool,
 }
 
 /// An import binding that could not be verified and was therefore NOT flagged
@@ -154,6 +192,14 @@ pub struct FindUnusedResponse {
     /// True if the cross-index probe budget ran out; symbols past the budget
     /// were conservatively treated as used
     pub probes_exhausted: bool,
+    #[serde(default)]
+    pub analyzed_configurations: Vec<String>,
+    pub analysis_completeness: AnalysisCompleteness,
+    #[serde(default)]
+    pub unresolved_dependency_kinds: Vec<String>,
+    #[serde(default)]
+    pub limitations: Vec<String>,
+    pub safe_for_destructive_edit: bool,
     /// Precision class of the method (text-based AST extraction + whole-word
     /// matching), not a per-run quality measure; see symbol_rejections,
     /// unverifiable_import_details and skipped_definitions for this run's
@@ -174,6 +220,7 @@ mod tests {
         assert_eq!(req.check, "all");
         assert_eq!(req.limit, 100);
         assert_eq!(req.max_file_size, 1_048_576);
+        assert!(req.configurations.is_empty());
         assert!(req.project.is_none());
         assert!(req.check_imports());
         assert!(req.check_symbols());
@@ -187,6 +234,7 @@ mod tests {
             check: "all".to_string(),
             limit: 100,
             max_file_size: 1_048_576,
+            configurations: Vec::new(),
         };
         assert!(req.validate().is_err());
     }
@@ -199,6 +247,7 @@ mod tests {
             check: "everything".to_string(),
             limit: 100,
             max_file_size: 1_048_576,
+            configurations: Vec::new(),
         };
         assert!(req.validate().is_err());
     }
@@ -211,6 +260,7 @@ mod tests {
             check: "imports".to_string(),
             limit: 0,
             max_file_size: 1_048_576,
+            configurations: Vec::new(),
         };
         assert!(req.validate().is_err());
     }
@@ -223,6 +273,7 @@ mod tests {
             check: "imports".to_string(),
             limit: 10,
             max_file_size: 1_048_576,
+            configurations: Vec::new(),
         };
         assert!(req.validate().is_ok());
         assert!(req.check_imports());
@@ -248,6 +299,13 @@ mod tests {
                 reason: "imported name is never referenced in this file".to_string(),
                 signature: "use std::collections::HashMap;".to_string(),
                 probe: "whole-word search for 'HashMap'".to_string(),
+                status: UnusedStatus::Inconclusive,
+                analyzed_configurations: Vec::new(),
+                analysis_completeness: AnalysisCompleteness::Partial,
+                configuration_states: Vec::new(),
+                unresolved_dependency_kinds: vec!["build_configuration".to_string()],
+                limitations: vec!["no build configuration".to_string()],
+                safe_for_destructive_edit: false,
             }],
             total_candidates: 1,
             unverifiable_imports: 2,
@@ -265,6 +323,11 @@ mod tests {
             skipped_definitions: 1,
             truncated: false,
             probes_exhausted: false,
+            analyzed_configurations: Vec::new(),
+            analysis_completeness: AnalysisCompleteness::Partial,
+            unresolved_dependency_kinds: vec!["build_configuration".to_string()],
+            limitations: vec!["no build configuration".to_string()],
+            safe_for_destructive_edit: false,
             precision: "medium".to_string(),
             duration_ms: 12,
         };

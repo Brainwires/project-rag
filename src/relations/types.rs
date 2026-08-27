@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::hash::{Hash, Hasher};
 
+use crate::build_config::ConfigurationState;
+
 /// Kind of symbol in the codebase
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -227,6 +229,12 @@ pub enum ReferenceKind {
     Read,
     /// Variable write/assignment
     Write,
+    /// Read through an object/member selector.
+    MemberRead,
+    /// Write through an object/member selector.
+    MemberWrite,
+    /// Call through an object/member selector.
+    MethodCall,
     /// Taking the address of a symbol
     AddressTake,
     /// Import statement
@@ -239,6 +247,20 @@ pub enum ReferenceKind {
     Inheritance,
     /// Instantiation (new Foo())
     Instantiation,
+    /// Object construction dependency.
+    ObjectConstruction,
+    /// Assignment involving an object value.
+    ObjectAssignment,
+    /// Statically visible ownership relationship.
+    Owns,
+    /// Statically visible reference relationship.
+    References,
+    /// Statically visible pointer relationship.
+    PointsTo,
+    /// Explicit creation relationship.
+    Creates,
+    /// Explicit destruction relationship.
+    Destroys,
     /// Template or generic use
     TemplateUse,
     /// Include directive
@@ -259,6 +281,18 @@ impl ReferenceKind {
     /// Whether this kind is executable/source dependency evidence by default.
     pub fn is_code(self) -> bool {
         !matches!(self, Self::Documentation | Self::Comment | Self::String)
+    }
+
+    pub fn is_call(self) -> bool {
+        matches!(
+            self,
+            Self::Call
+                | Self::MethodCall
+                | Self::ConstructorCall
+                | Self::ObjectConstruction
+                | Self::Creates
+                | Self::Destroys
+        )
     }
 }
 
@@ -588,6 +622,9 @@ pub struct Reference {
     pub resolution_status: ResolutionStatus,
     pub evidence_kind: EvidenceKind,
     pub dispatch_kind: DispatchKind,
+    /// Per-build-configuration preprocessor scope for this source occurrence.
+    #[serde(default)]
+    pub configuration_states: Vec<ConfigurationState>,
     pub language: String,
     pub parser: String,
     /// Timestamp when this reference was indexed
@@ -625,6 +662,7 @@ impl Reference {
             resolution_status: ResolutionStatus::Resolved,
             evidence_kind: EvidenceKind::Syntactic,
             dispatch_kind: DispatchKind::Unknown,
+            configuration_states: Vec::new(),
             language: definition.symbol_id.language.clone(),
             parser: definition.parser.clone(),
             indexed_at: definition.indexed_at,
@@ -761,6 +799,8 @@ pub struct ReferenceResult {
     pub resolution_status: ResolutionStatus,
     pub evidence_kind: EvidenceKind,
     pub dispatch_kind: DispatchKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configuration_states: Vec<ConfigurationState>,
     pub language: String,
     pub parser: String,
     /// Preview of the line containing the reference
@@ -783,6 +823,7 @@ impl From<&Reference> for ReferenceResult {
             resolution_status: r.resolution_status,
             evidence_kind: r.evidence_kind,
             dispatch_kind: r.dispatch_kind,
+            configuration_states: r.configuration_states.clone(),
             language: r.language.clone(),
             parser: r.parser.clone(),
             preview: None,
@@ -867,6 +908,8 @@ pub struct GraphEdge {
     pub resolution_status: ResolutionStatus,
     pub evidence_kind: EvidenceKind,
     pub dispatch_kind: DispatchKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configuration_states: Vec<ConfigurationState>,
     pub path: String,
     pub start_line: usize,
     pub start_column: usize,
@@ -891,6 +934,7 @@ impl GraphEdge {
             resolution_status: reference.resolution_status,
             evidence_kind: reference.evidence_kind,
             dispatch_kind: reference.dispatch_kind,
+            configuration_states: reference.configuration_states.clone(),
             path: reference.file_path.clone(),
             start_line: reference.start_line,
             start_column: reference.start_col,
@@ -1084,6 +1128,7 @@ mod tests {
             resolution_status: ResolutionStatus::Resolved,
             evidence_kind: EvidenceKind::Syntactic,
             dispatch_kind: DispatchKind::Direct,
+            configuration_states: Vec::new(),
             language: "Rust".to_string(),
             parser: "tree-sitter/test".to_string(),
             indexed_at: 12345,

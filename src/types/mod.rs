@@ -5,7 +5,8 @@ mod file_ops;
 pub use file_ops::{EditFileRequest, EditFileResponse, ReadFileRequest, ReadFileResponse};
 mod find_unused;
 pub use find_unused::{
-    FindUnusedRequest, FindUnusedResponse, SymbolRejections, UnusedCandidate, UnverifiableImport,
+    AnalysisCompleteness, FindUnusedRequest, FindUnusedResponse, SymbolRejections, UnusedCandidate,
+    UnusedStatus, UnverifiableImport,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -468,6 +469,9 @@ pub struct FindReferencesRequest {
     /// Restrict evidence kinds. Empty includes all evidence kinds.
     #[serde(default)]
     pub evidence_kinds: Vec<crate::relations::EvidenceKind>,
+    /// Restrict occurrences to active/unknown scope in these build configurations.
+    #[serde(default)]
+    pub configurations: Vec<String>,
     /// Include documentation, comment, and string matches when no kind filter is supplied.
     #[serde(default)]
     pub include_non_code: bool,
@@ -504,6 +508,13 @@ impl FindReferencesRequest {
             && path.trim().is_empty()
         {
             return Err("path_filter cannot be empty".to_string());
+        }
+        if self
+            .configurations
+            .iter()
+            .any(|configuration| configuration.trim().is_empty())
+        {
+            return Err("configurations cannot contain an empty config_id".to_string());
         }
         Ok(())
     }
@@ -584,6 +595,9 @@ pub struct GetCallGraphRequest {
     /// Canonical project-relative path substring filters.
     #[serde(default)]
     pub path_filters: Vec<String>,
+    /// Restrict graph observations to active/unknown scope in these configurations.
+    #[serde(default)]
+    pub configurations: Vec<String>,
 }
 
 fn default_call_graph_depth() -> usize {
@@ -647,6 +661,13 @@ impl GetCallGraphRequest {
             .any(|language| language.trim().is_empty())
         {
             return Err("language_filters cannot contain an empty value".to_string());
+        }
+        if self
+            .configurations
+            .iter()
+            .any(|configuration| configuration.trim().is_empty())
+        {
+            return Err("configurations cannot contain an empty config_id".to_string());
         }
         Ok(())
     }

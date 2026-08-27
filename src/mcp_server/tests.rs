@@ -80,7 +80,7 @@ fn test_all_tools_and_prompts_are_routed() {
 }
 
 /// The MCP input schema for find_unused is generated from FindUnusedRequest's
-/// JsonSchema derive; this pins the contract a client actually sees: all five
+/// JsonSchema derive; this pins the contract a client actually sees: all six
 /// parameters present, only `path` required (the rest have serde defaults),
 /// and doc comments surfaced as descriptions.
 #[test]
@@ -101,7 +101,14 @@ fn test_find_unused_tool_schema() {
     let properties = schema["properties"]
         .as_object()
         .expect("schema has no properties");
-    for field in ["path", "project", "check", "limit", "max_file_size"] {
+    for field in [
+        "path",
+        "project",
+        "check",
+        "limit",
+        "max_file_size",
+        "configurations",
+    ] {
         assert!(properties.contains_key(field), "schema missing '{}'", field);
         assert!(
             properties[field]["description"].is_string(),
@@ -117,6 +124,10 @@ fn test_find_unused_tool_schema() {
         .filter_map(|v| v.as_str())
         .collect();
     assert_eq!(required, vec!["path"], "only 'path' should be required");
+    assert_eq!(
+        schema["properties"]["configurations"]["default"],
+        serde_json::json!([])
+    );
 
     assert!(
         tool.description

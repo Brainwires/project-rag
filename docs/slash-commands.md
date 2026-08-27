@@ -1,6 +1,6 @@
 # Slash Commands
 
-Project RAG provides 9 slash commands via MCP Prompts for quick access in Claude Code.
+Project RAG provides 12 slash commands via MCP Prompts for quick access in Claude Code.
 
 ## Quick Reference
 
@@ -15,6 +15,9 @@ Project RAG provides 9 slash commands via MCP Prompts for quick access in Claude
 | `/project:definition` | Find where a symbol is defined |
 | `/project:references` | Find all references to a symbol |
 | `/project:callgraph` | Get call graph for a function |
+| `/project:read` | Read a file inside an indexed project |
+| `/project:edit` | Edit and reindex a file inside an indexed project |
+| `/project:unused` | Find conservative unused-code candidates |
 
 ## Usage
 
@@ -106,6 +109,35 @@ duplicate nodes, and capped graphs report their continuation frontier.
 ```
 
 Useful for understanding code flow and impact analysis.
+
+### `/project:read`
+
+Read all or part of a file within an indexed project root. The result includes a
+content hash that can guard a subsequent edit against concurrent changes.
+
+```
+/project:read
+```
+
+### `/project:edit`
+
+Replace a whole file, replace or delete a line range, or insert lines within an
+indexed project root. Successful edits automatically reindex the affected project.
+
+```
+/project:edit
+```
+
+### `/project:unused`
+
+Find unused imports and dead-symbol candidates within analyzed build
+configurations. Results disclose conditional state, completeness, unresolved
+dependency kinds, and limitations; they are evidence for investigation and never
+automatic permission to delete code.
+
+```
+/project:unused
+```
 
 ## How Slash Commands Work
 

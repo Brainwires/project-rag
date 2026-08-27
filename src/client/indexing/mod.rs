@@ -1,4 +1,5 @@
 use super::RagClient;
+use crate::build_config::{BuildConfigCatalog, ConfigurationState, PreprocessorState};
 use crate::embedding::EmbeddingProvider;
 use crate::indexer::{CodeChunk, FileInfo, FileWalker};
 use crate::relations::RelationsProvider;
@@ -9,6 +10,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rmcp::{Peer, RoleServer, model::ProgressNotificationParam, model::ProgressToken};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -75,6 +77,27 @@ macro_rules! check_cancelled {
     };
 }
 
+fn relevant_build_diagnostics(catalog: &BuildConfigCatalog, files: &[FileInfo]) -> Vec<String> {
+    let has_build_sensitive_file = files.iter().any(|file| {
+        file.extension.as_deref().is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" | "m" | "mm"
+            )
+        })
+    });
+    catalog
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            has_build_sensitive_file
+                || !(diagnostic.starts_with("No compile_commands.json found")
+                    || diagnostic.starts_with("No analyzed build configuration is available"))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Build and publish one coherent relations generation for a project root.
 ///
 /// Storage is idempotent per file, so calling this for modified files replaces
@@ -86,6 +109,40 @@ async fn extract_and_store_relations(
     root_path: &str,
     errors: &mut Vec<String>,
 ) -> (usize, usize) {
+    let build_catalog =
+        match BuildConfigCatalog::discover(Path::new(root_path), &client.config.analysis) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                errors.push(format!("Build-configuration discovery failed: {:#}", error));
+                BuildConfigCatalog::default()
+            }
+        };
+    let build_diagnostics = relevant_build_diagnostics(&build_catalog, files);
+    for diagnostic in &build_diagnostics {
+        tracing::warn!("{}", diagnostic);
+        errors.push(diagnostic.clone());
+    }
+    {
+        let mut cache = client.hash_cache.write().await;
+        cache
+            .diagnostics
+            .retain(|diagnostic| !diagnostic.starts_with("[build-config] "));
+        cache.diagnostics.extend(
+            build_diagnostics
+                .iter()
+                .map(|diagnostic| format!("[build-config] {}", diagnostic)),
+        );
+    }
+    let states_by_file = files
+        .iter()
+        .map(|file| {
+            (
+                file.relative_path.clone(),
+                build_catalog.states_for_file(&file.relative_path, &file.content),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
     let provider = client.relations_provider.clone();
     let definition_results: Vec<_> = files
         .par_iter()
@@ -154,6 +211,64 @@ async fn extract_and_store_relations(
             .iter()
             .map(crate::relations::Reference::from_definition),
     );
+    for reference in &mut references {
+        reference.configuration_states = states_by_file
+            .get(&reference.file_path)
+            .and_then(|lines| lines.get(reference.start_line))
+            .cloned()
+            .unwrap_or_default();
+    }
+
+    // Forced includes are dependencies even though they have no source token in
+    // the translation unit. Keep them as explicit build-config provenance rows.
+    for file in files {
+        for configuration in build_catalog.configurations_for_file(&file.relative_path) {
+            for forced_include in &configuration.forced_includes {
+                let location = crate::relations::SourceLocation {
+                    project_id: file.project.clone().unwrap_or_default(),
+                    file_path: file.relative_path.clone(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 1,
+                    end_col: 0,
+                    role: crate::relations::LocationRole::Reference,
+                };
+                references.push(crate::relations::Reference {
+                    file_path: file.relative_path.clone(),
+                    root_path: Some(root_path.to_string()),
+                    project: file.project.clone(),
+                    start_line: 1,
+                    end_line: 1,
+                    start_col: 0,
+                    end_col: 0,
+                    location_id: format!(
+                        "{}:{}:{}",
+                        location.to_storage_id(),
+                        configuration.config_id,
+                        forced_include
+                    ),
+                    source_symbol_id: None,
+                    target_symbol_id: String::new(),
+                    target_name: forced_include.clone(),
+                    candidates: Vec::new(),
+                    reference_kind: crate::relations::ReferenceKind::Include,
+                    resolution_status: crate::relations::ResolutionStatus::Unresolved,
+                    evidence_kind: crate::relations::EvidenceKind::Syntactic,
+                    dispatch_kind: crate::relations::DispatchKind::Unknown,
+                    configuration_states: vec![ConfigurationState {
+                        config_id: configuration.config_id.clone(),
+                        state: PreprocessorState::Active,
+                    }],
+                    language: file
+                        .language
+                        .clone()
+                        .unwrap_or_else(|| "Unknown".to_string()),
+                    parser: "build-config/forced-include".to_string(),
+                    indexed_at: chrono::Utc::now().timestamp(),
+                });
+            }
+        }
+    }
 
     if let Err(e) = client.relations_store.delete_by_root(root_path).await {
         let message = format!("Failed to clear prior relations generation: {:#}", e);

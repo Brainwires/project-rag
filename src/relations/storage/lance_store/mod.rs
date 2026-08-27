@@ -1,7 +1,7 @@
 //! LanceDB-based storage for code relationships.
 //!
-//! Definitions and references live in two schema-v3 tables
-//! (`relations_definitions_v3`, `relations_references_v3`) inside the same LanceDB directory as the embeddings
+//! Definitions and references live in schema-versioned relation tables inside
+//! the same LanceDB directory as the embeddings
 //! table, so one database directory holds everything the index knows.
 //!
 //! Writes are idempotent per file: storing rows for a file first deletes
@@ -25,8 +25,8 @@ use tokio::sync::RwLock;
 use super::{RelationsStats, RelationsStore};
 use crate::relations::types::{CallEdge, Definition, Reference, ReferenceKind, ResolutionStatus};
 
-const DEFINITIONS_TABLE: &str = "relations_definitions_v3";
-const REFERENCES_TABLE: &str = "relations_references_v3";
+const DEFINITIONS_TABLE: &str = "relations_definitions_v4";
+const REFERENCES_TABLE: &str = "relations_references_v4";
 
 /// Delete filters are built as `file_path IN (...)`; chunked so a large batch
 /// of files cannot produce an absurdly long filter string.

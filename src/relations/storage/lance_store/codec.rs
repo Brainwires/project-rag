@@ -69,6 +69,7 @@ pub fn references_schema() -> Arc<Schema> {
         Field::new("resolution_status", DataType::Utf8, false),
         Field::new("evidence_kind", DataType::Utf8, false),
         Field::new("dispatch_kind", DataType::Utf8, false),
+        Field::new("configuration_states", DataType::Utf8, false),
         Field::new("language", DataType::Utf8, false),
         Field::new("parser", DataType::Utf8, false),
         Field::new("indexed_at", DataType::Int64, false),
@@ -401,6 +402,14 @@ pub fn references_to_batch(references: &[Reference]) -> Result<RecordBatch> {
             .map(|r| enum_to_str(&r.dispatch_kind))
             .collect::<Vec<_>>(),
     );
+    let configuration_states = StringArray::from(
+        references
+            .iter()
+            .map(|r| {
+                serde_json::to_string(&r.configuration_states).unwrap_or_else(|_| "[]".to_string())
+            })
+            .collect::<Vec<_>>(),
+    );
     let languages = StringArray::from(
         references
             .iter()
@@ -435,6 +444,7 @@ pub fn references_to_batch(references: &[Reference]) -> Result<RecordBatch> {
             Arc::new(resolution_statuses),
             Arc::new(evidence_kinds),
             Arc::new(dispatch_kinds),
+            Arc::new(configuration_states),
             Arc::new(languages),
             Arc::new(parsers),
             Arc::new(indexed_ats),
@@ -568,6 +578,7 @@ pub fn batch_to_references(batch: &RecordBatch) -> Result<Vec<Reference>> {
     let resolution_statuses = str_col(batch, "resolution_status")?;
     let evidence_kinds = str_col(batch, "evidence_kind")?;
     let dispatch_kinds = str_col(batch, "dispatch_kind")?;
+    let configuration_states = str_col(batch, "configuration_states")?;
     let languages = str_col(batch, "language")?;
     let parsers = str_col(batch, "parser")?;
     let indexed_ats = i64_col(batch, "indexed_at")?;
@@ -582,6 +593,8 @@ pub fn batch_to_references(batch: &RecordBatch) -> Result<Vec<Reference>> {
             enum_from_str::<EvidenceKind>(evidence_kinds.value(i)).unwrap_or_default();
         let dispatch_kind =
             enum_from_str::<DispatchKind>(dispatch_kinds.value(i)).unwrap_or_default();
+        let configuration_states =
+            serde_json::from_str(configuration_states.value(i)).unwrap_or_default();
         let parsed_candidates: Vec<ReferenceCandidate> =
             serde_json::from_str(candidates.value(i)).unwrap_or_default();
         out.push(Reference {
@@ -601,6 +614,7 @@ pub fn batch_to_references(batch: &RecordBatch) -> Result<Vec<Reference>> {
             resolution_status,
             evidence_kind,
             dispatch_kind,
+            configuration_states,
             language: languages.value(i).to_string(),
             parser: parsers.value(i).to_string(),
             indexed_at: indexed_ats.value(i),

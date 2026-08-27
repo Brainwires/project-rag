@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+pub use crate::build_config::AnalysisConfig;
+
 /// Main configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -24,6 +26,10 @@ pub struct Config {
 
     /// Cache configuration
     pub cache: CacheConfig,
+
+    /// Build-aware analysis configuration.
+    #[serde(default)]
+    pub analysis: AnalysisConfig,
 }
 
 /// Vector database configuration

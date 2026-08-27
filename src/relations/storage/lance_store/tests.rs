@@ -59,6 +59,7 @@ fn make_call_ref(target_id: &str, file: &str, line: usize) -> Reference {
         resolution_status: crate::relations::ResolutionStatus::Resolved,
         evidence_kind: crate::relations::EvidenceKind::Syntactic,
         dispatch_kind: crate::relations::DispatchKind::Direct,
+        configuration_states: Vec::new(),
         language: "Rust".to_string(),
         parser: "tree-sitter/test".to_string(),
         indexed_at: 42,
@@ -277,6 +278,10 @@ async fn reference_name_query_and_statistics_share_persisted_rows() {
     let target_id = target.to_storage_id();
     let mut call = make_call_ref(&target_id, "src/main.rs", 5);
     call.target_name = "Write".to_string();
+    call.configuration_states = vec![crate::build_config::ConfigurationState {
+        config_id: "debug".to_string(),
+        state: crate::build_config::PreprocessorState::Active,
+    }];
     let mut comment = call.clone();
     comment.start_line = 6;
     comment.end_line = 6;
@@ -296,7 +301,7 @@ async fn reference_name_query_and_statistics_share_persisted_rows() {
     comment.target_symbol_id.clear();
 
     store
-        .store_references(vec![call, comment], "/test")
+        .store_references(vec![call.clone(), comment], "/test")
         .await
         .unwrap();
     let matches = store
@@ -311,6 +316,7 @@ async fn reference_name_query_and_statistics_share_persisted_rows() {
     let stats = store.get_stats().await.unwrap();
     assert_eq!(matches.len(), 2);
     assert_eq!(at_call.target_symbol_id, target_id);
+    assert_eq!(at_call.configuration_states, call.configuration_states);
     assert_eq!(stats.reference_count, 2);
     assert_eq!(stats.code_reference_count, 1);
 }
@@ -356,6 +362,68 @@ async fn benchmark_m2_relations_store() {
     let query_elapsed = query_started.elapsed();
     println!(
         "m2 synthetic: write_500_defs_2000_refs_ms={} query_matches={} query_ms={} db_bytes={}",
+        write_elapsed.as_millis(),
+        matches.len(),
+        query_elapsed.as_millis(),
+        directory_size(dir.path())
+    );
+}
+
+#[tokio::test]
+#[ignore = "manual synthetic M4 configuration-scope latency/index-size measurement"]
+async fn benchmark_m4_configuration_scoped_relations_store() {
+    let (dir, store) = make_store().await;
+    let definitions: Vec<_> = (0..500)
+        .map(|index| {
+            make_def(
+                &format!("symbol_{index}"),
+                &format!("src/file_{}.cpp", index / 10),
+                index + 1,
+                index + 2,
+                SymbolKind::Function,
+            )
+        })
+        .collect();
+    let symbol_ids: Vec<_> = definitions.iter().map(Definition::to_storage_id).collect();
+    let references: Vec<_> = (0..2_000)
+        .map(|index| {
+            let mut reference = make_call_ref(
+                &symbol_ids[index % symbol_ids.len()],
+                &format!("src/caller_{}.cpp", index / 20),
+                index + 1,
+            );
+            reference.target_name = format!("symbol_{}", index % symbol_ids.len());
+            reference.location_id = format!("loc:v4:benchmark:{index}");
+            reference.configuration_states = vec![
+                crate::build_config::ConfigurationState {
+                    config_id: "debug-x64".to_string(),
+                    state: crate::build_config::PreprocessorState::Active,
+                },
+                crate::build_config::ConfigurationState {
+                    config_id: "release-x64".to_string(),
+                    state: if index % 3 == 0 {
+                        crate::build_config::PreprocessorState::Inactive
+                    } else {
+                        crate::build_config::PreprocessorState::Active
+                    },
+                },
+            ];
+            reference
+        })
+        .collect();
+
+    let write_started = std::time::Instant::now();
+    store.store_definitions(definitions, "/test").await.unwrap();
+    store.store_references(references, "/test").await.unwrap();
+    let write_elapsed = write_started.elapsed();
+    let query_started = std::time::Instant::now();
+    let matches = store
+        .find_references_by_name_in_root("symbol_42", "/test")
+        .await
+        .unwrap();
+    let query_elapsed = query_started.elapsed();
+    println!(
+        "m4 synthetic: write_500_defs_2000_scoped_refs_ms={} query_matches={} query_ms={} db_bytes={}",
         write_elapsed.as_millis(),
         matches.len(),
         query_elapsed.as_millis(),

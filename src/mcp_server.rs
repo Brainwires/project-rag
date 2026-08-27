@@ -338,7 +338,7 @@ impl RagMcpServer {
     }
 
     #[tool(
-        description = "Find unused imports and dead-code candidates in a file or directory. check: \"imports\" flags import/use/include bindings never referenced in their file (index-free); \"symbols\" flags definitions nothing references, using the index to verify cross-file usage (requires index_codebase first); \"all\" (default) does both. Candidates carry a confidence level (high/medium/low) - the analysis is text-based, so dynamic dispatch, macros and framework wiring are invisible to it. Treat results as leads to verify, never as safe to auto-delete."
+        description = "Conservatively analyze unused imports and symbols within explicit build-configuration scope. Auto-discovers compile_commands.json and accepts configured alternatives. Findings report referenced/unused_in_analyzed_configurations/inconclusive semantics, analyzed config IDs, completeness, unresolved dependency kinds, limitations, and safe_for_destructive_edit=false when build, generated, preprocessor, reflection, or dynamic wiring evidence is incomplete. Treat findings as evidence, never as safe to auto-delete."
     )]
     async fn find_unused(
         &self,
@@ -571,8 +571,8 @@ impl RagMcpServer {
         Ok(vec![PromptMessage::new_text(
             PromptMessageRole::User,
             format!(
-                "Please run the find_unused tool on '{}' and summarize the findings grouped by confidence. \
-                 Remind me that candidates are leads to verify, not guaranteed dead code.",
+                "Please run the find_unused tool on '{}' and summarize findings by status and analyzed build configuration. \
+                 Highlight inconclusive limitations and never imply destructive-edit safety when it is false.",
                 path
             ),
         )])
@@ -602,7 +602,7 @@ impl ServerHandler for RagMcpServer {
                 query_codebase to search, and search_by_filters for advanced queries. \
                 Use read_file and edit_file to read and modify files inside an indexed project; \
                 edit_file automatically reindexes the affected file. \
-                Use find_unused to surface unused imports and dead-code candidates for cleanup."
+                Use find_unused to surface conservative unused-code evidence; findings are not deletion authorization."
                     .into(),
             ),
         }

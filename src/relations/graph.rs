@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 
+use crate::build_config::configuration_scope_matches;
+
 use super::storage::RelationsStore;
 use super::{
     CallGraphNode, Definition, GraphEdge, LocationRole, Reference, ReferenceKind, ResolutionStatus,
@@ -26,6 +28,7 @@ pub struct GraphTraversalOptions {
     pub resolution_statuses: Vec<ResolutionStatus>,
     pub language_filters: Vec<String>,
     pub path_filters: Vec<String>,
+    pub configurations: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -52,6 +55,7 @@ fn reference_matches(reference: &Reference, options: &GraphTraversalOptions) -> 
                 .path_filters
                 .iter()
                 .any(|filter| reference.file_path.contains(&filter.replace('\\', "/"))))
+        && configuration_scope_matches(&reference.configuration_states, &options.configurations)
 }
 
 fn preferred_definitions(definitions: Vec<Definition>) -> HashMap<String, Definition> {
@@ -361,6 +365,7 @@ mod tests {
             } else {
                 DispatchKind::Unknown
             },
+            configuration_states: Vec::new(),
             language: "Rust".to_string(),
             parser: "tree-sitter/rust".to_string(),
             indexed_at: 1,
@@ -378,6 +383,7 @@ mod tests {
             resolution_statuses: vec![ResolutionStatus::Resolved],
             language_filters: Vec::new(),
             path_filters: Vec::new(),
+            configurations: Vec::new(),
         }
     }
 
@@ -518,14 +524,24 @@ mod tests {
         let a = definition("A", 1);
         let b = definition("B", 10);
         let c = definition("C", 20);
+        let mut first = call(&a, Some(&b), 2, ResolutionStatus::Resolved);
+        first.configuration_states = vec![crate::build_config::ConfigurationState {
+            config_id: "debug".to_string(),
+            state: crate::build_config::PreprocessorState::Active,
+        }];
         let mut second = call(&a, Some(&c), 3, ResolutionStatus::Resolved);
         second.language = "C++".to_string();
         second.file_path = "generated/a.cpp".to_string();
-        let references = vec![call(&a, Some(&b), 2, ResolutionStatus::Resolved), second];
+        second.configuration_states = vec![crate::build_config::ConfigurationState {
+            config_id: "release".to_string(),
+            state: crate::build_config::PreprocessorState::Active,
+        }];
+        let references = vec![first, second];
         let (_directory, store) = stored_graph(&[a.clone(), b, c], references).await;
         let mut opts = options(1);
         opts.language_filters = vec!["rust".to_string()];
         opts.path_filters = vec!["src/".to_string()];
+        opts.configurations = vec!["debug".to_string()];
 
         let graph = traverse_dependency_graph(&store, &a, "/graph", &opts)
             .await
@@ -575,5 +591,63 @@ mod tests {
         );
         assert_eq!(cold.nodes.len(), 3);
         assert_eq!(warm.edges.len(), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "synthetic M4 configuration-filtered graph latency measurement"]
+    async fn benchmark_m4_configuration_filtered_depth_two() {
+        let definitions = (0..500)
+            .map(|index| definition(&format!("Node{index}"), index * 10 + 1))
+            .collect::<Vec<_>>();
+        let references = (0..499)
+            .map(|index| {
+                let mut reference = call(
+                    &definitions[index],
+                    Some(&definitions[index + 1]),
+                    index * 10 + 2,
+                    ResolutionStatus::Resolved,
+                );
+                reference.configuration_states = vec![
+                    crate::build_config::ConfigurationState {
+                        config_id: "debug".to_string(),
+                        state: crate::build_config::PreprocessorState::Active,
+                    },
+                    crate::build_config::ConfigurationState {
+                        config_id: "release".to_string(),
+                        state: if index % 2 == 0 {
+                            crate::build_config::PreprocessorState::Active
+                        } else {
+                            crate::build_config::PreprocessorState::Inactive
+                        },
+                    },
+                ];
+                reference
+            })
+            .collect::<Vec<_>>();
+        let root = definitions[0].clone();
+        let (_directory, store) = stored_graph(&definitions, references).await;
+        let mut opts = options(2);
+        opts.configurations = vec!["debug".to_string()];
+
+        let cold_started = std::time::Instant::now();
+        let cold = traverse_dependency_graph(&store, &root, "/graph", &opts)
+            .await
+            .unwrap();
+        let cold_elapsed = cold_started.elapsed();
+        let warm_started = std::time::Instant::now();
+        let warm = traverse_dependency_graph(&store, &root, "/graph", &opts)
+            .await
+            .unwrap();
+        let warm_elapsed = warm_started.elapsed();
+
+        println!(
+            "m4 config-filtered graph: nodes={} edges={} cold_ms={} warm_ms={}",
+            warm.nodes.len(),
+            warm.edges.len(),
+            cold_elapsed.as_millis(),
+            warm_elapsed.as_millis()
+        );
+        assert_eq!((cold.nodes.len(), cold.edges.len()), (3, 2));
+        assert_eq!((warm.nodes.len(), warm.edges.len()), (3, 2));
     }
 }

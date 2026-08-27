@@ -1408,6 +1408,10 @@ impl RagClient {
                     .contains(&reference.resolution_status);
             let evidence_allowed = request.evidence_kinds.is_empty()
                 || request.evidence_kinds.contains(&reference.evidence_kind);
+            let configuration_allowed = crate::build_config::configuration_scope_matches(
+                &reference.configuration_states,
+                &request.configurations,
+            );
             points_to_target
                 && definition_allowed
                 && kind_allowed
@@ -1415,6 +1419,7 @@ impl RagClient {
                 && path_allowed
                 && resolution_allowed
                 && evidence_allowed
+                && configuration_allowed
         });
         persisted.sort_by(|a, b| {
             (&a.file_path, a.start_line, a.start_col, &a.location_id).cmp(&(
@@ -1584,7 +1589,12 @@ impl RagClient {
         );
 
         let edge_kinds = if request.edge_kinds.is_empty() {
-            vec![ReferenceKind::Call, ReferenceKind::ConstructorCall]
+            vec![
+                ReferenceKind::Call,
+                ReferenceKind::MethodCall,
+                ReferenceKind::ConstructorCall,
+                ReferenceKind::ObjectConstruction,
+            ]
         } else {
             request.edge_kinds.clone()
         };
@@ -1638,6 +1648,7 @@ impl RagClient {
             resolution_statuses: resolution_statuses.clone(),
             language_filters: request.language_filters,
             path_filters: request.path_filters,
+            configurations: request.configurations,
         };
         let graph = crate::relations::graph::traverse_dependency_graph(
             self.relations_store.as_ref(),

@@ -7,6 +7,51 @@ fn test_cancel_token() -> CancellationToken {
     CancellationToken::new()
 }
 
+fn diagnostic_file(path: &str, extension: &str) -> FileInfo {
+    FileInfo {
+        path: std::path::PathBuf::from(path),
+        relative_path: path.to_string(),
+        root_path: "/test".to_string(),
+        project: None,
+        extension: Some(extension.to_string()),
+        language: None,
+        content: String::new(),
+        hash: "hash".to_string(),
+    }
+}
+
+#[test]
+fn missing_compilation_database_is_reported_only_for_build_sensitive_files() {
+    let catalog = BuildConfigCatalog {
+        configurations: Vec::new(),
+        diagnostics: vec![
+            "No compile_commands.json found; configure it".to_string(),
+            "No analyzed build configuration is available".to_string(),
+        ],
+    };
+
+    assert!(
+        relevant_build_diagnostics(&catalog, &[diagnostic_file("src/lib.rs", "rs")]).is_empty()
+    );
+    assert_eq!(
+        relevant_build_diagnostics(&catalog, &[diagnostic_file("src/main.cpp", "cpp")]).len(),
+        2
+    );
+}
+
+#[test]
+fn invalid_explicit_build_database_is_reported_for_every_project_type() {
+    let catalog = BuildConfigCatalog {
+        configurations: Vec::new(),
+        diagnostics: vec!["Invalid compilation database 'custom.json'".to_string()],
+    };
+
+    assert_eq!(
+        relevant_build_diagnostics(&catalog, &[diagnostic_file("src/lib.rs", "rs")]),
+        catalog.diagnostics
+    );
+}
+
 // Helper to create test client
 async fn create_test_client() -> (RagClient, TempDir) {
     let temp_dir = TempDir::new().unwrap();

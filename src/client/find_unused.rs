@@ -22,11 +22,13 @@
 //!   BM25/hybrid index is probed for outside usage before flagging anything.
 
 use super::RagClient;
+use crate::build_config::{BuildConfigCatalog, ConfigurationState, PreprocessorState};
 use crate::indexer::{FileInfo, FileWalker};
 use crate::relations::repomap::language_name_for_extension;
 use crate::relations::{Definition, RelationsProvider, SymbolKind, Visibility};
 use crate::types::{
-    FindUnusedRequest, FindUnusedResponse, SymbolRejections, UnusedCandidate, UnverifiableImport,
+    AnalysisCompleteness, FindUnusedRequest, FindUnusedResponse, SymbolRejections, UnusedCandidate,
+    UnusedStatus, UnverifiableImport,
 };
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -103,6 +105,8 @@ struct Analyzed {
     skipped_definitions: usize,
     /// Canonicalized paths of scanned files, for excluding them from probes
     scanned_paths: HashSet<PathBuf>,
+    /// Per file, per 1-based line, states in every selected build configuration.
+    configuration_states: Vec<Vec<Vec<ConfigurationState>>>,
 }
 
 /// Import candidates plus every binding that could not be verified, with the
@@ -138,6 +142,22 @@ impl RagClient {
         // Probes are needed only when the scan covers less than the indexed
         // root; scanning the whole root makes the in-memory corpus authoritative.
         let partial_scan = indexed_root.as_deref() != Some(normalized.as_str());
+
+        let build_root = indexed_root
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let path = PathBuf::from(&normalized);
+                if path.is_file() {
+                    path.parent().unwrap_or(&path).to_path_buf()
+                } else {
+                    path
+                }
+            });
+        let build_catalog = BuildConfigCatalog::discover(&build_root, &self.config.analysis)?
+            .selected(&request.configurations);
+        let analyzed_configurations = build_catalog.config_ids();
+        let include_paths = build_catalog.include_paths(&build_root);
 
         // Gather and analyze files on a blocking thread (I/O + tree-sitter + regex).
         let provider = self.relations_provider.clone();
@@ -179,11 +199,13 @@ impl RagClient {
         let check_imports = request.check_imports();
         let resolver_provider = provider.clone();
         let resolver_project = request.project.clone();
+        let analysis_catalog = build_catalog.clone();
         let (analyzed, import_scan) = tokio::task::spawn_blocking(move || {
-            let analyzed = analyze(files, provider);
+            let analyzed = analyze(files, provider, &analysis_catalog);
             let import_scan = if check_imports {
                 let mut resolver = IncludeResolver {
                     scan_root,
+                    include_paths,
                     project: resolver_project,
                     provider: resolver_provider,
                     cache: HashMap::new(),
@@ -228,6 +250,17 @@ impl RagClient {
         let mut seen = HashSet::new();
         candidates.retain(|c| seen.insert((c.file_path.clone(), c.name.clone())));
 
+        let assessment = assess_analysis(
+            &analyzed,
+            &build_catalog,
+            &self.config.analysis.dynamic_wiring_patterns,
+            &self.config.analysis.generated_path_patterns,
+            unverifiable_imports,
+            probes_exhausted,
+            &symbol_rejections,
+        );
+        finalize_candidates(&mut candidates, &analyzed, &assessment);
+
         let total_candidates = candidates.len();
         let truncated = total_candidates > request.limit;
         candidates.truncate(request.limit);
@@ -244,6 +277,11 @@ impl RagClient {
             skipped_definitions: analyzed.skipped_definitions,
             truncated,
             probes_exhausted,
+            analyzed_configurations,
+            analysis_completeness: assessment.completeness,
+            unresolved_dependency_kinds: assessment.unresolved_dependency_kinds,
+            limitations: assessment.limitations,
+            safe_for_destructive_edit: false,
             precision: "medium".to_string(),
             duration_ms: start.elapsed().as_millis() as u64,
         })
@@ -327,6 +365,7 @@ impl RagClient {
 fn analyze(
     files: Vec<FileInfo>,
     provider: Arc<crate::relations::HybridRelationsProvider>,
+    build_catalog: &BuildConfigCatalog,
 ) -> Analyzed {
     let ident_re = Regex::new(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b").expect("static regex");
 
@@ -394,6 +433,10 @@ fn analyze(
         .iter()
         .map(|f| std::fs::canonicalize(&f.path).unwrap_or_else(|_| f.path.clone()))
         .collect();
+    let configuration_states = files
+        .iter()
+        .map(|file| build_catalog.states_for_file(&file.relative_path, &file.content))
+        .collect();
 
     Analyzed {
         files,
@@ -403,6 +446,7 @@ fn analyze(
         def_spans_by_name,
         skipped_definitions,
         scanned_paths,
+        configuration_states,
     }
 }
 
@@ -411,6 +455,7 @@ fn analyze(
 struct IncludeResolver {
     /// Base directory includes resolve against besides the including file's own
     scan_root: PathBuf,
+    include_paths: Vec<PathBuf>,
     project: Option<String>,
     provider: Arc<crate::relations::HybridRelationsProvider>,
     cache: HashMap<PathBuf, Arc<Vec<String>>>,
@@ -421,10 +466,13 @@ impl IncludeResolver {
     /// `Some` with an empty list = resolved, but nothing extractable is
     /// defined in it.
     fn header_symbols(&mut self, including_file: &Path, needle: &str) -> Option<Arc<Vec<String>>> {
-        for base in [including_file.parent(), Some(self.scan_root.as_path())]
+        let mut bases = vec![including_file.parent(), Some(self.scan_root.as_path())]
             .into_iter()
             .flatten()
-        {
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        bases.extend(self.include_paths.clone());
+        for base in bases {
             let candidate = base.join(needle);
             let Ok(canonical) = std::fs::canonicalize(&candidate) else {
                 continue;
@@ -475,7 +523,7 @@ fn import_candidates(analyzed: &Analyzed, resolver: &mut IncludeResolver) -> Imp
         for def in file_defs.iter().filter(|d| d.kind() == SymbolKind::Import) {
             match language {
                 Some("C") | Some("C++") => match check_include(analyzed, i, def, resolver) {
-                    IncludeVerdict::Unused(candidate) => scan.candidates.push(candidate),
+                    IncludeVerdict::Unused(candidate) => scan.candidates.push(*candidate),
                     IncludeVerdict::Used => {}
                     IncludeVerdict::Unverifiable(reason) => {
                         scan.unverifiable.push(UnverifiableImport {
@@ -542,7 +590,7 @@ fn import_candidates(analyzed: &Analyzed, resolver: &mut IncludeResolver) -> Imp
 }
 
 enum IncludeVerdict {
-    Unused(UnusedCandidate),
+    Unused(Box<UnusedCandidate>),
     Used,
     /// Why the include could not be checked; travels into
     /// `unverifiable_import_details`.
@@ -619,7 +667,7 @@ fn check_include(
                 shown
             )
         };
-        IncludeVerdict::Unused(make_candidate(
+        IncludeVerdict::Unused(Box::new(make_candidate(
             def,
             &analyzed.files[i].relative_path,
             "medium",
@@ -629,16 +677,16 @@ fn check_include(
                 def.name()
             ),
             probe,
-        ))
+        )))
     }
 }
 
 /// True if `name` appears in file `i` on any line outside every import statement.
 fn binding_used(analyzed: &Analyzed, i: usize, name: &str) -> bool {
     analyzed.idents[i].get(name).is_some_and(|lines| {
-        lines
-            .iter()
-            .any(|&line| !line_in_spans(line, &analyzed.import_spans[i]))
+        lines.iter().any(|&line| {
+            line_relevant(analyzed, i, line) && !line_in_spans(line, &analyzed.import_spans[i])
+        })
     })
 }
 
@@ -656,6 +704,10 @@ fn symbol_candidates(analyzed: &Analyzed) -> (Vec<(String, UnusedCandidate)>, Sy
                 continue;
             }
             let name = def.name();
+            if !line_relevant(analyzed, i, def.start_line()) {
+                rejections.ineligible += 1;
+                continue;
+            }
 
             // A mention inside any same-name definition (its own body, its impl
             // block) is not usage.
@@ -663,9 +715,11 @@ fn symbol_candidates(analyzed: &Analyzed) -> (Vec<(String, UnusedCandidate)>, Sy
                 .get(name)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let used_here = analyzed.idents[i]
-                .get(name)
-                .is_some_and(|lines| lines.iter().any(|&l| !line_in_spans(l, own_spans)));
+            let used_here = analyzed.idents[i].get(name).is_some_and(|lines| {
+                lines.iter().any(|&line| {
+                    line_relevant(analyzed, i, line) && !line_in_spans(line, own_spans)
+                })
+            });
             if used_here {
                 rejections.used_here += 1;
                 continue;
@@ -687,7 +741,9 @@ fn symbol_candidates(analyzed: &Analyzed) -> (Vec<(String, UnusedCandidate)>, Sy
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
                 lines.iter().any(|&l| {
-                    !line_in_spans(l, &analyzed.import_spans[j]) && !line_in_spans(l, spans)
+                    line_relevant(analyzed, j, l)
+                        && !line_in_spans(l, &analyzed.import_spans[j])
+                        && !line_in_spans(l, spans)
                 })
             });
             if used_elsewhere {
@@ -769,6 +825,187 @@ fn make_candidate(
         reason,
         signature: def.signature.clone(),
         probe,
+        status: UnusedStatus::Inconclusive,
+        analyzed_configurations: Vec::new(),
+        analysis_completeness: AnalysisCompleteness::Partial,
+        configuration_states: Vec::new(),
+        unresolved_dependency_kinds: Vec::new(),
+        limitations: Vec::new(),
+        safe_for_destructive_edit: false,
+    }
+}
+
+fn line_relevant(analyzed: &Analyzed, file_index: usize, line: usize) -> bool {
+    let states = analyzed.configuration_states[file_index]
+        .get(line)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    states.is_empty()
+        || states
+            .iter()
+            .any(|state| state.state != PreprocessorState::Inactive)
+}
+
+struct AnalysisAssessment {
+    completeness: AnalysisCompleteness,
+    unresolved_dependency_kinds: Vec<String>,
+    limitations: Vec<String>,
+}
+
+fn finalize_candidates(
+    candidates: &mut [UnusedCandidate],
+    analyzed: &Analyzed,
+    assessment: &AnalysisAssessment,
+) {
+    for candidate in candidates {
+        let states = analyzed
+            .files
+            .iter()
+            .position(|file| file.relative_path == candidate.file_path)
+            .and_then(|file_index| {
+                analyzed.configuration_states[file_index]
+                    .get(candidate.line)
+                    .cloned()
+            })
+            .unwrap_or_default();
+        candidate.configuration_states = states.clone();
+        candidate.analyzed_configurations = states
+            .iter()
+            .filter(|state| state.state != PreprocessorState::Inactive)
+            .map(|state| state.config_id.clone())
+            .collect();
+        candidate.analysis_completeness = assessment.completeness;
+        candidate.unresolved_dependency_kinds = assessment.unresolved_dependency_kinds.clone();
+        candidate.limitations = assessment.limitations.clone();
+        candidate.status = if assessment.completeness == AnalysisCompleteness::Complete
+            && !states
+                .iter()
+                .any(|state| state.state == PreprocessorState::UnknownDueToBuildConfig)
+        {
+            UnusedStatus::UnusedInAnalyzedConfigurations
+        } else {
+            UnusedStatus::Inconclusive
+        };
+        candidate.safe_for_destructive_edit = false;
+    }
+}
+
+fn assess_analysis(
+    analyzed: &Analyzed,
+    catalog: &BuildConfigCatalog,
+    configured_wiring_patterns: &[String],
+    generated_path_patterns: &[String],
+    unverifiable_imports: usize,
+    probes_exhausted: bool,
+    rejections: &SymbolRejections,
+) -> AnalysisAssessment {
+    let mut unresolved = Vec::<String>::new();
+    let mut limitations = Vec::<String>::new();
+    if catalog.configurations.is_empty() {
+        unresolved.push("build_configuration".to_string());
+        limitations.push("no build configuration was analyzed".to_string());
+    }
+
+    let is_compiled_language = |file: &FileInfo| {
+        file.extension.as_deref().is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" | "m" | "mm"
+            )
+        })
+    };
+    let missing_file_configs = analyzed
+        .files
+        .iter()
+        .filter(|file| {
+            is_compiled_language(file)
+                && catalog
+                    .configurations_for_file(&file.relative_path)
+                    .is_empty()
+        })
+        .count();
+    if missing_file_configs > 0 {
+        unresolved.push("conditional_compilation".to_string());
+        limitations.push(format!(
+            "{} compiled-language files have no matching build configuration",
+            missing_file_configs
+        ));
+    }
+    if analyzed.skipped_definitions > 0 {
+        unresolved.push("parser_omissions".to_string());
+        limitations.push(format!(
+            "{} definition nodes could not be named",
+            analyzed.skipped_definitions
+        ));
+    }
+    if unverifiable_imports > 0 {
+        unresolved.push("external_or_generated_include".to_string());
+        limitations.push(format!(
+            "{} imports/includes could not be verified",
+            unverifiable_imports
+        ));
+    }
+    if probes_exhausted || rejections.probe_errors > 0 {
+        unresolved.push("cross_index_probe".to_string());
+        limitations.push("cross-index usage verification was incomplete".to_string());
+    }
+
+    let mut wiring_patterns = vec![
+        "register(".to_string(),
+        "register_".to_string(),
+        "reflection".to_string(),
+        "Q_OBJECT".to_string(),
+        "plugin".to_string(),
+        "dynamic_cast".to_string(),
+    ];
+    wiring_patterns.extend(configured_wiring_patterns.iter().cloned());
+    if analyzed.files.iter().any(|file| {
+        wiring_patterns
+            .iter()
+            .any(|pattern| !pattern.is_empty() && file.content.contains(pattern))
+    }) {
+        unresolved.push("dynamic_or_registration_wiring".to_string());
+        limitations.push(
+            "dynamic registration/reflection wiring may create non-textual dependencies"
+                .to_string(),
+        );
+    }
+    if analyzed.files.iter().any(|file| {
+        let path = file.relative_path.replace('\\', "/").to_ascii_lowercase();
+        generated_path_patterns
+            .iter()
+            .any(|pattern| path.contains(&pattern.to_ascii_lowercase().replace('\\', "/")))
+    }) || catalog.configurations.iter().any(|configuration| {
+        !configuration.generated_header_paths.is_empty()
+            || !configuration.forced_includes.is_empty()
+    }) {
+        unresolved.push("generated_or_forced_wiring".to_string());
+        limitations.push(
+            "generated headers or forced includes require build/generator validation".to_string(),
+        );
+    }
+
+    unresolved.sort();
+    unresolved.dedup();
+    limitations.extend(
+        catalog
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.contains("Invalid") || diagnostic.contains("unavailable")
+            })
+            .cloned(),
+    );
+    limitations.sort();
+    limitations.dedup();
+    AnalysisAssessment {
+        completeness: if unresolved.is_empty() {
+            AnalysisCompleteness::Complete
+        } else {
+            AnalysisCompleteness::Partial
+        },
+        unresolved_dependency_kinds: unresolved,
+        limitations,
     }
 }
 
@@ -856,6 +1093,7 @@ mod tests {
             check: check.to_string(),
             limit: 100,
             max_file_size: 1_048_576,
+            configurations: Vec::new(),
         }
     }
 
@@ -1145,7 +1383,7 @@ mod tests {
             make("b.rs", "use crate::ghost_fn;\n"),
         ];
         let provider = Arc::new(crate::relations::HybridRelationsProvider::new(false).unwrap());
-        let analyzed = analyze(files, provider);
+        let analyzed = analyze(files, provider, &BuildConfigCatalog::default());
 
         let (pending, rejections) = symbol_candidates(&analyzed);
         assert!(
@@ -1154,5 +1392,209 @@ mod tests {
             pending.iter().map(|(n, _)| n).collect::<Vec<_>>()
         );
         assert_eq!(rejections.used_elsewhere, 0);
+    }
+
+    fn analyzed_file(name: &str, extension: &str, content: &str) -> FileInfo {
+        FileInfo {
+            path: PathBuf::from(name),
+            relative_path: name.to_string(),
+            root_path: "/test".to_string(),
+            project: Some("test".to_string()),
+            extension: Some(extension.to_string()),
+            language: None,
+            content: content.to_string(),
+            hash: "test_hash".to_string(),
+        }
+    }
+
+    fn explicit_configuration(
+        id: &str,
+        definitions: &[&str],
+    ) -> crate::build_config::BuildConfiguration {
+        crate::build_config::BuildConfiguration {
+            config_id: id.to_string(),
+            source: crate::build_config::BuildConfigSource::Explicit,
+            source_files: Vec::new(),
+            include_paths: Vec::new(),
+            preprocessor_definitions: definitions.iter().map(|value| value.to_string()).collect(),
+            language_standard: Some("c++20".to_string()),
+            forced_includes: Vec::new(),
+            generated_header_paths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn missing_build_configuration_makes_unused_finding_inconclusive() {
+        let provider = Arc::new(crate::relations::HybridRelationsProvider::new(false).unwrap());
+        let catalog = BuildConfigCatalog::default();
+        let analyzed = analyze(
+            vec![analyzed_file(
+                "src/a.cpp",
+                "cpp",
+                "static void orphaned() {}\n",
+            )],
+            provider,
+            &catalog,
+        );
+        let (pending, rejections) = symbol_candidates(&analyzed);
+        let mut candidates = pending
+            .into_iter()
+            .map(|(_, candidate)| candidate)
+            .collect::<Vec<_>>();
+        let assessment = assess_analysis(
+            &analyzed,
+            &catalog,
+            &[],
+            &["generated/".to_string()],
+            0,
+            false,
+            &rejections,
+        );
+        finalize_candidates(&mut candidates, &analyzed, &assessment);
+        let orphan = candidates
+            .iter()
+            .find(|candidate| candidate.name == "orphaned")
+            .unwrap();
+        assert_eq!(orphan.status, UnusedStatus::Inconclusive);
+        assert!(
+            orphan
+                .unresolved_dependency_kinds
+                .contains(&"build_configuration".to_string())
+        );
+        assert!(!orphan.safe_for_destructive_edit);
+    }
+
+    #[test]
+    fn reference_active_only_in_another_indexed_configuration_counts_as_referenced() {
+        let catalog = BuildConfigCatalog {
+            configurations: vec![
+                explicit_configuration("debug", &[]),
+                explicit_configuration("release", &["RELEASE=1"]),
+            ],
+            diagnostics: Vec::new(),
+        };
+        let provider = Arc::new(crate::relations::HybridRelationsProvider::new(false).unwrap());
+        let analyzed = analyze(
+            vec![analyzed_file(
+                "src/a.cpp",
+                "cpp",
+                "static void target_symbol() {}\n#ifdef RELEASE\nvoid use_target() { target_symbol(); }\n#endif\n",
+            )],
+            provider,
+            &catalog,
+        );
+        let (pending, rejections) = symbol_candidates(&analyzed);
+        assert!(
+            !pending.iter().any(|(name, _)| name == "target_symbol"),
+            "a reference active in release configuration must keep the symbol live"
+        );
+        assert!(rejections.used_here > 0);
+    }
+
+    #[test]
+    fn dynamic_and_generated_wiring_prevents_destructive_safety() {
+        let catalog = BuildConfigCatalog {
+            configurations: vec![explicit_configuration("debug", &[])],
+            diagnostics: Vec::new(),
+        };
+        let provider = Arc::new(crate::relations::HybridRelationsProvider::new(false).unwrap());
+        let analyzed = analyze(
+            vec![analyzed_file(
+                "generated/a.cpp",
+                "cpp",
+                "static void orphaned() {}\nvoid wiring() { register(plugin); }\n",
+            )],
+            provider,
+            &catalog,
+        );
+        let (pending, rejections) = symbol_candidates(&analyzed);
+        let mut candidates = pending
+            .into_iter()
+            .map(|(_, candidate)| candidate)
+            .collect::<Vec<_>>();
+        let assessment = assess_analysis(
+            &analyzed,
+            &catalog,
+            &[],
+            &["generated/".to_string()],
+            0,
+            false,
+            &rejections,
+        );
+        finalize_candidates(&mut candidates, &analyzed, &assessment);
+        let orphan = candidates
+            .iter()
+            .find(|candidate| candidate.name == "orphaned")
+            .unwrap();
+        assert_eq!(orphan.status, UnusedStatus::Inconclusive);
+        assert!(
+            orphan
+                .unresolved_dependency_kinds
+                .contains(&"dynamic_or_registration_wiring".to_string())
+        );
+        assert!(
+            orphan
+                .unresolved_dependency_kinds
+                .contains(&"generated_or_forced_wiring".to_string())
+        );
+        assert!(!orphan.safe_for_destructive_edit);
+    }
+
+    #[test]
+    #[ignore = "manual synthetic M4 multi-configuration unused-analysis measurement"]
+    fn benchmark_m4_multi_configuration_unused_analysis() {
+        let files = (0..200)
+            .map(|index| {
+                analyzed_file(
+                    &format!("src/file_{index}.cpp"),
+                    "cpp",
+                    &format!(
+                        "static void orphan_{index}() {{}}\n#ifdef FEATURE\nstatic void live_{index}() {{}}\nvoid caller_{index}() {{ live_{index}(); }}\n#endif\n"
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let catalog = BuildConfigCatalog {
+            configurations: vec![
+                explicit_configuration("debug", &[]),
+                explicit_configuration("feature", &["FEATURE=1"]),
+                explicit_configuration("asan", &["ASAN=1"]),
+                explicit_configuration("release", &["NDEBUG=1"]),
+            ],
+            diagnostics: Vec::new(),
+        };
+        let provider = Arc::new(crate::relations::HybridRelationsProvider::new(false).unwrap());
+
+        let started = std::time::Instant::now();
+        let analyzed = analyze(files, provider, &catalog);
+        let (pending, rejections) = symbol_candidates(&analyzed);
+        let mut candidates = pending
+            .into_iter()
+            .map(|(_, candidate)| candidate)
+            .collect::<Vec<_>>();
+        let assessment = assess_analysis(
+            &analyzed,
+            &catalog,
+            &[],
+            &["generated/".to_string()],
+            0,
+            false,
+            &rejections,
+        );
+        finalize_candidates(&mut candidates, &analyzed, &assessment);
+        let elapsed = started.elapsed();
+
+        println!(
+            "m4 unused synthetic: files={} configurations={} candidates={} elapsed_ms={}",
+            analyzed.files.len(),
+            catalog.configurations.len(),
+            candidates.len(),
+            elapsed.as_millis()
+        );
+        assert_eq!(analyzed.files.len(), 200);
+        assert!(candidates.iter().all(|candidate| {
+            candidate.status == UnusedStatus::UnusedInAnalyzedConfigurations
+                && !candidate.safe_for_destructive_edit
+        }));
     }
 }

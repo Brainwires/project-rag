@@ -676,6 +676,7 @@ fn find_references_m2_filters_default_to_code_only() {
     assert!(request.reference_kinds.is_empty());
     assert!(request.resolution_statuses.is_empty());
     assert!(request.evidence_kinds.is_empty());
+    assert!(request.configurations.is_empty());
     assert_eq!(request.cursor, 0);
 }
 
@@ -694,6 +695,7 @@ fn graph_request() -> GetCallGraphRequest {
         resolution_statuses: Vec::new(),
         language_filters: Vec::new(),
         path_filters: Vec::new(),
+        configurations: Vec::new(),
     }
 }
 

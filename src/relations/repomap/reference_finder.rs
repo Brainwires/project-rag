@@ -182,13 +182,14 @@ impl ReferenceFinder {
                         reference_kind,
                         resolution_status,
                         evidence_kind,
-                        dispatch_kind: if reference_kind == ReferenceKind::Call
+                        dispatch_kind: if reference_kind.is_call()
                             && resolution_status == ResolutionStatus::Resolved
                         {
                             DispatchKind::Direct
                         } else {
                             DispatchKind::Unknown
                         },
+                        configuration_states: Vec::new(),
                         language: language_name.clone(),
                         parser: parser_name.clone(),
                         indexed_at: Utc::now().timestamp(),
@@ -266,9 +267,17 @@ impl ReferenceFinder {
             };
         }
 
-        // Check for instantiation (before function call, since `new Foo()` looks like a call)
+        let member_access = before.trim_end().ends_with('.')
+            || before.trim_end().ends_with("->")
+            || before.trim_end().ends_with("::");
+
+        if before.trim_end().ends_with("delete") {
+            return ReferenceKind::Destroys;
+        }
+
+        // Check for construction before function call, since `new Foo()` looks like a call.
         if before.contains("new ") {
-            return ReferenceKind::ConstructorCall;
+            return ReferenceKind::ObjectConstruction;
         }
 
         // Check for inheritance patterns
@@ -278,7 +287,11 @@ impl ReferenceFinder {
 
         // Check for function/method call pattern (identifier followed by parenthesis)
         if after_name.trim_start().starts_with('(') {
-            return ReferenceKind::Call;
+            return if member_access {
+                ReferenceKind::MethodCall
+            } else {
+                ReferenceKind::Call
+            };
         }
 
         // Check for assignment (write)
@@ -286,7 +299,26 @@ impl ReferenceFinder {
             && !after_name.trim_start().starts_with("==")
             && !after_name.trim_start().starts_with("=>")
         {
-            return ReferenceKind::Write;
+            return if member_access {
+                ReferenceKind::MemberWrite
+            } else if after_name.contains('{') || after_name.contains("new ") {
+                ReferenceKind::ObjectAssignment
+            } else {
+                ReferenceKind::Write
+            };
+        }
+
+        if before.contains("unique_ptr<") || before.contains("Box<") {
+            return ReferenceKind::Owns;
+        }
+        if before.contains("shared_ptr<")
+            || before.trim_end().ends_with('&')
+            || after_name.trim_start().starts_with('&')
+        {
+            return ReferenceKind::References;
+        }
+        if before.trim_end().ends_with('*') || after_name.trim_start().starts_with('*') {
+            return ReferenceKind::PointsTo;
         }
 
         // Check for type reference patterns
@@ -295,7 +327,11 @@ impl ReferenceFinder {
         }
 
         // Default to read
-        ReferenceKind::Read
+        if member_access {
+            ReferenceKind::MemberRead
+        } else {
+            ReferenceKind::Read
+        }
     }
 }
 
@@ -471,8 +507,37 @@ fn greet(name: &str) {
         assert!(
             references
                 .iter()
-                .any(|r| r.reference_kind == ReferenceKind::ConstructorCall)
+                .any(|r| r.reference_kind == ReferenceKind::ObjectConstruction)
         );
+    }
+
+    #[test]
+    fn classifies_member_dependencies_without_alias_inference() {
+        let source = "obj.value = other.value; obj.run(); Widget* pointer; Owner<Box<Item>> owned;";
+        let file_info = make_file_info(source, "src/main.cpp");
+        let mut symbol_index = HashMap::new();
+        for name in ["value", "run", "Widget", "Item"] {
+            symbol_index.insert(
+                name.to_string(),
+                vec![make_definition(name, "src/types.cpp", 1)],
+            );
+        }
+        let references = ReferenceFinder::new()
+            .find_references(&file_info, &symbol_index)
+            .unwrap();
+        assert!(references.iter().any(|reference| {
+            reference.target_name == "value"
+                && reference.reference_kind == ReferenceKind::MemberWrite
+        }));
+        assert!(references.iter().any(|reference| {
+            reference.target_name == "run" && reference.reference_kind == ReferenceKind::MethodCall
+        }));
+        assert!(references.iter().any(|reference| {
+            reference.target_name == "Widget" && reference.reference_kind == ReferenceKind::PointsTo
+        }));
+        assert!(references.iter().any(|reference| {
+            reference.target_name == "Item" && reference.reference_kind == ReferenceKind::Owns
+        }));
     }
 
     #[test]
@@ -576,5 +641,52 @@ fn main() {
         let references = finder.find_references(&file_info, &symbol_index).unwrap();
 
         assert_eq!(references.len(), 3);
+    }
+
+    #[test]
+    #[ignore = "manual synthetic M4 non-call dependency extraction measurement"]
+    fn benchmark_m4_non_call_dependency_classification() {
+        let names = (0..250)
+            .map(|index| format!("Field{index}"))
+            .collect::<Vec<_>>();
+        let source = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| match index % 4 {
+                0 => format!("obj.{name} = other.{name};"),
+                1 => format!("owner.{name}.run();"),
+                2 => format!("std::unique_ptr<{name}> value_{index};"),
+                _ => format!("{name}* pointer_{index};"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let file_info = make_file_info(&source, "src/dependencies.cpp");
+        let symbol_index = names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    vec![make_definition(name, "src/types.cpp", 1)],
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let started = std::time::Instant::now();
+        let references = ReferenceFinder::new()
+            .find_references(&file_info, &symbol_index)
+            .unwrap();
+        let elapsed = started.elapsed();
+        println!(
+            "m4 non-call synthetic: symbols={} references={} elapsed_ms={}",
+            symbol_index.len(),
+            references.len(),
+            elapsed.as_millis()
+        );
+        assert!(references.len() >= names.len());
+        assert!(
+            references
+                .iter()
+                .all(|reference| !reference.reference_kind.is_call())
+        );
     }
 }

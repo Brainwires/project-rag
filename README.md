@@ -117,7 +117,7 @@ search_by_filters(query="JWT validation", file_extensions=["rs", "go"])
 
 ## MCP Tools
 
-The server provides 9 tools that can be used directly:
+The server provides 13 tools that can be used directly:
 
 1. **index_codebase** - Smartly index a codebase directory
    - Automatically performs full indexing for new codebases
@@ -169,7 +169,8 @@ Normal retrieval never searches Git history implicitly. History results expose v
    - Separates logical `symbol_id` from declaration/definition/reference `location_id`
    - Categorizes definitions, declarations, calls, reads, writes, imports/includes, type uses, documentation, comments, and strings
    - Exposes independent `resolution_status` and `evidence_kind` fields plus candidate sets
-   - Supports language, canonical path, reference-kind, resolution, and evidence filters
+   - Supports language, canonical path, reference-kind, resolution, evidence, and build-configuration filters
+   - Reports per-configuration active/inactive/unknown preprocessor scope
    - Excludes documentation, comments, and strings by default
    - Reports exact pre-pagination totals and continuation offsets
    - Optional: include definition site in results
@@ -179,11 +180,32 @@ Normal retrieval never searches Git history implicitly. History results expose v
    - Returns a graph-form `nodes`/`edges` response with one node per stable logical `symbol_id`
    - Exact breadth-first depth semantics: 0 is root-only, 1 adds direct neighbors, and 2 adds their neighbors
    - Traverses incoming callers, outgoing callees, or both without looping on cycles or duplicating diamond nodes
-   - Defaults to resolved call and constructor-call edges; ambiguous observations can be requested but are never traversed as targets
-   - Supports node/edge budgets plus kind, resolution, language, and canonical path filters
+   - Defaults to resolved call, method-call, constructor-call, and object-construction edges; ambiguous observations can be requested but are never traversed as targets
+   - Supports node/edge budgets plus kind, resolution, language, canonical path, and build-configuration filters
    - Reports explicit truncation totals and continuation frontier information
    - Uses persisted incoming/outgoing LanceDB adjacency indexes over the authoritative reference store
    - Useful for understanding code flow and impact analysis
+
+10. **list_symbols** - List indexed symbols in a file or project scope
+   - Returns stable symbol IDs, kinds, signatures, and source locations
+   - Supports bounded discovery without requiring a precise cursor position
+
+11. **read_file** - Read a file within an indexed project root
+   - Supports bounded line ranges and reports a content hash for guarded edits
+   - Rejects paths outside indexed roots
+
+12. **edit_file** - Edit a file within an indexed project root
+   - Supports whole-file replacement, range replacement, deletion, and insertion
+   - Accepts an expected hash to prevent overwriting unseen changes
+   - Automatically reindexes the affected project
+
+13. **find_unused** - Conservative configuration-scoped unused analysis
+   - Auto-discovers `compile_commands.json` and supports explicit build configurations
+   - Tracks include paths, definitions, language standards, forced includes, and generated headers
+   - Reports `unused_in_analyzed_configurations` or `inconclusive`, never context-free universal unused claims
+   - Exposes analyzed config IDs, preprocessor state, completeness, unresolved dependency kinds, and limitations
+   - Dynamic registration, reflection, generated wiring, missing configurations, and parser omissions prevent destructive-edit safety
+   - `safe_for_destructive_edit` remains false; use findings as evidence to investigate, not permission to delete
 
 ## Prerequisites
 

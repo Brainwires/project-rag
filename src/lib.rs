@@ -120,6 +120,7 @@
 /// BM25 keyword search using Tantivy for hybrid search
 pub mod bm25_search;
 
+pub mod build_config;
 /// Persistent hash cache for tracking file changes across restarts
 pub mod cache;
 
@@ -166,12 +167,17 @@ pub mod mcp_server;
 
 // Re-export commonly used types for convenience
 pub use types::{
-    AdvancedSearchRequest, ClearRequest, ClearResponse, FindDefinitionRequest,
-    FindDefinitionResponse, FindReferencesRequest, FindReferencesResponse, GetCallGraphRequest,
-    GetCallGraphResponse, GitSearchResult, GraphContinuation, GraphTotals, IndexRequest,
-    IndexResponse, IndexingMode, LanguageStats, QueryRequest, QueryResponse, ReferenceStatistics,
-    SearchGitHistoryRequest, SearchGitHistoryResponse, SearchResult, StatisticsRequest,
-    StatisticsResponse,
+    AdvancedSearchRequest, AnalysisCompleteness, ClearRequest, ClearResponse,
+    FindDefinitionRequest, FindDefinitionResponse, FindReferencesRequest, FindReferencesResponse,
+    FindUnusedRequest, FindUnusedResponse, GetCallGraphRequest, GetCallGraphResponse,
+    GitSearchResult, GraphContinuation, GraphTotals, IndexRequest, IndexResponse, IndexingMode,
+    LanguageStats, QueryRequest, QueryResponse, ReferenceStatistics, SearchGitHistoryRequest,
+    SearchGitHistoryResponse, SearchResult, StatisticsRequest, StatisticsResponse, UnusedStatus,
+};
+
+pub use build_config::{
+    AnalysisConfig, BuildConfigCatalog, BuildConfigSource, BuildConfiguration, ConfigurationState,
+    ExplicitBuildConfiguration, PreprocessorState,
 };
 
 pub use config::Config;

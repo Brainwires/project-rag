@@ -5,10 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Persistent identity schema. Version 3 adds logical symbol identities, separate
-/// source locations, and classified reference/evidence rows. Existing v2 retrieval
-/// data remains physically separate and a clean reindex is required.
-pub const INDEX_SCHEMA_VERSION: u32 = 3;
+/// Persistent analysis schema. Version 4 adds build-configuration and
+/// preprocessor scope to relation rows. Retrieval data remains physically
+/// compatible; one indexing pass publishes the v4 relation generation.
+pub const INDEX_SCHEMA_VERSION: u32 = 4;
 
 /// Information about a dirty (in-progress) indexing operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,15 +128,17 @@ impl HashCache {
 
         // Try to parse as new format first
         if let Ok(mut cache) = serde_json::from_str::<HashCache>(&content) {
-            if cache.schema_version == 2 {
+            if matches!(cache.schema_version, 2 | 3) {
+                let previous = cache.schema_version;
                 cache.schema_version = INDEX_SCHEMA_VERSION;
                 cache.diagnostics.push(
-                    "Relations schema upgraded to v3; run indexing once to build logical symbols and classified references"
+                    "Relations schema upgraded to v4; run indexing once to attach build-configuration and preprocessor scope"
                         .to_string(),
                 );
                 cache.save(cache_path)?;
                 tracing::info!(
-                    "Migrated cache metadata from schema 2 to 3 while preserving project identities"
+                    "Migrated cache metadata from schema {} to 4 while preserving project identities",
+                    previous
                 );
                 return Ok(cache);
             }
@@ -652,6 +654,37 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|d| d.contains("Relations schema"))
+        );
+    }
+
+    #[test]
+    fn test_v3_cache_preserves_hashes_for_build_scope_migration() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let cache_path = temp_file.path().to_path_buf();
+        let v3 = r#"{
+            "schema_version": 3,
+            "roots": {"C:/project": {"src/lib.cpp": "hash"}},
+            "project_ids": {"C:/project": "stable-project"},
+            "dirty_roots": {},
+            "diagnostics": []
+        }"#;
+        fs::write(&cache_path, v3).unwrap();
+
+        let loaded = HashCache::load(&cache_path).unwrap();
+        assert_eq!(loaded.schema_version, 4);
+        assert_eq!(loaded.project_id("C:/project"), Some("stable-project"));
+        assert_eq!(
+            loaded
+                .get_root("C:/project")
+                .and_then(|files| files.get("src/lib.cpp"))
+                .map(String::as_str),
+            Some("hash")
+        );
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.contains("preprocessor scope") })
         );
     }
 
