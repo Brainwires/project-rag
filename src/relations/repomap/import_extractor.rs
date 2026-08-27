@@ -13,7 +13,9 @@ use chrono::Utc;
 use tree_sitter::Node;
 
 use crate::indexer::FileInfo;
-use crate::relations::types::{Definition, SymbolId, SymbolKind, Visibility};
+use crate::relations::types::{
+    Definition, LinkageKind, LocationRole, SourceLocation, SymbolId, SymbolKind, Visibility,
+};
 
 /// Check if a node kind represents an import statement for the given language.
 pub fn is_import_node(kind: &str, language: &str) -> bool {
@@ -57,13 +59,28 @@ pub fn extract_imports(
     names
         .into_iter()
         .map(|name| Definition {
-            symbol_id: SymbolId::new(
-                &file_info.relative_path,
+            symbol_id: SymbolId::new_logical(
+                file_info.project.clone().unwrap_or_default(),
+                language,
+                name.clone(),
                 name,
                 SymbolKind::Import,
+                signature.clone(),
+                LinkageKind::FileLocal,
+                Some(file_info.relative_path.clone()),
+                &file_info.relative_path,
                 start_pos.row + 1,
                 start_pos.column,
             ),
+            location: SourceLocation {
+                project_id: file_info.project.clone().unwrap_or_default(),
+                file_path: file_info.relative_path.clone(),
+                start_line: start_pos.row + 1,
+                start_col: start_pos.column,
+                end_line: end_pos.row + 1,
+                end_col: end_pos.column,
+                role: LocationRole::Declaration,
+            },
             root_path: Some(file_info.root_path.clone()),
             project: file_info.project.clone(),
             end_line: end_pos.row + 1,
@@ -72,6 +89,7 @@ pub fn extract_imports(
             doc_comment: None,
             visibility,
             parent_id: parent_id.clone(),
+            parser: format!("tree-sitter/{}", language.to_lowercase()),
             indexed_at: Utc::now().timestamp(),
         })
         .collect()

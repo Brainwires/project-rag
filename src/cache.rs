@@ -5,9 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Persistent identity schema. Version 2 stores only canonical project-relative
-/// file keys and is paired with the `code_embeddings_v2` vector table.
-pub const INDEX_SCHEMA_VERSION: u32 = 2;
+/// Persistent identity schema. Version 3 adds logical symbol identities, separate
+/// source locations, and classified reference/evidence rows. Existing v2 retrieval
+/// data remains physically separate and a clean reindex is required.
+pub const INDEX_SCHEMA_VERSION: u32 = 3;
 
 /// Information about a dirty (in-progress) indexing operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,7 +68,7 @@ impl Default for DirtyInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HashCache {
     /// Persistent identity schema version. Incompatible older indexes are reset
-    /// rather than mixed with v2 identities.
+    /// rather than mixed with current identities.
     #[serde(default)]
     pub schema_version: u32,
     /// Map of root path -> (file path -> hash)
@@ -126,7 +127,19 @@ impl HashCache {
         let content = fs::read_to_string(cache_path).context("Failed to read cache file")?;
 
         // Try to parse as new format first
-        if let Ok(cache) = serde_json::from_str::<HashCache>(&content) {
+        if let Ok(mut cache) = serde_json::from_str::<HashCache>(&content) {
+            if cache.schema_version == 2 {
+                cache.schema_version = INDEX_SCHEMA_VERSION;
+                cache.diagnostics.push(
+                    "Relations schema upgraded to v3; run indexing once to build logical symbols and classified references"
+                        .to_string(),
+                );
+                cache.save(cache_path)?;
+                tracing::info!(
+                    "Migrated cache metadata from schema 2 to 3 while preserving project identities"
+                );
+                return Ok(cache);
+            }
             if cache.schema_version != INDEX_SCHEMA_VERSION {
                 tracing::warn!(
                     "Resetting incompatible index cache schema {} (current {})",
@@ -615,6 +628,31 @@ mod tests {
         let reloaded = HashCache::load(&cache_path).unwrap();
         assert_eq!(reloaded.schema_version, INDEX_SCHEMA_VERSION);
         assert!(reloaded.roots.is_empty());
+    }
+
+    #[test]
+    fn test_v2_cache_preserves_project_identity_during_relations_migration() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let cache_path = temp_file.path().to_path_buf();
+        let v2 = r#"{
+            "schema_version": 2,
+            "roots": {"C:/project": {"src/lib.rs": "hash"}},
+            "project_ids": {"C:/project": "stable-project"},
+            "dirty_roots": {},
+            "diagnostics": []
+        }"#;
+        fs::write(&cache_path, v2).unwrap();
+
+        let loaded = HashCache::load(&cache_path).unwrap();
+        assert_eq!(loaded.schema_version, INDEX_SCHEMA_VERSION);
+        assert_eq!(loaded.project_id("C:/project"), Some("stable-project"));
+        assert!(loaded.get_root("C:/project").is_some());
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("Relations schema"))
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::hash::{Hash, Hasher};
 
 /// Kind of symbol in the codebase
@@ -18,6 +19,10 @@ pub enum SymbolKind {
     Function,
     /// A method (belongs to a class/struct/impl)
     Method,
+    /// A constructor
+    Constructor,
+    /// A destructor
+    Destructor,
     /// A class definition
     Class,
     /// A struct definition
@@ -30,6 +35,8 @@ pub enum SymbolKind {
     Enum,
     /// A module/namespace
     Module,
+    /// A language namespace
+    Namespace,
     /// A variable/binding
     Variable,
     /// A constant
@@ -46,6 +53,8 @@ pub enum SymbolKind {
     EnumVariant,
     /// A type alias
     TypeAlias,
+    /// A preprocessor macro
+    Macro,
     /// Unknown or unclassified symbol
     Unknown,
 }
@@ -71,8 +80,9 @@ impl SymbolKind {
             | "method_declaration" // Java, Go, PHP
             | "method" // Ruby
             | "singleton_method" // Ruby
-            | "constructor_declaration" // Java
             => Self::Method,
+
+            "constructor_declaration" => Self::Constructor,
 
             // Classes
             "impl_item" // Rust (impl blocks treated as class-like)
@@ -147,12 +157,15 @@ impl SymbolKind {
         match self {
             Self::Function => "function",
             Self::Method => "method",
+            Self::Constructor => "constructor",
+            Self::Destructor => "destructor",
             Self::Class => "class",
             Self::Struct => "struct",
             Self::Interface => "interface",
             Self::Trait => "trait",
             Self::Enum => "enum",
             Self::Module => "module",
+            Self::Namespace => "namespace",
             Self::Variable => "variable",
             Self::Constant => "constant",
             Self::Parameter => "parameter",
@@ -161,6 +174,7 @@ impl SymbolKind {
             Self::Export => "export",
             Self::EnumVariant => "enum variant",
             Self::TypeAlias => "type alias",
+            Self::Macro => "macro",
             Self::Unknown => "unknown",
         }
     }
@@ -201,29 +215,150 @@ impl Visibility {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceKind {
+    /// The symbol's defining source location
+    Definition,
+    /// A non-defining declaration
+    Declaration,
     /// Function or method call
     Call,
+    /// Constructor invocation
+    ConstructorCall,
     /// Variable read access
     Read,
     /// Variable write/assignment
     Write,
+    /// Taking the address of a symbol
+    AddressTake,
     /// Import statement
     Import,
     /// Type annotation or type reference
     TypeReference,
+    /// Preferred spelling for a type dependency
+    TypeUse,
     /// Class inheritance (extends/implements)
     Inheritance,
     /// Instantiation (new Foo())
     Instantiation,
+    /// Template or generic use
+    TemplateUse,
+    /// Include directive
+    Include,
+    /// Macro use
+    MacroUse,
+    /// Match inside a documentation comment
+    Documentation,
+    /// Match inside a non-documentation comment
+    Comment,
+    /// Match inside a string literal
+    String,
     /// Unknown reference type
     Unknown,
 }
 
+impl ReferenceKind {
+    /// Whether this kind is executable/source dependency evidence by default.
+    pub fn is_code(self) -> bool {
+        !matches!(self, Self::Documentation | Self::Comment | Self::String)
+    }
+}
+
+/// Whether a reference target has actually been established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionStatus {
+    Resolved,
+    Ambiguous,
+    #[default]
+    Unresolved,
+}
+
+/// Nature of the evidence supporting a relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    Semantic,
+    Syntactic,
+    #[default]
+    Heuristic,
+}
+
+/// Dispatch form for call-like references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchKind {
+    Direct,
+    Virtual,
+    Indirect,
+    Callback,
+    Dynamic,
+    #[default]
+    Unknown,
+}
+
+/// Role of a concrete source location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocationRole {
+    Declaration,
+    #[default]
+    Definition,
+    Reference,
+}
+
+/// Linkage/scope discriminator used by logical symbol identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkageKind {
+    External,
+    Internal,
+    FileLocal,
+    Local,
+    Anonymous,
+    #[default]
+    Unknown,
+}
+
+/// A declaration, definition, or reference location, separate from logical identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct SourceLocation {
+    #[serde(default)]
+    pub project_id: String,
+    pub file_path: String,
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+    pub role: LocationRole,
+}
+
+impl SourceLocation {
+    pub fn to_storage_id(&self) -> String {
+        let raw = format!(
+            "{}\0{}\0{}\0{}\0{}\0{}\0{:?}",
+            self.project_id,
+            self.file_path,
+            self.start_line,
+            self.start_col,
+            self.end_line,
+            self.end_col,
+            self.role
+        );
+        format!("loc:v3:{:x}", Sha256::digest(raw.as_bytes()))
+    }
+}
+
+/// One plausible target retained for an ambiguous or unresolved reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReferenceCandidate {
+    pub symbol_id: String,
+    pub reason: String,
+}
+
 /// A unique identifier for a symbol in the codebase.
 ///
-/// Symbols are identified by their file path, name, kind, and position.
-/// This allows distinguishing between symbols with the same name in different files
-/// or different positions within the same file.
+/// Logical identity is independent of declaration/definition position. Location fields
+/// remain as compatibility metadata; equality, hashing, and storage IDs use the logical
+/// fields below.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SymbolId {
     /// Relative file path from the project root
@@ -236,6 +371,24 @@ pub struct SymbolId {
     pub start_line: usize,
     /// Starting column (0-based)
     pub start_col: usize,
+    /// Stable persisted project identity (never the absolute root path).
+    #[serde(default)]
+    pub project_id: String,
+    /// Parser language name.
+    #[serde(default)]
+    pub language: String,
+    /// Namespace/type-qualified name.
+    #[serde(default)]
+    pub qualified_name: String,
+    /// Normalized overload-disambiguating signature.
+    #[serde(default)]
+    pub canonical_signature: String,
+    /// Linkage/scope category.
+    #[serde(default)]
+    pub linkage: LinkageKind,
+    /// File/scope discriminator when linkage is not external.
+    #[serde(default)]
+    pub scope_discriminator: Option<String>,
 }
 
 impl SymbolId {
@@ -247,10 +400,46 @@ impl SymbolId {
         start_line: usize,
         start_col: usize,
     ) -> Self {
+        let file_path = file_path.into();
         Self {
-            file_path: file_path.into(),
+            scope_discriminator: Some(file_path.clone()),
+            file_path,
             name: name.into(),
             kind,
+            start_line,
+            start_col,
+            project_id: String::new(),
+            language: String::new(),
+            qualified_name: String::new(),
+            canonical_signature: String::new(),
+            linkage: LinkageKind::FileLocal,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_logical(
+        project_id: impl Into<String>,
+        language: impl Into<String>,
+        qualified_name: impl Into<String>,
+        name: impl Into<String>,
+        kind: SymbolKind,
+        canonical_signature: impl Into<String>,
+        linkage: LinkageKind,
+        scope_discriminator: Option<String>,
+        file_path: impl Into<String>,
+        start_line: usize,
+        start_col: usize,
+    ) -> Self {
+        Self {
+            project_id: project_id.into(),
+            language: language.into(),
+            qualified_name: qualified_name.into(),
+            name: name.into(),
+            kind,
+            canonical_signature: canonical_signature.into(),
+            linkage,
+            scope_discriminator,
+            file_path: file_path.into(),
             start_line,
             start_col,
         }
@@ -258,40 +447,35 @@ impl SymbolId {
 
     /// Generate a unique string ID for storage
     pub fn to_storage_id(&self) -> String {
-        format!(
-            "{}:{}:{}:{}",
-            self.file_path, self.name, self.start_line, self.start_col
-        )
+        let qualified = if self.qualified_name.is_empty() {
+            &self.name
+        } else {
+            &self.qualified_name
+        };
+        let scope = self.scope_discriminator.as_deref().unwrap_or("");
+        let raw = format!(
+            "{}\0{}\0{}\0{:?}\0{}\0{:?}\0{}",
+            self.project_id,
+            self.language,
+            qualified,
+            self.kind,
+            self.canonical_signature,
+            self.linkage,
+            scope
+        );
+        format!("sym:v3:{:x}:{}", Sha256::digest(raw.as_bytes()), self.name)
     }
 
     /// Parse from a storage ID string
     pub fn from_storage_id(id: &str) -> Option<Self> {
-        let parts: Vec<&str> = id.rsplitn(4, ':').collect();
-        if parts.len() != 4 {
-            return None;
-        }
-        // rsplitn gives parts in reverse order
-        let start_col = parts[0].parse().ok()?;
-        let start_line = parts[1].parse().ok()?;
-        let name = parts[2].to_string();
-        let file_path = parts[3].to_string();
-
-        Some(Self {
-            file_path,
-            name,
-            kind: SymbolKind::Unknown, // Kind not stored in ID
-            start_line,
-            start_col,
-        })
+        let name = id.strip_prefix("sym:v3:")?.rsplit(':').next()?.to_string();
+        Some(Self::new("", name, SymbolKind::Unknown, 0, 0))
     }
 }
 
 impl PartialEq for SymbolId {
     fn eq(&self, other: &Self) -> bool {
-        self.file_path == other.file_path
-            && self.name == other.name
-            && self.start_line == other.start_line
-            && self.start_col == other.start_col
+        self.to_storage_id() == other.to_storage_id()
     }
 }
 
@@ -299,10 +483,7 @@ impl Eq for SymbolId {}
 
 impl Hash for SymbolId {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.file_path.hash(state);
-        self.name.hash(state);
-        self.start_line.hash(state);
-        self.start_col.hash(state);
+        self.to_storage_id().hash(state);
     }
 }
 
@@ -314,6 +495,8 @@ impl Hash for SymbolId {
 pub struct Definition {
     /// Unique identifier for this symbol
     pub symbol_id: SymbolId,
+    /// Concrete declaration/definition location.
+    pub location: SourceLocation,
     /// Absolute root path of the indexed codebase
     pub root_path: Option<String>,
     /// Project name (for multi-project support)
@@ -330,6 +513,8 @@ pub struct Definition {
     pub visibility: Visibility,
     /// Parent symbol ID (e.g., containing class for a method)
     pub parent_id: Option<String>,
+    /// Parser which produced this evidence.
+    pub parser: String,
     /// Timestamp when this definition was indexed
     pub indexed_at: i64,
 }
@@ -337,26 +522,16 @@ pub struct Definition {
 impl Definition {
     /// Extract the symbol name from an id produced by [`Definition::to_storage_id`].
     ///
-    /// The layout is `def:<file_path>:<name>:<line>` -- note this differs from
-    /// [`SymbolId::to_storage_id`], which is `<file>:<name>:<line>:<col>`. Reaching for
-    /// the wrong one is what kept get_call_graph callees permanently empty.
-    ///
-    /// Fields are taken from the RIGHT because `file_path` may itself contain a colon
-    /// (a Windows drive letter).
+    /// Logical IDs use `sym:v3:<digest>:<simple-name>` so callers can show the
+    /// simple name without treating a source location as identity.
     pub fn name_from_storage_id(id: &str) -> Option<&str> {
-        let rest = id.strip_prefix("def:")?;
-        let mut parts = rest.rsplitn(3, ':');
-        let _line = parts.next()?;
-        let name = parts.next()?;
+        let name = id.strip_prefix("sym:v3:")?.rsplit(':').next()?;
         if name.is_empty() { None } else { Some(name) }
     }
 
     /// Generate a unique storage ID for this definition
     pub fn to_storage_id(&self) -> String {
-        format!(
-            "def:{}:{}:{}",
-            self.symbol_id.file_path, self.symbol_id.name, self.symbol_id.start_line
-        )
+        self.symbol_id.to_storage_id()
     }
 
     /// Get the file path
@@ -397,10 +572,24 @@ pub struct Reference {
     pub start_col: usize,
     /// Ending column (0-based)
     pub end_col: usize,
+    /// Stable identity for this occurrence.
+    pub location_id: String,
+    /// Enclosing source symbol, when known.
+    pub source_symbol_id: Option<String>,
     /// Storage ID of the target symbol being referenced
     pub target_symbol_id: String,
+    /// Exact identifier text used to query unresolved candidate sets.
+    pub target_name: String,
+    /// Plausible targets; retained without claiming resolution.
+    #[serde(default)]
+    pub candidates: Vec<ReferenceCandidate>,
     /// Kind of reference
     pub reference_kind: ReferenceKind,
+    pub resolution_status: ResolutionStatus,
+    pub evidence_kind: EvidenceKind,
+    pub dispatch_kind: DispatchKind,
+    pub language: String,
+    pub parser: String,
     /// Timestamp when this reference was indexed
     pub indexed_at: i64,
 }
@@ -408,10 +597,38 @@ pub struct Reference {
 impl Reference {
     /// Generate a unique storage ID for this reference
     pub fn to_storage_id(&self) -> String {
-        format!(
-            "ref:{}:{}:{}",
-            self.file_path, self.start_line, self.start_col
-        )
+        self.location_id.clone()
+    }
+
+    pub fn from_definition(definition: &Definition) -> Self {
+        let symbol_id = definition.to_storage_id();
+        Self {
+            file_path: definition.location.file_path.clone(),
+            root_path: definition.root_path.clone(),
+            project: definition.project.clone(),
+            start_line: definition.location.start_line,
+            end_line: definition.location.end_line,
+            start_col: definition.location.start_col,
+            end_col: definition.location.end_col,
+            location_id: definition.location.to_storage_id(),
+            source_symbol_id: None,
+            target_symbol_id: symbol_id.clone(),
+            target_name: definition.name().to_string(),
+            candidates: vec![ReferenceCandidate {
+                symbol_id,
+                reason: "parser produced this declaration/definition".to_string(),
+            }],
+            reference_kind: match definition.location.role {
+                LocationRole::Declaration => ReferenceKind::Declaration,
+                _ => ReferenceKind::Definition,
+            },
+            resolution_status: ResolutionStatus::Resolved,
+            evidence_kind: EvidenceKind::Syntactic,
+            dispatch_kind: DispatchKind::Unknown,
+            language: definition.symbol_id.language.clone(),
+            parser: definition.parser.clone(),
+            indexed_at: definition.indexed_at,
+        }
     }
 }
 
@@ -428,6 +645,10 @@ pub struct CallEdge {
     pub call_site_line: usize,
     /// Column where the call occurs
     pub call_site_col: usize,
+    pub reference_kind: ReferenceKind,
+    pub resolution_status: ResolutionStatus,
+    pub evidence_kind: EvidenceKind,
+    pub parser: String,
 }
 
 /// Precision level of the relations provider
@@ -460,10 +681,16 @@ impl PrecisionLevel {
 /// Result from find_definition containing the found definition
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DefinitionResult {
+    /// Stable logical symbol identity.
+    pub symbol_id: String,
+    /// Stable identity of this declaration/definition location.
+    pub location_id: String,
     /// File path where the definition is located
     pub file_path: String,
     /// Symbol name
     pub name: String,
+    /// Namespace/type-qualified name.
+    pub qualified_name: String,
     /// Symbol kind
     pub kind: SymbolKind,
     /// Starting line (1-based)
@@ -478,13 +705,22 @@ pub struct DefinitionResult {
     pub signature: String,
     /// Documentation comment
     pub doc_comment: Option<String>,
+    pub location_role: LocationRole,
+    pub language: String,
+    pub canonical_signature: String,
+    pub parser: String,
+    pub resolution_status: ResolutionStatus,
+    pub evidence_kind: EvidenceKind,
 }
 
 impl From<&Definition> for DefinitionResult {
     fn from(def: &Definition) -> Self {
         Self {
+            symbol_id: def.to_storage_id(),
+            location_id: def.location.to_storage_id(),
             file_path: def.symbol_id.file_path.clone(),
             name: def.symbol_id.name.clone(),
+            qualified_name: def.symbol_id.qualified_name.clone(),
             kind: def.symbol_id.kind,
             start_line: def.symbol_id.start_line,
             end_line: def.end_line,
@@ -492,6 +728,12 @@ impl From<&Definition> for DefinitionResult {
             end_col: def.end_col,
             signature: def.signature.clone(),
             doc_comment: def.doc_comment.clone(),
+            location_role: def.location.role,
+            language: def.symbol_id.language.clone(),
+            canonical_signature: def.symbol_id.canonical_signature.clone(),
+            parser: def.parser.clone(),
+            resolution_status: ResolutionStatus::Resolved,
+            evidence_kind: EvidenceKind::Syntactic,
         }
     }
 }
@@ -499,6 +741,11 @@ impl From<&Definition> for DefinitionResult {
 /// Result from find_references containing a found reference
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReferenceResult {
+    pub location_id: String,
+    pub source_symbol_id: Option<String>,
+    pub target_symbol_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<ReferenceCandidate>,
     /// File path where the reference occurs
     pub file_path: String,
     /// Starting line (1-based)
@@ -511,6 +758,11 @@ pub struct ReferenceResult {
     pub end_col: usize,
     /// Kind of reference
     pub reference_kind: ReferenceKind,
+    pub resolution_status: ResolutionStatus,
+    pub evidence_kind: EvidenceKind,
+    pub dispatch_kind: DispatchKind,
+    pub language: String,
+    pub parser: String,
     /// Preview of the line containing the reference
     pub preview: Option<String>,
 }
@@ -518,12 +770,21 @@ pub struct ReferenceResult {
 impl From<&Reference> for ReferenceResult {
     fn from(r: &Reference) -> Self {
         Self {
+            location_id: r.location_id.clone(),
+            source_symbol_id: r.source_symbol_id.clone(),
+            target_symbol_id: (!r.target_symbol_id.is_empty()).then(|| r.target_symbol_id.clone()),
+            candidates: r.candidates.clone(),
             file_path: r.file_path.clone(),
             start_line: r.start_line,
             end_line: r.end_line,
             start_col: r.start_col,
             end_col: r.end_col,
             reference_kind: r.reference_kind,
+            resolution_status: r.resolution_status,
+            evidence_kind: r.evidence_kind,
+            dispatch_kind: r.dispatch_kind,
+            language: r.language.clone(),
+            parser: r.parser.clone(),
             preview: None,
         }
     }
@@ -540,6 +801,14 @@ pub struct CallGraphNode {
     pub file_path: String,
     /// Line number
     pub line: usize,
+    /// Exact call-site provenance for this relationship.
+    pub call_site_file: String,
+    pub call_site_line: usize,
+    pub call_site_col: usize,
+    pub reference_kind: ReferenceKind,
+    pub resolution_status: ResolutionStatus,
+    pub evidence_kind: EvidenceKind,
+    pub parser: String,
     /// Nested callers/callees (for depth > 1)
     pub children: Vec<CallGraphNode>,
 }
@@ -565,8 +834,11 @@ pub struct SkippedDefinition {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SymbolInfo {
+    pub symbol_id: String,
+    pub location_id: String,
     /// Symbol name
     pub name: String,
+    pub qualified_name: String,
     /// Symbol kind
     pub kind: SymbolKind,
     /// File path
@@ -577,6 +849,8 @@ pub struct SymbolInfo {
     pub end_line: usize,
     /// Signature
     pub signature: String,
+    pub language: String,
+    pub location_role: LocationRole,
 }
 
 // ============================================================================
@@ -638,7 +912,8 @@ mod tests {
         let id3 = SymbolId::new("src/main.rs", "foo", SymbolKind::Function, 20, 0);
 
         assert_eq!(id1, id2);
-        assert_ne!(id1, id3);
+        // Source positions are locations, not logical symbol identity.
+        assert_eq!(id1, id3);
     }
 
     #[test]
@@ -657,13 +932,23 @@ mod tests {
     fn test_symbol_id_storage_id() {
         let id = SymbolId::new("src/main.rs", "foo", SymbolKind::Function, 10, 5);
         let storage_id = id.to_storage_id();
-        assert_eq!(storage_id, "src/main.rs:foo:10:5");
+        assert!(storage_id.starts_with("sym:v3:"));
+        assert!(storage_id.ends_with(":foo"));
     }
 
     #[test]
     fn test_definition_storage_id() {
         let def = Definition {
             symbol_id: SymbolId::new("src/lib.rs", "MyClass", SymbolKind::Class, 15, 0),
+            location: SourceLocation {
+                project_id: String::new(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 15,
+                start_col: 0,
+                end_line: 15,
+                end_col: 7,
+                role: LocationRole::Definition,
+            },
             root_path: Some("/project".to_string()),
             project: Some("test".to_string()),
             end_line: 50,
@@ -672,10 +957,11 @@ mod tests {
             doc_comment: None,
             visibility: Visibility::Public,
             parent_id: None,
+            parser: "tree-sitter/test".to_string(),
             indexed_at: 12345,
         };
 
-        assert_eq!(def.to_storage_id(), "def:src/lib.rs:MyClass:15");
+        assert!(def.to_storage_id().starts_with("sym:v3:"));
         assert_eq!(def.file_path(), "src/lib.rs");
         assert_eq!(def.name(), "MyClass");
         assert_eq!(def.kind(), SymbolKind::Class);
@@ -683,6 +969,15 @@ mod tests {
 
     #[test]
     fn test_reference_storage_id() {
+        let location = SourceLocation {
+            project_id: String::new(),
+            file_path: "src/consumer.rs".to_string(),
+            start_line: 25,
+            start_col: 10,
+            end_line: 25,
+            end_col: 20,
+            role: LocationRole::Reference,
+        };
         let reference = Reference {
             file_path: "src/consumer.rs".to_string(),
             root_path: None,
@@ -691,12 +986,21 @@ mod tests {
             end_line: 25,
             start_col: 10,
             end_col: 20,
-            target_symbol_id: "def:src/lib.rs:foo:10".to_string(),
+            location_id: location.to_storage_id(),
+            source_symbol_id: None,
+            target_symbol_id: "sym:v3:test:foo".to_string(),
+            target_name: "foo".to_string(),
+            candidates: Vec::new(),
             reference_kind: ReferenceKind::Call,
+            resolution_status: ResolutionStatus::Resolved,
+            evidence_kind: EvidenceKind::Syntactic,
+            dispatch_kind: DispatchKind::Direct,
+            language: "Rust".to_string(),
+            parser: "tree-sitter/test".to_string(),
             indexed_at: 12345,
         };
 
-        assert_eq!(reference.to_storage_id(), "ref:src/consumer.rs:25:10");
+        assert_eq!(reference.to_storage_id(), location.to_storage_id());
     }
 
     #[test]
@@ -710,6 +1014,15 @@ mod tests {
     fn test_definition_result_from_definition() {
         let def = Definition {
             symbol_id: SymbolId::new("src/lib.rs", "my_func", SymbolKind::Function, 10, 0),
+            location: SourceLocation {
+                project_id: String::new(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 10,
+                start_col: 0,
+                end_line: 10,
+                end_col: 7,
+                role: LocationRole::Definition,
+            },
             root_path: None,
             project: None,
             end_line: 20,
@@ -718,6 +1031,7 @@ mod tests {
             doc_comment: Some("Does stuff".to_string()),
             visibility: Visibility::Public,
             parent_id: None,
+            parser: "tree-sitter/test".to_string(),
             indexed_at: 0,
         };
 

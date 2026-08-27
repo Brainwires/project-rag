@@ -33,8 +33,9 @@ pub mod stack_graphs;
 use anyhow::Result;
 
 pub use types::{
-    CallEdge, CallGraphNode, Definition, DefinitionResult, PrecisionLevel, Reference,
-    ReferenceKind, ReferenceResult, SkippedDefinition, SymbolId, SymbolInfo, SymbolKind,
+    CallEdge, CallGraphNode, Definition, DefinitionResult, DispatchKind, EvidenceKind, LinkageKind,
+    LocationRole, PrecisionLevel, Reference, ReferenceCandidate, ReferenceKind, ReferenceResult,
+    ResolutionStatus, SkippedDefinition, SourceLocation, SymbolId, SymbolInfo, SymbolKind,
     Visibility,
 };
 

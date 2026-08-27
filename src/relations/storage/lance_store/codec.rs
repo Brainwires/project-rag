@@ -10,7 +10,9 @@ use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 
 use crate::relations::types::{
-    Definition, Reference, ReferenceKind, SymbolId, SymbolKind, Visibility,
+    Definition, DispatchKind, EvidenceKind, LinkageKind, LocationRole, Reference,
+    ReferenceCandidate, ReferenceKind, ResolutionStatus, SourceLocation, SymbolId, SymbolKind,
+    Visibility,
 };
 
 /// Schema of the definitions table.
@@ -20,8 +22,20 @@ pub fn definitions_schema() -> Arc<Schema> {
         Field::new("file_path", DataType::Utf8, false),
         Field::new("root_path", DataType::Utf8, true),
         Field::new("project", DataType::Utf8, true),
+        Field::new("project_id", DataType::Utf8, false),
+        Field::new("language", DataType::Utf8, false),
         Field::new("name", DataType::Utf8, false),
+        Field::new("qualified_name", DataType::Utf8, false),
         Field::new("kind", DataType::Utf8, false),
+        Field::new("canonical_signature", DataType::Utf8, false),
+        Field::new("linkage", DataType::Utf8, false),
+        Field::new("scope_discriminator", DataType::Utf8, true),
+        Field::new("location_id", DataType::Utf8, false),
+        Field::new("location_role", DataType::Utf8, false),
+        Field::new("location_start_line", DataType::UInt32, false),
+        Field::new("location_start_col", DataType::UInt32, false),
+        Field::new("location_end_line", DataType::UInt32, false),
+        Field::new("location_end_col", DataType::UInt32, false),
         Field::new("start_line", DataType::UInt32, false),
         Field::new("start_col", DataType::UInt32, false),
         Field::new("end_line", DataType::UInt32, false),
@@ -30,6 +44,7 @@ pub fn definitions_schema() -> Arc<Schema> {
         Field::new("doc_comment", DataType::Utf8, true),
         Field::new("visibility", DataType::Utf8, false),
         Field::new("parent_id", DataType::Utf8, true),
+        Field::new("parser", DataType::Utf8, false),
         Field::new("indexed_at", DataType::Int64, false),
     ]))
 }
@@ -45,8 +60,17 @@ pub fn references_schema() -> Arc<Schema> {
         Field::new("end_line", DataType::UInt32, false),
         Field::new("start_col", DataType::UInt32, false),
         Field::new("end_col", DataType::UInt32, false),
+        Field::new("location_id", DataType::Utf8, false),
+        Field::new("source_symbol_id", DataType::Utf8, true),
         Field::new("target_symbol_id", DataType::Utf8, false),
+        Field::new("target_name", DataType::Utf8, false),
+        Field::new("candidates", DataType::Utf8, false),
         Field::new("reference_kind", DataType::Utf8, false),
+        Field::new("resolution_status", DataType::Utf8, false),
+        Field::new("evidence_kind", DataType::Utf8, false),
+        Field::new("dispatch_kind", DataType::Utf8, false),
+        Field::new("language", DataType::Utf8, false),
+        Field::new("parser", DataType::Utf8, false),
         Field::new("indexed_at", DataType::Int64, false),
     ]))
 }
@@ -102,11 +126,83 @@ pub fn definitions_to_batch(definitions: &[Definition]) -> Result<RecordBatch> {
             .map(|d| d.project.as_deref())
             .collect::<Vec<_>>(),
     );
+    let project_ids = StringArray::from(
+        definitions
+            .iter()
+            .map(|d| d.symbol_id.project_id.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let languages = StringArray::from(
+        definitions
+            .iter()
+            .map(|d| d.symbol_id.language.as_str())
+            .collect::<Vec<_>>(),
+    );
     let names = StringArray::from(definitions.iter().map(|d| d.name()).collect::<Vec<_>>());
+    let qualified_names = StringArray::from(
+        definitions
+            .iter()
+            .map(|d| d.symbol_id.qualified_name.as_str())
+            .collect::<Vec<_>>(),
+    );
     let kinds = StringArray::from(
         definitions
             .iter()
             .map(|d| enum_to_str(&d.symbol_id.kind))
+            .collect::<Vec<_>>(),
+    );
+    let canonical_signatures = StringArray::from(
+        definitions
+            .iter()
+            .map(|d| d.symbol_id.canonical_signature.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let linkages = StringArray::from(
+        definitions
+            .iter()
+            .map(|d| enum_to_str(&d.symbol_id.linkage))
+            .collect::<Vec<_>>(),
+    );
+    let scope_discriminators = StringArray::from(
+        definitions
+            .iter()
+            .map(|d| d.symbol_id.scope_discriminator.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let location_ids = StringArray::from(
+        definitions
+            .iter()
+            .map(|d| d.location.to_storage_id())
+            .collect::<Vec<_>>(),
+    );
+    let location_roles = StringArray::from(
+        definitions
+            .iter()
+            .map(|d| enum_to_str(&d.location.role))
+            .collect::<Vec<_>>(),
+    );
+    let location_start_lines = UInt32Array::from(
+        definitions
+            .iter()
+            .map(|d| d.location.start_line as u32)
+            .collect::<Vec<_>>(),
+    );
+    let location_start_cols = UInt32Array::from(
+        definitions
+            .iter()
+            .map(|d| d.location.start_col as u32)
+            .collect::<Vec<_>>(),
+    );
+    let location_end_lines = UInt32Array::from(
+        definitions
+            .iter()
+            .map(|d| d.location.end_line as u32)
+            .collect::<Vec<_>>(),
+    );
+    let location_end_cols = UInt32Array::from(
+        definitions
+            .iter()
+            .map(|d| d.location.end_col as u32)
             .collect::<Vec<_>>(),
     );
     let start_lines = UInt32Array::from(
@@ -157,6 +253,12 @@ pub fn definitions_to_batch(definitions: &[Definition]) -> Result<RecordBatch> {
             .map(|d| d.parent_id.as_deref())
             .collect::<Vec<_>>(),
     );
+    let parsers = StringArray::from(
+        definitions
+            .iter()
+            .map(|d| d.parser.as_str())
+            .collect::<Vec<_>>(),
+    );
     let indexed_ats =
         Int64Array::from(definitions.iter().map(|d| d.indexed_at).collect::<Vec<_>>());
 
@@ -167,8 +269,20 @@ pub fn definitions_to_batch(definitions: &[Definition]) -> Result<RecordBatch> {
             Arc::new(file_paths),
             Arc::new(root_paths),
             Arc::new(projects),
+            Arc::new(project_ids),
+            Arc::new(languages),
             Arc::new(names),
+            Arc::new(qualified_names),
             Arc::new(kinds),
+            Arc::new(canonical_signatures),
+            Arc::new(linkages),
+            Arc::new(scope_discriminators),
+            Arc::new(location_ids),
+            Arc::new(location_roles),
+            Arc::new(location_start_lines),
+            Arc::new(location_start_cols),
+            Arc::new(location_end_lines),
+            Arc::new(location_end_cols),
             Arc::new(start_lines),
             Arc::new(start_cols),
             Arc::new(end_lines),
@@ -177,6 +291,7 @@ pub fn definitions_to_batch(definitions: &[Definition]) -> Result<RecordBatch> {
             Arc::new(doc_comments),
             Arc::new(visibilities),
             Arc::new(parent_ids),
+            Arc::new(parsers),
             Arc::new(indexed_ats),
         ],
     )
@@ -232,16 +347,70 @@ pub fn references_to_batch(references: &[Reference]) -> Result<RecordBatch> {
             .map(|r| r.end_col as u32)
             .collect::<Vec<_>>(),
     );
+    let location_ids = StringArray::from(
+        references
+            .iter()
+            .map(|r| r.location_id.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let source_symbol_ids = StringArray::from(
+        references
+            .iter()
+            .map(|r| r.source_symbol_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
     let targets = StringArray::from(
         references
             .iter()
             .map(|r| r.target_symbol_id.as_str())
             .collect::<Vec<_>>(),
     );
+    let target_names = StringArray::from(
+        references
+            .iter()
+            .map(|r| r.target_name.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let candidates = StringArray::from(
+        references
+            .iter()
+            .map(|r| serde_json::to_string(&r.candidates).unwrap_or_else(|_| "[]".to_string()))
+            .collect::<Vec<_>>(),
+    );
     let kinds = StringArray::from(
         references
             .iter()
             .map(|r| enum_to_str(&r.reference_kind))
+            .collect::<Vec<_>>(),
+    );
+    let resolution_statuses = StringArray::from(
+        references
+            .iter()
+            .map(|r| enum_to_str(&r.resolution_status))
+            .collect::<Vec<_>>(),
+    );
+    let evidence_kinds = StringArray::from(
+        references
+            .iter()
+            .map(|r| enum_to_str(&r.evidence_kind))
+            .collect::<Vec<_>>(),
+    );
+    let dispatch_kinds = StringArray::from(
+        references
+            .iter()
+            .map(|r| enum_to_str(&r.dispatch_kind))
+            .collect::<Vec<_>>(),
+    );
+    let languages = StringArray::from(
+        references
+            .iter()
+            .map(|r| r.language.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let parsers = StringArray::from(
+        references
+            .iter()
+            .map(|r| r.parser.as_str())
             .collect::<Vec<_>>(),
     );
     let indexed_ats = Int64Array::from(references.iter().map(|r| r.indexed_at).collect::<Vec<_>>());
@@ -257,8 +426,17 @@ pub fn references_to_batch(references: &[Reference]) -> Result<RecordBatch> {
             Arc::new(end_lines),
             Arc::new(start_cols),
             Arc::new(end_cols),
+            Arc::new(location_ids),
+            Arc::new(source_symbol_ids),
             Arc::new(targets),
+            Arc::new(target_names),
+            Arc::new(candidates),
             Arc::new(kinds),
+            Arc::new(resolution_statuses),
+            Arc::new(evidence_kinds),
+            Arc::new(dispatch_kinds),
+            Arc::new(languages),
+            Arc::new(parsers),
             Arc::new(indexed_ats),
         ],
     )
@@ -304,8 +482,19 @@ pub fn batch_to_definitions(batch: &RecordBatch) -> Result<Vec<Definition>> {
     let file_paths = str_col(batch, "file_path")?;
     let root_paths = str_col(batch, "root_path")?;
     let projects = str_col(batch, "project")?;
+    let project_ids = str_col(batch, "project_id")?;
+    let languages = str_col(batch, "language")?;
     let names = str_col(batch, "name")?;
+    let qualified_names = str_col(batch, "qualified_name")?;
     let kinds = str_col(batch, "kind")?;
+    let canonical_signatures = str_col(batch, "canonical_signature")?;
+    let linkages = str_col(batch, "linkage")?;
+    let scope_discriminators = str_col(batch, "scope_discriminator")?;
+    let location_roles = str_col(batch, "location_role")?;
+    let location_start_lines = u32_col(batch, "location_start_line")?;
+    let location_start_cols = u32_col(batch, "location_start_col")?;
+    let location_end_lines = u32_col(batch, "location_end_line")?;
+    let location_end_cols = u32_col(batch, "location_end_col")?;
     let start_lines = u32_col(batch, "start_line")?;
     let start_cols = u32_col(batch, "start_col")?;
     let end_lines = u32_col(batch, "end_line")?;
@@ -314,20 +503,39 @@ pub fn batch_to_definitions(batch: &RecordBatch) -> Result<Vec<Definition>> {
     let doc_comments = str_col(batch, "doc_comment")?;
     let visibilities = str_col(batch, "visibility")?;
     let parent_ids = str_col(batch, "parent_id")?;
+    let parsers = str_col(batch, "parser")?;
     let indexed_ats = i64_col(batch, "indexed_at")?;
 
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         let kind = enum_from_str::<SymbolKind>(kinds.value(i)).unwrap_or(SymbolKind::Unknown);
         let visibility = enum_from_str::<Visibility>(visibilities.value(i)).unwrap_or_default();
+        let linkage = enum_from_str::<LinkageKind>(linkages.value(i)).unwrap_or_default();
+        let location_role =
+            enum_from_str::<LocationRole>(location_roles.value(i)).unwrap_or_default();
         out.push(Definition {
-            symbol_id: SymbolId::new(
-                file_paths.value(i),
+            symbol_id: SymbolId::new_logical(
+                project_ids.value(i),
+                languages.value(i),
+                qualified_names.value(i),
                 names.value(i),
                 kind,
+                canonical_signatures.value(i),
+                linkage,
+                opt_str(scope_discriminators, i),
+                file_paths.value(i),
                 start_lines.value(i) as usize,
                 start_cols.value(i) as usize,
             ),
+            location: SourceLocation {
+                project_id: project_ids.value(i).to_string(),
+                file_path: file_paths.value(i).to_string(),
+                start_line: location_start_lines.value(i) as usize,
+                start_col: location_start_cols.value(i) as usize,
+                end_line: location_end_lines.value(i) as usize,
+                end_col: location_end_cols.value(i) as usize,
+                role: location_role,
+            },
             root_path: opt_str(root_paths, i),
             project: opt_str(projects, i),
             end_line: end_lines.value(i) as usize,
@@ -336,6 +544,7 @@ pub fn batch_to_definitions(batch: &RecordBatch) -> Result<Vec<Definition>> {
             doc_comment: opt_str(doc_comments, i),
             visibility,
             parent_id: opt_str(parent_ids, i),
+            parser: parsers.value(i).to_string(),
             indexed_at: indexed_ats.value(i),
         });
     }
@@ -350,14 +559,31 @@ pub fn batch_to_references(batch: &RecordBatch) -> Result<Vec<Reference>> {
     let end_lines = u32_col(batch, "end_line")?;
     let start_cols = u32_col(batch, "start_col")?;
     let end_cols = u32_col(batch, "end_col")?;
+    let location_ids = str_col(batch, "location_id")?;
+    let source_symbol_ids = str_col(batch, "source_symbol_id")?;
     let targets = str_col(batch, "target_symbol_id")?;
+    let target_names = str_col(batch, "target_name")?;
+    let candidates = str_col(batch, "candidates")?;
     let kinds = str_col(batch, "reference_kind")?;
+    let resolution_statuses = str_col(batch, "resolution_status")?;
+    let evidence_kinds = str_col(batch, "evidence_kind")?;
+    let dispatch_kinds = str_col(batch, "dispatch_kind")?;
+    let languages = str_col(batch, "language")?;
+    let parsers = str_col(batch, "parser")?;
     let indexed_ats = i64_col(batch, "indexed_at")?;
 
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         let reference_kind =
             enum_from_str::<ReferenceKind>(kinds.value(i)).unwrap_or(ReferenceKind::Unknown);
+        let resolution_status =
+            enum_from_str::<ResolutionStatus>(resolution_statuses.value(i)).unwrap_or_default();
+        let evidence_kind =
+            enum_from_str::<EvidenceKind>(evidence_kinds.value(i)).unwrap_or_default();
+        let dispatch_kind =
+            enum_from_str::<DispatchKind>(dispatch_kinds.value(i)).unwrap_or_default();
+        let parsed_candidates: Vec<ReferenceCandidate> =
+            serde_json::from_str(candidates.value(i)).unwrap_or_default();
         out.push(Reference {
             file_path: file_paths.value(i).to_string(),
             root_path: opt_str(root_paths, i),
@@ -366,8 +592,17 @@ pub fn batch_to_references(batch: &RecordBatch) -> Result<Vec<Reference>> {
             end_line: end_lines.value(i) as usize,
             start_col: start_cols.value(i) as usize,
             end_col: end_cols.value(i) as usize,
+            location_id: location_ids.value(i).to_string(),
+            source_symbol_id: opt_str(source_symbol_ids, i),
             target_symbol_id: targets.value(i).to_string(),
+            target_name: target_names.value(i).to_string(),
+            candidates: parsed_candidates,
             reference_kind,
+            resolution_status,
+            evidence_kind,
+            dispatch_kind,
+            language: languages.value(i).to_string(),
+            parser: parsers.value(i).to_string(),
             indexed_at: indexed_ats.value(i),
         });
     }

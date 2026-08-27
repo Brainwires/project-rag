@@ -8,7 +8,18 @@ use chrono::Utc;
 use tree_sitter::{Language, Node, Parser};
 
 use crate::indexer::FileInfo;
-use crate::relations::types::{Definition, SkippedDefinition, SymbolId, SymbolKind, Visibility};
+use crate::relations::types::{
+    Definition, LinkageKind, LocationRole, SkippedDefinition, SourceLocation, SymbolId, SymbolKind,
+    Visibility,
+};
+
+#[derive(Clone)]
+struct ParentScope {
+    symbol_id: String,
+    qualified_name: String,
+    kind: SymbolKind,
+    anonymous: bool,
+}
 
 /// Extracts symbol definitions from source code using AST parsing.
 pub struct SymbolExtractor {
@@ -88,7 +99,7 @@ impl SymbolExtractor {
         source: &str,
         language: &str,
         file_info: &FileInfo,
-        parent_id: Option<String>,
+        parent: Option<ParentScope>,
         result: &mut Vec<Definition>,
         skipped: &mut Vec<SkippedDefinition>,
     ) {
@@ -99,6 +110,7 @@ impl SymbolExtractor {
         // that binds no checkable name (globs, side-effect imports) is recorded as
         // skipped so the listing is visibly incomplete rather than silently short.
         if super::import_extractor::is_import_node(kind, language) {
+            let parent_id = parent.as_ref().map(|p| p.symbol_id.clone());
             let imports = super::import_extractor::extract_imports(
                 node, source, language, file_info, &parent_id,
             );
@@ -115,11 +127,16 @@ impl SymbolExtractor {
         }
 
         // Check if this node is a definition we care about
-        if is_definition_node(kind, language) {
+        if is_definition_node(node, language) {
             if let Some(def) =
-                self.node_to_definition(node, source, language, file_info, &parent_id)
+                self.node_to_definition(node, source, language, file_info, parent.as_ref())
             {
-                let new_parent_id = Some(def.to_storage_id());
+                let new_parent = Some(ParentScope {
+                    symbol_id: def.to_storage_id(),
+                    qualified_name: def.symbol_id.qualified_name.clone(),
+                    kind: def.symbol_id.kind,
+                    anonymous: def.symbol_id.linkage == LinkageKind::Anonymous,
+                });
                 result.push(def);
 
                 // Extract nested definitions with this as parent
@@ -130,7 +147,7 @@ impl SymbolExtractor {
                         source,
                         language,
                         file_info,
-                        new_parent_id.clone(),
+                        new_parent.clone(),
                         result,
                         skipped,
                     );
@@ -156,7 +173,7 @@ impl SymbolExtractor {
                 source,
                 language,
                 file_info,
-                parent_id.clone(),
+                parent.clone(),
                 result,
                 skipped,
             );
@@ -170,13 +187,60 @@ impl SymbolExtractor {
         source: &str,
         language: &str,
         file_info: &FileInfo,
-        parent_id: &Option<String>,
+        parent: Option<&ParentScope>,
     ) -> Option<Definition> {
         let kind = node.kind();
-        let symbol_kind = SymbolKind::from_ast_kind(kind);
+        let mut symbol_kind = SymbolKind::from_ast_kind(kind);
 
         // Extract the symbol name
-        let name = extract_symbol_name(node, source, language)?;
+        let name_node = find_name_node(node, language);
+        let name = match name_node {
+            Some(name_node) => source
+                .get(name_node.start_byte()..name_node.end_byte())?
+                .to_string(),
+            None if kind == "namespace_definition" => "<anonymous>".to_string(),
+            None => return None,
+        };
+
+        if kind == "namespace_definition" {
+            symbol_kind = SymbolKind::Namespace;
+        } else if matches!(kind, "declaration" | "field_declaration") {
+            symbol_kind = if parent.is_some_and(|p| is_type_scope(p.kind)) {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            };
+        } else if symbol_kind == SymbolKind::Function
+            && parent.is_some_and(|p| is_type_scope(p.kind))
+        {
+            symbol_kind = SymbolKind::Method;
+        }
+
+        let qualified_from_source = if language == "C++" {
+            cpp_qualified_callable_name(node, source)
+        } else {
+            None
+        };
+        let qualified_name = qualified_from_source.unwrap_or_else(|| match parent {
+            Some(parent) if !parent.qualified_name.is_empty() => {
+                format!("{}::{}", parent.qualified_name, name)
+            }
+            _ => name.clone(),
+        });
+
+        if symbol_kind == SymbolKind::Function && qualified_name.contains("::") {
+            symbol_kind = SymbolKind::Method;
+        }
+
+        if matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method) {
+            let owner = qualified_name.rsplit_once("::").map(|(owner, _)| owner);
+            let qualified_leaf = qualified_name.rsplit("::").next().unwrap_or(&name);
+            if qualified_leaf.starts_with('~') {
+                symbol_kind = SymbolKind::Destructor;
+            } else if owner.and_then(|o| o.rsplit("::").next()) == Some(qualified_leaf) {
+                symbol_kind = SymbolKind::Constructor;
+            }
+        }
 
         // Get position info
         let start_pos = node.start_position();
@@ -184,6 +248,7 @@ impl SymbolExtractor {
 
         // Extract signature (first line or declaration)
         let signature = extract_signature(node, source, language);
+        let canonical_signature = canonical_signature(node, source, &name, language);
 
         // Extract doc comment
         let doc_comment = extract_doc_comment(node, source, language);
@@ -191,15 +256,53 @@ impl SymbolExtractor {
         // Determine visibility
         let node_text = &source[node.start_byte()..node.end_byte().min(source.len())];
         let visibility = Visibility::from_keywords(node_text);
+        let is_anonymous = name == "<anonymous>" || parent.is_some_and(|p| p.anonymous);
+        let linkage = if is_anonymous {
+            LinkageKind::Anonymous
+        } else if node_text.trim_start().starts_with("static ") {
+            LinkageKind::Internal
+        } else if parent
+            .is_some_and(|p| matches!(p.kind, SymbolKind::Function | SymbolKind::Method))
+        {
+            LinkageKind::Local
+        } else {
+            LinkageKind::External
+        };
+        let scope_discriminator =
+            (!matches!(linkage, LinkageKind::External)).then(|| file_info.relative_path.clone());
+
+        let location_role = if matches!(kind, "declaration" | "field_declaration") {
+            LocationRole::Declaration
+        } else {
+            LocationRole::Definition
+        };
+        let name_start = name_node.unwrap_or(node).start_position();
+        let name_end = name_node.unwrap_or(node).end_position();
+        let location = SourceLocation {
+            project_id: file_info.project.clone().unwrap_or_default(),
+            file_path: file_info.relative_path.clone(),
+            start_line: name_start.row + 1,
+            start_col: name_start.column,
+            end_line: name_end.row + 1,
+            end_col: name_end.column,
+            role: location_role,
+        };
 
         Some(Definition {
-            symbol_id: SymbolId::new(
-                &file_info.relative_path,
+            symbol_id: SymbolId::new_logical(
+                file_info.project.clone().unwrap_or_default(),
+                language,
+                qualified_name,
                 name,
                 symbol_kind,
+                canonical_signature,
+                linkage,
+                scope_discriminator,
+                &file_info.relative_path,
                 start_pos.row + 1, // Convert to 1-based
                 start_pos.column,
             ),
+            location,
             root_path: Some(file_info.root_path.clone()),
             project: file_info.project.clone(),
             end_line: end_pos.row + 1,
@@ -207,7 +310,8 @@ impl SymbolExtractor {
             signature,
             doc_comment,
             visibility,
-            parent_id: parent_id.clone(),
+            parent_id: parent.map(|p| p.symbol_id.clone()),
+            parser: format!("tree-sitter/{}", language.to_lowercase()),
             indexed_at: Utc::now().timestamp(),
         })
     }
@@ -266,7 +370,7 @@ pub fn language_name_for_extension(extension: &str) -> Option<&'static str> {
 }
 
 /// Get the tree-sitter language for a file extension
-fn get_language_for_extension(extension: &str) -> Option<(Language, String)> {
+pub(super) fn get_language_for_extension(extension: &str) -> Option<(Language, String)> {
     let name = language_name_for_extension(extension)?;
     let language: Language = match name {
         "Rust" => tree_sitter_rust::LANGUAGE.into(),
@@ -287,7 +391,8 @@ fn get_language_for_extension(extension: &str) -> Option<(Language, String)> {
 }
 
 /// Check if a node kind represents a definition
-fn is_definition_node(kind: &str, language: &str) -> bool {
+fn is_definition_node(node: Node<'_>, language: &str) -> bool {
+    let kind = node.kind();
     match language {
         "Rust" => matches!(
             kind,
@@ -339,14 +444,17 @@ fn is_definition_node(kind: &str, language: &str) -> bool {
             kind,
             "function_definition" | "struct_specifier" | "enum_specifier"
         ),
-        "C++" => matches!(
-            kind,
-            "function_definition"
-                | "class_specifier"
-                | "struct_specifier"
-                | "enum_specifier"
-                | "namespace_definition"
-        ),
+        "C++" => {
+            matches!(
+                kind,
+                "function_definition"
+                    | "class_specifier"
+                    | "struct_specifier"
+                    | "enum_specifier"
+                    | "namespace_definition"
+            ) || (matches!(kind, "declaration" | "field_declaration")
+                && contains_node_kind(node, "function_declarator"))
+        }
         "C#" => matches!(
             kind,
             "method_declaration"
@@ -369,26 +477,71 @@ fn is_definition_node(kind: &str, language: &str) -> bool {
     }
 }
 
-/// Extract the symbol name from an AST node
-fn extract_symbol_name(node: Node, source: &str, language: &str) -> Option<String> {
-    // Strategy: Find the identifier/name child node based on language
-    let name_node = find_name_node(node, language)?;
-
-    let start = name_node.start_byte();
-    let end = name_node.end_byte();
-
-    if end > source.len() {
-        return None;
+fn contains_node_kind(node: Node<'_>, wanted: &str) -> bool {
+    if node.kind() == wanted {
+        return true;
     }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| contains_node_kind(child, wanted))
+}
 
-    let name = source[start..end].to_string();
+fn is_type_scope(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class
+            | SymbolKind::Struct
+            | SymbolKind::Interface
+            | SymbolKind::Trait
+            | SymbolKind::Namespace
+            | SymbolKind::Module
+    )
+}
 
-    // Filter out empty or whitespace-only names
-    if name.trim().is_empty() {
-        return None;
-    }
+fn cpp_qualified_callable_name(node: Node<'_>, source: &str) -> Option<String> {
+    let declarator = node.child_by_field_name("declarator")?;
+    let text = source.get(declarator.start_byte()..declarator.end_byte())?;
+    let before_params = text.split('(').next()?.trim();
+    let candidate = before_params
+        .split_whitespace()
+        .last()?
+        .trim_matches(|c| matches!(c, '*' | '&'));
+    candidate.contains("::").then(|| candidate.to_string())
+}
 
-    Some(name)
+fn canonical_signature(node: Node<'_>, source: &str, name: &str, language: &str) -> String {
+    let raw = if matches!(language, "C" | "C++") {
+        node.child_by_field_name("declarator")
+            .and_then(|d| source.get(d.start_byte()..d.end_byte()))
+            .unwrap_or_else(|| source.get(node.start_byte()..node.end_byte()).unwrap_or(""))
+    } else {
+        source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+    };
+    let header = raw
+        .split('{')
+        .next()
+        .unwrap_or(raw)
+        .trim_end_matches(';')
+        .trim();
+    let callable = if let Some(open) = header.find('(') {
+        let prefix = &header[..open];
+        let callable_name = prefix
+            .split_whitespace()
+            .last()
+            .unwrap_or(name)
+            .rsplit("::")
+            .next()
+            .unwrap_or(name);
+        format!("{}{}", callable_name, &header[open..])
+    } else {
+        name.to_string()
+    };
+    normalize_signature(&callable)
+}
+
+fn normalize_signature(signature: &str) -> String {
+    let collapsed = signature.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.replace(" ", "").trim_end_matches(';').to_string()
 }
 
 /// Find the child node containing the symbol name
@@ -516,6 +669,12 @@ fn find_innermost_identifier<'a>(node: Node<'a>) -> Option<Node<'a>> {
     // If this is an identifier, return it
     if node.kind() == "identifier" || node.kind() == "field_identifier" {
         return Some(node);
+    }
+
+    if let Some(name_node) = node.child_by_field_name("name")
+        && let Some(id) = find_innermost_identifier(name_node)
+    {
+        return Some(id);
     }
 
     // Check for name field. Only return on success -- an unconditional return here
@@ -788,5 +947,83 @@ class Calculator {
                 extension
             );
         }
+    }
+
+    #[test]
+    fn cpp_declaration_and_definition_share_logical_id() {
+        let mut header = make_file_info(
+            "class Writer { public: void Write(int value) const; };",
+            "hpp",
+        );
+        header.relative_path = "include/writer.hpp".to_string();
+        header.project = Some("stable-project".to_string());
+        let mut source = make_file_info("void Writer::Write(int value) const { }", "cpp");
+        source.relative_path = "src/writer.cpp".to_string();
+        source.project = Some("stable-project".to_string());
+
+        let extractor = SymbolExtractor::new();
+        let header_defs = extractor.extract_definitions(&header).unwrap();
+        let source_defs = extractor.extract_definitions(&source).unwrap();
+        let declaration = header_defs.iter().find(|d| d.name() == "Write").unwrap();
+        let definition = source_defs.iter().find(|d| d.name() == "Write").unwrap();
+
+        assert_eq!(declaration.kind(), SymbolKind::Method);
+        assert_eq!(definition.kind(), SymbolKind::Method);
+        assert_eq!(declaration.location.role, LocationRole::Declaration);
+        assert_eq!(definition.location.role, LocationRole::Definition);
+        assert_eq!(declaration.to_storage_id(), definition.to_storage_id());
+        assert_ne!(
+            declaration.location.to_storage_id(),
+            definition.location.to_storage_id()
+        );
+    }
+
+    #[test]
+    fn cpp_overloads_and_file_local_symbols_have_distinct_ids() {
+        let mut overloads = make_file_info(
+            "void Write(int value) {}\nvoid Write(const char *value) {}",
+            "cpp",
+        );
+        overloads.project = Some("stable-project".to_string());
+        let extractor = SymbolExtractor::new();
+        let defs = extractor.extract_definitions(&overloads).unwrap();
+        let writes: Vec<_> = defs.iter().filter(|d| d.name() == "Write").collect();
+        assert_eq!(writes.len(), 2);
+        assert_ne!(writes[0].to_storage_id(), writes[1].to_storage_id());
+
+        let mut first = make_file_info("static void helper() {}", "cpp");
+        first.relative_path = "src/a/common.cpp".to_string();
+        first.project = Some("stable-project".to_string());
+        let mut second = make_file_info("static void helper() {}", "cpp");
+        second.relative_path = "src/b/common.cpp".to_string();
+        second.project = Some("stable-project".to_string());
+        let first_id = extractor.extract_definitions(&first).unwrap()[0].to_storage_id();
+        let second_id = extractor.extract_definitions(&second).unwrap()[0].to_storage_id();
+        assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn anonymous_namespace_symbols_are_file_scoped() {
+        let mut first = make_file_info("namespace { void helper() {} }", "cpp");
+        first.relative_path = "src/a.cpp".to_string();
+        first.project = Some("stable-project".to_string());
+        let mut second = make_file_info("namespace { void helper() {} }", "cpp");
+        second.relative_path = "src/b.cpp".to_string();
+        second.project = Some("stable-project".to_string());
+        let extractor = SymbolExtractor::new();
+        let first_def = extractor
+            .extract_definitions(&first)
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name() == "helper")
+            .unwrap();
+        let second_def = extractor
+            .extract_definitions(&second)
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name() == "helper")
+            .unwrap();
+        assert_eq!(first_def.symbol_id.linkage, LinkageKind::Anonymous);
+        assert_ne!(first_def.to_storage_id(), second_def.to_storage_id());
     }
 }

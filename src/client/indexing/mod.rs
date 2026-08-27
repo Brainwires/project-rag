@@ -75,38 +75,94 @@ macro_rules! check_cancelled {
     };
 }
 
-/// Extract symbol definitions (functions, classes, imports, ...) from the given
-/// files and persist them in the relations store.
+/// Build and publish one coherent relations generation for a project root.
 ///
 /// Storage is idempotent per file, so calling this for modified files replaces
 /// their old symbols. Best-effort: a failure degrades relations queries but must
 /// not fail the indexing run, so it is reported through `errors` instead.
-async fn extract_and_store_definitions(
+async fn extract_and_store_relations(
     client: &RagClient,
     files: &[FileInfo],
     root_path: &str,
     errors: &mut Vec<String>,
-) -> usize {
+) -> (usize, usize) {
     let provider = client.relations_provider.clone();
-    let definitions: Vec<_> = files
+    let definition_results: Vec<_> = files
         .par_iter()
-        .flat_map(|file| {
-            provider.extract_definitions(file).unwrap_or_else(|e| {
-                tracing::debug!(
-                    "Definition extraction failed for {}: {}",
-                    file.relative_path,
-                    e
-                );
-                Vec::new()
-            })
+        .map(|file| match provider.extract_definitions_reporting(file) {
+            Ok((definitions, skipped)) => {
+                let diagnostics = (!skipped.is_empty()).then(|| {
+                    format!(
+                        "Symbol extraction for '{}' omitted {} unnameable definition nodes",
+                        file.relative_path,
+                        skipped.len()
+                    )
+                });
+                (definitions, diagnostics)
+            }
+            Err(error) => (
+                Vec::new(),
+                Some(format!(
+                    "Definition extraction failed for '{}': {:#}",
+                    file.relative_path, error
+                )),
+            ),
         })
         .collect();
-
-    if definitions.is_empty() {
-        return 0;
+    let mut definitions = Vec::new();
+    for (mut extracted, diagnostic) in definition_results {
+        definitions.append(&mut extracted);
+        if let Some(diagnostic) = diagnostic {
+            tracing::warn!("{}", diagnostic);
+            errors.push(diagnostic);
+        }
     }
 
-    match client
+    let mut symbol_index: HashMap<String, Vec<crate::relations::Definition>> = HashMap::new();
+    for definition in &definitions {
+        symbol_index
+            .entry(definition.name().to_string())
+            .or_default()
+            .push(definition.clone());
+    }
+    let symbol_index = Arc::new(symbol_index);
+    let reference_results: Vec<_> = files
+        .par_iter()
+        .map(
+            |file| match provider.extract_references(file, &symbol_index) {
+                Ok(references) => (references, None),
+                Err(error) => (
+                    Vec::new(),
+                    Some(format!(
+                        "Reference extraction failed for '{}': {:#}",
+                        file.relative_path, error
+                    )),
+                ),
+            },
+        )
+        .collect();
+    let mut references = Vec::new();
+    for (mut extracted, diagnostic) in reference_results {
+        references.append(&mut extracted);
+        if let Some(diagnostic) = diagnostic {
+            tracing::warn!("{}", diagnostic);
+            errors.push(diagnostic);
+        }
+    }
+    references.extend(
+        definitions
+            .iter()
+            .map(crate::relations::Reference::from_definition),
+    );
+
+    if let Err(e) = client.relations_store.delete_by_root(root_path).await {
+        let message = format!("Failed to clear prior relations generation: {:#}", e);
+        tracing::warn!("{}", message);
+        errors.push(message);
+        return (0, 0);
+    }
+
+    let stored_definitions = match client
         .relations_store
         .store_definitions(definitions, root_path)
         .await
@@ -118,9 +174,28 @@ async fn extract_and_store_definitions(
         Err(e) => {
             tracing::warn!("Failed to store definitions: {:#}", e);
             errors.push(format!("Failed to store definitions: {:#}", e));
+            return (0, 0);
+        }
+    };
+
+    let stored_references = match client
+        .relations_store
+        .store_references(references, root_path)
+        .await
+    {
+        Ok(stored) => stored,
+        Err(e) => {
+            tracing::warn!("Failed to store references: {:#}", e);
+            errors.push(format!("Failed to store references: {:#}", e));
             0
         }
-    }
+    };
+    tracing::info!(
+        "Published relations generation with {} definitions and {} references",
+        stored_definitions,
+        stored_references
+    );
+    (stored_definitions, stored_references)
 }
 
 /// Result of embedding generation with cancellation support
@@ -423,7 +498,7 @@ pub async fn do_index(
 
     // Persist symbol definitions (functions, classes, imports) alongside the
     // embeddings so relations queries can be served from the database.
-    extract_and_store_definitions(client, &files, &path, &mut errors).await;
+    extract_and_store_relations(client, &files, &path, &mut errors).await;
 
     // Send progress before saving cache
     if let (Some(peer), Some(token)) = (&peer, &progress_token) {
@@ -591,14 +666,14 @@ pub async fn do_incremental_update(
     let mut new_hashes = HashMap::with_capacity(current_files.len());
     let mut files_to_index = Vec::with_capacity(current_files.len());
 
-    for file in current_files {
+    for file in &current_files {
         new_hashes.insert(file.relative_path.clone(), file.hash.clone());
 
         match existing_hashes.get(&file.relative_path) {
             None => {
                 // New file
                 files_added += 1;
-                files_to_index.push(file);
+                files_to_index.push(file.clone());
             }
             Some(old_hash) if old_hash != &file.hash => {
                 // Modified file - delete old embeddings first
@@ -610,7 +685,7 @@ pub async fn do_incremental_update(
                     tracing::warn!("Failed to delete old embeddings: {}", e);
                 }
                 files_updated += 1;
-                files_to_index.push(file);
+                files_to_index.push(file.clone());
             }
             _ => {
                 // Unchanged file, skip
@@ -730,10 +805,6 @@ pub async fn do_incremental_update(
                 .context("Failed to store embeddings")?;
         }
 
-        // Refresh stored definitions for the changed files. Storage replaces rows
-        // per file, so modified files do not accumulate stale symbols.
-        extract_and_store_definitions(client, &files_to_index, &path, &mut Vec::new()).await;
-
         (all_embeddings.len(), embed_result.errors)
     } else {
         (0, vec![])
@@ -743,6 +814,13 @@ pub async fn do_incremental_update(
     for err in embed_errors {
         tracing::warn!("Embedding error during incremental update: {}", err);
     }
+
+    let mut relation_errors = Vec::new();
+    // M2 prioritizes a coherent source-of-truth reference generation and also uses
+    // this pass to populate new v3 relation tables after a compatible v2 cache
+    // migration. M5 will replace the conservative rebuild with dependency-aware
+    // incremental invalidation.
+    extract_and_store_relations(client, &current_files, &path, &mut relation_errors).await;
 
     // Send progress before saving cache
     if let (Some(peer), Some(token)) = (&peer, &progress_token) {
@@ -803,7 +881,7 @@ pub async fn do_incremental_update(
         chunks_created: chunks_modified,
         embeddings_generated,
         duration_ms: start.elapsed().as_millis() as u64,
-        errors: vec![],
+        errors: relation_errors,
         files_updated,
         files_removed,
     })

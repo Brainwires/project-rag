@@ -1,10 +1,19 @@
 use super::*;
-use crate::relations::types::{SymbolId, Visibility};
+use crate::relations::types::{SymbolId, SymbolKind, Visibility};
 use tempfile::TempDir;
 
 fn make_def(name: &str, file: &str, start: usize, end: usize, kind: SymbolKind) -> Definition {
     Definition {
         symbol_id: SymbolId::new(file, name, kind, start, 0),
+        location: crate::relations::SourceLocation {
+            project_id: "proj".to_string(),
+            file_path: file.to_string(),
+            start_line: start,
+            start_col: 0,
+            end_line: start,
+            end_col: name.len(),
+            role: crate::relations::LocationRole::Definition,
+        },
         root_path: Some("/test".to_string()),
         project: Some("proj".to_string()),
         end_line: end,
@@ -13,11 +22,21 @@ fn make_def(name: &str, file: &str, start: usize, end: usize, kind: SymbolKind) 
         doc_comment: None,
         visibility: Visibility::Public,
         parent_id: None,
+        parser: "tree-sitter/test".to_string(),
         indexed_at: 42,
     }
 }
 
 fn make_call_ref(target_id: &str, file: &str, line: usize) -> Reference {
+    let location = crate::relations::SourceLocation {
+        project_id: "proj".to_string(),
+        file_path: file.to_string(),
+        start_line: line,
+        start_col: 4,
+        end_line: line,
+        end_col: 10,
+        role: crate::relations::LocationRole::Reference,
+    };
     Reference {
         file_path: file.to_string(),
         root_path: Some("/test".to_string()),
@@ -26,8 +45,22 @@ fn make_call_ref(target_id: &str, file: &str, line: usize) -> Reference {
         end_line: line,
         start_col: 4,
         end_col: 10,
+        location_id: location.to_storage_id(),
+        source_symbol_id: None,
         target_symbol_id: target_id.to_string(),
+        target_name: crate::relations::Definition::name_from_storage_id(target_id)
+            .unwrap_or("target")
+            .to_string(),
+        candidates: vec![crate::relations::ReferenceCandidate {
+            symbol_id: target_id.to_string(),
+            reason: "test".to_string(),
+        }],
         reference_kind: ReferenceKind::Call,
+        resolution_status: crate::relations::ResolutionStatus::Resolved,
+        evidence_kind: crate::relations::EvidenceKind::Syntactic,
+        dispatch_kind: crate::relations::DispatchKind::Direct,
+        language: "Rust".to_string(),
+        parser: "tree-sitter/test".to_string(),
         indexed_at: 42,
     }
 }
@@ -38,6 +71,22 @@ async fn make_store() -> (TempDir, LanceRelationsStore) {
         .await
         .unwrap();
     (temp_dir, store)
+}
+
+fn directory_size(path: &std::path::Path) -> u64 {
+    std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                directory_size(&path)
+            } else {
+                entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+            }
+        })
+        .sum()
 }
 
 #[tokio::test]
@@ -222,6 +271,99 @@ async fn test_references_roundtrip_and_delete_by_file() {
 }
 
 #[tokio::test]
+async fn reference_name_query_and_statistics_share_persisted_rows() {
+    let (_dir, store) = make_store().await;
+    let target = make_def("Write", "src/api.rs", 1, 3, SymbolKind::Function);
+    let target_id = target.to_storage_id();
+    let mut call = make_call_ref(&target_id, "src/main.rs", 5);
+    call.target_name = "Write".to_string();
+    let mut comment = call.clone();
+    comment.start_line = 6;
+    comment.end_line = 6;
+    comment.location_id = crate::relations::SourceLocation {
+        project_id: "proj".to_string(),
+        file_path: "src/main.rs".to_string(),
+        start_line: 6,
+        start_col: 4,
+        end_line: 6,
+        end_col: 9,
+        role: crate::relations::LocationRole::Reference,
+    }
+    .to_storage_id();
+    comment.reference_kind = ReferenceKind::Comment;
+    comment.resolution_status = crate::relations::ResolutionStatus::Unresolved;
+    comment.evidence_kind = crate::relations::EvidenceKind::Heuristic;
+    comment.target_symbol_id.clear();
+
+    store
+        .store_references(vec![call, comment], "/test")
+        .await
+        .unwrap();
+    let matches = store
+        .find_references_by_name_in_root("Write", "/test")
+        .await
+        .unwrap();
+    let at_call = store
+        .find_reference_at_in_root("src/main.rs", "/test", 5, 5)
+        .await
+        .unwrap()
+        .unwrap();
+    let stats = store.get_stats().await.unwrap();
+    assert_eq!(matches.len(), 2);
+    assert_eq!(at_call.target_symbol_id, target_id);
+    assert_eq!(stats.reference_count, 2);
+    assert_eq!(stats.code_reference_count, 1);
+}
+
+#[tokio::test]
+#[ignore = "manual synthetic M2 latency/index-size measurement"]
+async fn benchmark_m2_relations_store() {
+    let (dir, store) = make_store().await;
+    let definitions: Vec<_> = (0..500)
+        .map(|index| {
+            make_def(
+                &format!("symbol_{index}"),
+                &format!("src/file_{}.rs", index / 10),
+                index + 1,
+                index + 2,
+                SymbolKind::Function,
+            )
+        })
+        .collect();
+    let symbol_ids: Vec<_> = definitions.iter().map(Definition::to_storage_id).collect();
+    let references: Vec<_> = (0..2_000)
+        .map(|index| {
+            let mut reference = make_call_ref(
+                &symbol_ids[index % symbol_ids.len()],
+                &format!("src/caller_{}.rs", index / 20),
+                index + 1,
+            );
+            reference.target_name = format!("symbol_{}", index % symbol_ids.len());
+            reference.location_id = format!("loc:v3:benchmark:{index}");
+            reference
+        })
+        .collect();
+
+    let write_started = std::time::Instant::now();
+    store.store_definitions(definitions, "/test").await.unwrap();
+    store.store_references(references, "/test").await.unwrap();
+    let write_elapsed = write_started.elapsed();
+    let query_started = std::time::Instant::now();
+    let matches = store
+        .find_references_by_name_in_root("symbol_42", "/test")
+        .await
+        .unwrap();
+    let query_elapsed = query_started.elapsed();
+    println!(
+        "m2 synthetic: write_500_defs_2000_refs_ms={} query_matches={} query_ms={} db_bytes={}",
+        write_elapsed.as_millis(),
+        matches.len(),
+        query_elapsed.as_millis(),
+        directory_size(dir.path())
+    );
+}
+
+#[tokio::test]
 async fn test_callers_and_callees() {
     let (_dir, store) = make_store().await;
 
@@ -235,10 +377,9 @@ async fn test_callers_and_callees() {
         .store_definitions(vec![greet, main_fn], "/test")
         .await
         .unwrap();
-    store
-        .store_references(vec![make_call_ref(&greet_id, "src/main.rs", 5)], "/test")
-        .await
-        .unwrap();
+    let mut call = make_call_ref(&greet_id, "src/main.rs", 5);
+    call.source_symbol_id = Some(main_id.clone());
+    store.store_references(vec![call], "/test").await.unwrap();
 
     let callers = store.get_callers(&greet_id).await.unwrap();
     assert_eq!(callers.len(), 1);

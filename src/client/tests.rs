@@ -1432,27 +1432,14 @@ async fn test_index_lock_can_reacquire_after_drop_without_release() {
 
 #[test]
 fn callee_fix_definition_storage_id_parsing() {
-    // Reference::target_symbol_id holds a DEFINITION id -- `def:<file>:<name>:<line>`
-    // (Definition::to_storage_id) -- NOT a SymbolId id, which is
-    // `<file>:<name>:<line>:<col>`. Callees stayed empty because the name was parsed
-    // with the wrong layout. Fields are taken from the right so a Windows drive-letter
-    // colon in the path cannot shift them.
+    // Reference::target_symbol_id holds a logical `sym:v3:<digest>:<name>` id.
     use crate::relations::Definition;
 
-    let plain = "def:Unit1.cpp:WndProc:16359";
+    let plain = "sym:v3:0123456789abcdef:WndProc";
     assert_eq!(Definition::name_from_storage_id(plain), Some("WndProc"));
-
-    let drive = r"def:D:\Work\nft\PPSKiosk\Unit1.cpp:WndProc:16359";
-    assert_eq!(Definition::name_from_storage_id(drive), Some("WndProc"));
-
-    // The SymbolId parser cannot read this layout -- it expects a trailing column and
-    // would try to parse the name as a line number. This is the original defect.
-    assert!(
-        crate::relations::SymbolId::from_storage_id(plain)
-            .map(|s| s.name)
-            .as_deref()
-            != Some("WndProc"),
-        "the SymbolId parser must not be used for Definition ids"
+    assert_eq!(
+        crate::relations::SymbolId::from_storage_id(plain).map(|s| s.name),
+        Some("WndProc".to_string())
     );
 
     // Malformed input is rejected rather than guessed at.
@@ -1460,7 +1447,7 @@ fn callee_fix_definition_storage_id_parsing() {
         Definition::name_from_storage_id("Unit1.cpp:WndProc:16359"),
         None
     );
-    assert_eq!(Definition::name_from_storage_id("def:nocolons"), None);
+    assert_eq!(Definition::name_from_storage_id("sym:v2:nocolons"), None);
 }
 
 #[test]
@@ -1488,6 +1475,28 @@ fn callee_fix_call_identifiers_in_span() {
     let tail = RagClient::call_identifiers_in_span(src, 7, 7);
     assert!(tail.contains(&"NotInSpan".to_string()));
     assert!(!tail.contains(&"EnterServiceMenu".to_string()));
+}
+
+#[test]
+fn unresolved_identifier_does_not_resolve_to_enclosing_function() {
+    use crate::relations::RelationsProvider;
+
+    let source = "fn owner() {\n    unknown_call();\n}\n";
+    let info = crate::indexer::FileInfo {
+        path: std::path::PathBuf::from("src/lib.rs"),
+        relative_path: "src/lib.rs".to_string(),
+        root_path: "/project".to_string(),
+        project: Some("stable-project".to_string()),
+        extension: Some("rs".to_string()),
+        language: Some("Rust".to_string()),
+        content: source.to_string(),
+        hash: "hash".to_string(),
+    };
+    let provider = crate::relations::HybridRelationsProvider::new(false).unwrap();
+    let definitions = provider.extract_definitions(&info).unwrap();
+    let column = source.lines().nth(1).unwrap().find("unknown_call").unwrap();
+    let resolved = RagClient::resolve_symbol_at(&definitions, source, 2, column, false);
+    assert!(resolved.is_none());
 }
 
 /// Smoke test for list_symbols against a real source tree.

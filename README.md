@@ -161,11 +161,17 @@ Normal retrieval never searches Git history implicitly. History results expose v
    - Returns definition location with symbol metadata
    - Uses hybrid approach: high-precision stack-graphs (Python, TypeScript, Java, Ruby) or AST-based RepoMap fallback
    - Reports precision level of results
+   - Reports explicit resolution/evidence and candidates; unresolved references never fall back to the enclosing function
 
 8. **find_references** - Find all references to a symbol
    - Specify file path, line number, and column
-   - Returns all locations where the symbol is used
-   - Categorizes reference types: Call, Read, Write, Import, TypeReference, Inheritance, Instantiation
+   - Uses the persisted reference store shared with statistics and graph tools
+   - Separates logical `symbol_id` from declaration/definition/reference `location_id`
+   - Categorizes definitions, declarations, calls, reads, writes, imports/includes, type uses, documentation, comments, and strings
+   - Exposes independent `resolution_status` and `evidence_kind` fields plus candidate sets
+   - Supports language, canonical path, reference-kind, resolution, and evidence filters
+   - Excludes documentation, comments, and strings by default
+   - Reports exact pre-pagination totals and continuation offsets
    - Optional: include definition site in results
 
 9. **get_call_graph** - Get call graph for a function
@@ -493,7 +499,10 @@ Project RAG provides code navigation capabilities similar to a Language Server P
 
 **Find References** (`find_references`):
 - Find all locations where a symbol is used across the codebase
-- Categorizes reference types: Call, Read, Write, Import, TypeReference, Inheritance, Instantiation
+- Reads the same persisted, classified reference rows used for relation statistics
+- Categorizes executable references separately from documentation, comments, and strings
+- Never turns a highest-ranked name match into a resolved edge without parser/resolver evidence
+- Returns `resolved`, `ambiguous`, or `unresolved` independently from `semantic`, `syntactic`, or `heuristic` evidence
 - Useful for understanding how code is connected
 - Option to include/exclude the definition site
 

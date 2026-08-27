@@ -1,7 +1,7 @@
 //! LanceDB-based storage for code relationships.
 //!
-//! Definitions and references live in two schema-v2 tables
-//! (`relations_definitions_v2`, `relations_references_v2`) inside the same LanceDB directory as the embeddings
+//! Definitions and references live in two schema-v3 tables
+//! (`relations_definitions_v3`, `relations_references_v3`) inside the same LanceDB directory as the embeddings
 //! table, so one database directory holds everything the index knows.
 //!
 //! Writes are idempotent per file: storing rows for a file first deletes
@@ -10,22 +10,22 @@
 mod codec;
 
 use anyhow::{Context, Result};
-use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use futures::stream::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::{RelationsStats, RelationsStore};
-use crate::relations::types::{CallEdge, Definition, Reference, ReferenceKind, SymbolKind};
+use crate::relations::types::{CallEdge, Definition, Reference, ReferenceKind, ResolutionStatus};
 
-const DEFINITIONS_TABLE: &str = "relations_definitions_v2";
-const REFERENCES_TABLE: &str = "relations_references_v2";
+const DEFINITIONS_TABLE: &str = "relations_definitions_v3";
+const REFERENCES_TABLE: &str = "relations_references_v3";
 
 /// Delete filters are built as `file_path IN (...)`; chunked so a large batch
 /// of files cannot produce an absurdly long filter string.
@@ -148,18 +148,6 @@ impl LanceRelationsStore {
         }
         Ok(())
     }
-
-    /// The innermost function or method in `definitions` whose span contains `line`.
-    fn enclosing_function(definitions: &[Definition], line: usize) -> Option<&Definition> {
-        definitions
-            .iter()
-            .filter(|d| {
-                matches!(d.symbol_id.kind, SymbolKind::Function | SymbolKind::Method)
-                    && line >= d.symbol_id.start_line
-                    && line <= d.end_line
-            })
-            .min_by_key(|d| d.end_line.saturating_sub(d.symbol_id.start_line))
-    }
 }
 
 #[async_trait]
@@ -279,6 +267,49 @@ impl RelationsStore for LanceRelationsStore {
         self.query_definitions(&filter).await
     }
 
+    async fn find_definitions_by_symbol_id_in_root(
+        &self,
+        symbol_id: &str,
+        root_path: &str,
+    ) -> Result<Vec<Definition>> {
+        let filter = format!(
+            "id = '{}' AND root_path = '{}'",
+            codec::escape_sql(symbol_id),
+            codec::escape_sql(root_path)
+        );
+        self.query_definitions(&filter).await
+    }
+
+    async fn find_reference_at_in_root(
+        &self,
+        file_path: &str,
+        root_path: &str,
+        line: usize,
+        column: usize,
+    ) -> Result<Option<Reference>> {
+        let filter = format!(
+            "file_path = '{}' AND root_path = '{}' AND start_line <= {} AND end_line >= {}",
+            codec::escape_sql(file_path),
+            codec::escape_sql(root_path),
+            line,
+            line
+        );
+        let matches = self.query_references(&filter).await?;
+        Ok(matches
+            .into_iter()
+            .filter(|reference| {
+                reference.start_line < line
+                    || reference.end_line > line
+                    || (column >= reference.start_col && column <= reference.end_col)
+            })
+            .min_by_key(|reference| {
+                (
+                    reference.end_line.saturating_sub(reference.start_line),
+                    reference.end_col.saturating_sub(reference.start_col),
+                )
+            }))
+    }
+
     async fn find_references(&self, target_symbol_id: &str) -> Result<Vec<Reference>> {
         let filter = format!(
             "target_symbol_id = '{}'",
@@ -287,71 +318,59 @@ impl RelationsStore for LanceRelationsStore {
         self.query_references(&filter).await
     }
 
+    async fn find_references_by_name_in_root(
+        &self,
+        symbol_name: &str,
+        root_path: &str,
+    ) -> Result<Vec<Reference>> {
+        let filter = format!(
+            "target_name = '{}' AND root_path = '{}'",
+            codec::escape_sql(symbol_name),
+            codec::escape_sql(root_path)
+        );
+        self.query_references(&filter).await
+    }
+
     async fn get_callers(&self, symbol_id: &str) -> Result<Vec<CallEdge>> {
         let filter = format!(
-            "target_symbol_id = '{}' AND reference_kind = '{}'",
+            "target_symbol_id = '{}' AND reference_kind = '{}' AND resolution_status = '{}'",
             codec::escape_sql(symbol_id),
-            codec::enum_to_str(&ReferenceKind::Call)
+            codec::enum_to_str(&ReferenceKind::Call),
+            codec::enum_to_str(&ResolutionStatus::Resolved)
         );
         let call_refs = self.query_references(&filter).await?;
         if call_refs.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Attribute each call site to the innermost function containing it in
-        // the file where the call occurs.
-        let files: Vec<String> = call_refs
-            .iter()
-            .map(|r| r.file_path.clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let defs_filter = format!("file_path IN ({})", codec::sql_in_list(&files));
-        let defs = self.query_definitions(&defs_filter).await?;
-
-        let mut defs_by_file: HashMap<&str, Vec<Definition>> = HashMap::new();
-        for def in &defs {
-            defs_by_file
-                .entry(def.file_path())
-                .or_default()
-                .push(def.clone());
-        }
-
         let mut seen = HashSet::new();
         let mut edges = Vec::new();
         for r in &call_refs {
-            let enclosing = defs_by_file
-                .get(r.file_path.as_str())
-                .and_then(|file_defs| Self::enclosing_function(file_defs, r.start_line));
-            if let Some(def) = enclosing {
-                let caller_id = def.to_storage_id();
-                if seen.insert((caller_id.clone(), r.start_line)) {
-                    edges.push(CallEdge {
-                        caller_id,
-                        callee_id: symbol_id.to_string(),
-                        call_site_file: r.file_path.clone(),
-                        call_site_line: r.start_line,
-                        call_site_col: r.start_col,
-                    });
-                }
+            if let Some(caller_id) = r.source_symbol_id.clone()
+                && seen.insert((caller_id.clone(), r.start_line))
+            {
+                edges.push(CallEdge {
+                    caller_id,
+                    callee_id: symbol_id.to_string(),
+                    call_site_file: r.file_path.clone(),
+                    call_site_line: r.start_line,
+                    call_site_col: r.start_col,
+                    reference_kind: r.reference_kind,
+                    resolution_status: r.resolution_status,
+                    evidence_kind: r.evidence_kind,
+                    parser: r.parser.clone(),
+                });
             }
         }
         Ok(edges)
     }
 
     async fn get_callees(&self, symbol_id: &str) -> Result<Vec<CallEdge>> {
-        let filter = format!("id = '{}'", codec::escape_sql(symbol_id));
-        let defs = self.query_definitions(&filter).await?;
-        let Some(def) = defs.first() else {
-            return Ok(Vec::new());
-        };
-
         let refs_filter = format!(
-            "file_path = '{}' AND reference_kind = '{}' AND start_line >= {} AND start_line <= {}",
-            codec::escape_sql(def.file_path()),
+            "source_symbol_id = '{}' AND reference_kind = '{}' AND resolution_status = '{}'",
+            codec::escape_sql(symbol_id),
             codec::enum_to_str(&ReferenceKind::Call),
-            def.start_line(),
-            def.end_line
+            codec::enum_to_str(&ResolutionStatus::Resolved)
         );
         let call_refs = self.query_references(&refs_filter).await?;
 
@@ -365,6 +384,10 @@ impl RelationsStore for LanceRelationsStore {
                 call_site_file: r.file_path,
                 call_site_line: r.start_line,
                 call_site_col: r.start_col,
+                reference_kind: r.reference_kind,
+                resolution_status: r.resolution_status,
+                evidence_kind: r.evidence_kind,
+                parser: r.parser,
             })
             .collect())
     }
@@ -429,6 +452,29 @@ impl RelationsStore for LanceRelationsStore {
         Ok(removed)
     }
 
+    async fn delete_by_root(&self, root_path: &str) -> Result<usize> {
+        let filter = format!("root_path = '{}'", codec::escape_sql(root_path));
+        let defs_table = self.definitions_table().await?;
+        let refs_table = self.references_table().await?;
+        let removed = defs_table
+            .count_rows(Some(filter.clone()))
+            .await
+            .unwrap_or(0)
+            + refs_table
+                .count_rows(Some(filter.clone()))
+                .await
+                .unwrap_or(0);
+        defs_table
+            .delete(&filter)
+            .await
+            .context("Failed to delete definitions by root")?;
+        refs_table
+            .delete(&filter)
+            .await
+            .context("Failed to delete references by root")?;
+        Ok(removed)
+    }
+
     async fn clear(&self) -> Result<()> {
         let db = self.get_connection().await?;
         for name in [DEFINITIONS_TABLE, REFERENCES_TABLE] {
@@ -452,12 +498,18 @@ impl RelationsStore for LanceRelationsStore {
             .count_rows(None)
             .await
             .context("Failed to count references")?;
+        let all_references = self.query_references("id IS NOT NULL").await?;
+        let code_reference_count = all_references
+            .iter()
+            .filter(|reference| reference.reference_kind.is_code())
+            .count();
 
         // Distinct files with definitions.
         let stream = defs_table
             .query()
             .select(lancedb::query::Select::Columns(vec![
                 "file_path".to_string(),
+                "root_path".to_string(),
             ]))
             .execute()
             .await
@@ -473,8 +525,15 @@ impl RelationsStore for LanceRelationsStore {
                 .column_by_name("file_path")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>())
             {
+                let roots = batch
+                    .column_by_name("root_path")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
                 for i in 0..batch.num_rows() {
-                    files.insert(paths.value(i).to_string());
+                    let root = roots
+                        .filter(|array| !array.is_null(i))
+                        .map(|array| array.value(i))
+                        .unwrap_or("");
+                    files.insert((root.to_string(), paths.value(i).to_string()));
                 }
             }
         }
@@ -482,6 +541,7 @@ impl RelationsStore for LanceRelationsStore {
         Ok(RelationsStats {
             definition_count,
             reference_count,
+            code_reference_count,
             files_with_definitions: files.len(),
         })
     }

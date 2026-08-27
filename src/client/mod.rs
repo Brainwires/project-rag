@@ -368,7 +368,14 @@ impl RagClient {
         let (resolved, root) = self
             .resolve_project_path(file_path, project.as_deref(), false)
             .await?;
-        Self::build_file_info_in_root(&resolved.absolute, &root, project)
+        let project_id = self
+            .hash_cache
+            .read()
+            .await
+            .project_id(&root)
+            .map(str::to_string)
+            .or(project);
+        Self::build_file_info_in_root(&resolved.absolute, &root, project_id)
     }
 
     /// Associated form used inside blocking analysis closures when the explicit
@@ -860,6 +867,7 @@ impl RagClient {
             language_breakdown,
             total_definitions: relations_stats.definition_count,
             total_references: relations_stats.reference_count,
+            code_reference_count: relations_stats.code_reference_count,
             files_with_definitions: relations_stats.files_with_definitions,
             index_schema_version: crate::cache::INDEX_SCHEMA_VERSION,
             invalid_history_records: git_cache.invalid_records,
@@ -1062,7 +1070,10 @@ impl RagClient {
             !callable_only
                 || matches!(
                     def.symbol_id.kind,
-                    crate::relations::SymbolKind::Function | crate::relations::SymbolKind::Method
+                    crate::relations::SymbolKind::Function
+                        | crate::relations::SymbolKind::Method
+                        | crate::relations::SymbolKind::Constructor
+                        | crate::relations::SymbolKind::Destructor
                 )
         };
 
@@ -1079,9 +1090,10 @@ impl RagClient {
                         d.end_line.saturating_sub(d.symbol_id.start_line),
                     )
                 });
-            if exact.is_some() {
-                return exact;
-            }
+            // An identifier which has no definition in this file is a reference
+            // candidate, not permission to return its enclosing function as the
+            // identifier's definition.
+            return exact;
         }
 
         definitions
@@ -1092,11 +1104,8 @@ impl RagClient {
 
     /// Files that plausibly mention `symbol`, newest-ranked first.
     ///
-    /// References live wherever the identifier appears, which is generally NOT the file
-    /// that defines it -- the previous implementation only ever scanned the definition's
-    /// own file, so any cross-file reference was invisible. Rather than parse the whole
-    /// corpus, shortlist with keyword search: a reference must contain the literal token,
-    /// so BM25 surfaces exactly the right files and tree-sitter only runs on those.
+    /// This remains a discovery-only helper for conservative unused analysis. It
+    /// must never be used to establish a resolved symbol edge.
     async fn files_mentioning(
         &self,
         symbol: &str,
@@ -1110,7 +1119,6 @@ impl RagClient {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("No embedding generated for symbol"))?;
-
         let results = self
             .vector_db
             .search(
@@ -1125,13 +1133,12 @@ impl RagClient {
             )
             .await
             .context("Failed to search for candidate files")?;
-
         let mut seen = std::collections::HashSet::new();
         let mut files = Vec::new();
-        for r in results {
-            let full = match &r.root_path {
-                Some(root) => std::path::Path::new(root).join(&r.file_path),
-                None => std::path::PathBuf::from(&r.file_path),
+        for result in results {
+            let full = match &result.root_path {
+                Some(root) => std::path::Path::new(root).join(&result.file_path),
+                None => std::path::PathBuf::from(&result.file_path),
             };
             if seen.insert(full.clone()) {
                 files.push(full);
@@ -1165,17 +1172,73 @@ impl RagClient {
             .context("Failed to extract definitions")?;
 
         // Find the definition at the requested position
-        let result = Self::resolve_symbol_at(
+        let local_definition = Self::resolve_symbol_at(
             &definitions,
             &file_info.content,
             request.line,
             request.column,
             false,
-        )
-        .map(DefinitionResult::from);
+        );
+        let (result, resolution_status, evidence_kind, candidates) = if let Some(definition) =
+            local_definition
+        {
+            (
+                Some(DefinitionResult::from(definition)),
+                crate::relations::ResolutionStatus::Resolved,
+                crate::relations::EvidenceKind::Syntactic,
+                vec![crate::relations::ReferenceCandidate {
+                    symbol_id: definition.to_storage_id(),
+                    reason: "cursor is on a parser-extracted declaration/definition".to_string(),
+                }],
+            )
+        } else if let Some(reference) = self
+            .relations_store
+            .find_reference_at_in_root(
+                &file_info.relative_path,
+                &file_info.root_path,
+                request.line,
+                request.column,
+            )
+            .await?
+        {
+            let resolved_definition = if reference.resolution_status
+                == crate::relations::ResolutionStatus::Resolved
+                && !reference.target_symbol_id.is_empty()
+            {
+                let mut locations = self
+                    .relations_store
+                    .find_definitions_by_symbol_id_in_root(
+                        &reference.target_symbol_id,
+                        &file_info.root_path,
+                    )
+                    .await?;
+                locations.sort_by_key(|definition| {
+                    definition.location.role != crate::relations::LocationRole::Definition
+                });
+                locations.first().map(DefinitionResult::from)
+            } else {
+                None
+            };
+            (
+                resolved_definition,
+                reference.resolution_status,
+                reference.evidence_kind,
+                reference.candidates,
+            )
+        } else {
+            (
+                None,
+                crate::relations::ResolutionStatus::Unresolved,
+                crate::relations::EvidenceKind::Heuristic,
+                Vec::new(),
+            )
+        };
 
         Ok(FindDefinitionResponse {
             definition: result,
+            resolution_status,
+            evidence_kind,
+            candidates,
             precision: format!("{:?}", precision).to_lowercase(),
             duration_ms: start.elapsed().as_millis() as u64,
         })
@@ -1218,114 +1281,189 @@ impl RagClient {
             .context("Failed to extract definitions")?;
 
         // Find the symbol at the requested position
-        let target_symbol = Self::resolve_symbol_at(
+        let mut target_symbol = Self::resolve_symbol_at(
             &definitions,
             &file_info.content,
             request.line,
             request.column,
             false,
-        );
+        )
+        .cloned();
+        let mut target_resolution_status = crate::relations::ResolutionStatus::Resolved;
+        let mut target_evidence_kind = crate::relations::EvidenceKind::Syntactic;
+        let mut occurrence_name = None;
+        let mut target_candidates = target_symbol
+            .as_ref()
+            .map(|definition| {
+                vec![crate::relations::ReferenceCandidate {
+                    symbol_id: definition.to_storage_id(),
+                    reason: "cursor is on a parser-extracted declaration/definition".to_string(),
+                }]
+            })
+            .unwrap_or_default();
 
-        let symbol_name = target_symbol.map(|def| def.symbol_id.name.clone());
+        if target_symbol.is_none()
+            && let Some(reference) = self
+                .relations_store
+                .find_reference_at_in_root(
+                    &file_info.relative_path,
+                    &file_info.root_path,
+                    request.line,
+                    request.column,
+                )
+                .await?
+        {
+            occurrence_name = Some(reference.target_name.clone());
+            target_resolution_status = reference.resolution_status;
+            target_evidence_kind = reference.evidence_kind;
+            target_candidates = reference.candidates.clone();
+            if reference.resolution_status == crate::relations::ResolutionStatus::Resolved
+                && !reference.target_symbol_id.is_empty()
+            {
+                target_symbol = self
+                    .relations_store
+                    .find_definitions_by_symbol_id_in_root(
+                        &reference.target_symbol_id,
+                        &file_info.root_path,
+                    )
+                    .await?
+                    .into_iter()
+                    .next();
+            }
+        }
+
+        let symbol_name = target_symbol
+            .as_ref()
+            .map(|def| def.symbol_id.name.clone())
+            .or(occurrence_name);
 
         // If no symbol found at position, return empty result
-        if symbol_name.is_none() {
+        if target_symbol.is_none() {
             return Ok(FindReferencesResponse {
-                symbol_name: None,
+                symbol_name,
+                target_resolution_status,
+                target_evidence_kind,
+                target_candidates,
                 references: Vec::new(),
                 total_count: 0,
+                total_matches: 0,
+                returned_matches: 0,
+                results_truncated: false,
+                next_cursor: None,
+                statistics: ReferenceStatistics {
+                    code_reference_count: 0,
+                    resolved_count: 0,
+                    ambiguous_count: 0,
+                    unresolved_count: 0,
+                },
                 precision: format!("{:?}", precision).to_lowercase(),
                 duration_ms: start.elapsed().as_millis() as u64,
             });
         }
 
         let symbol_name_str = symbol_name.clone().unwrap();
-
-        // Index ONLY the target symbol. ReferenceFinder matches identifiers against this
-        // map, so restricting it keeps the scan of other files cheap and on-topic.
-        let target_defs: Vec<crate::relations::Definition> = definitions
-            .iter()
-            .filter(|d| d.symbol_id.name == symbol_name_str)
-            .cloned()
-            .collect();
-        let mut symbol_index: std::collections::HashMap<String, Vec<crate::relations::Definition>> =
-            std::collections::HashMap::new();
-        if !target_defs.is_empty() {
-            symbol_index.insert(symbol_name_str.clone(), target_defs);
-        }
-
-        // Scan the defining file plus every other file the index says mentions the symbol.
-        // Searching only the defining file is why this returned nothing for anything called
-        // from elsewhere, which is the normal case for a public API.
-        let mut scan_targets: Vec<std::path::PathBuf> = vec![file_info.path.clone()];
-        match self
-            .files_mentioning(
-                &symbol_name_str,
-                request.project.clone(),
-                request.limit.max(20),
+        let target_id = target_symbol.expect("checked above").to_storage_id();
+        let path_filter = if let Some(path) = request.path_filter.as_deref() {
+            Some(
+                crate::project_path::ProjectPathResolver::new(&file_info.root_path)?
+                    .resolve_existing(path)?
+                    .relative,
             )
+        } else {
+            None
+        };
+        let mut persisted = self
+            .relations_store
+            .find_references_by_name_in_root(&symbol_name_str, &file_info.root_path)
             .await
-        {
-            Ok(found) => {
-                for f in found {
-                    if !scan_targets.iter().any(|p| p == &f) {
-                        scan_targets.push(f);
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(
-                "Candidate lookup failed, scanning defining file only: {}",
-                e
-            ),
-        }
-
-        let mut matching_refs: Vec<ReferenceResult> = Vec::new();
-        for target in &scan_targets {
-            if matching_refs.len() >= request.limit {
-                break;
-            }
-            let scan_info = if target == &file_info.path {
-                file_info.clone()
+            .context("Failed to query persisted reference source of truth")?;
+        persisted.retain(|reference| {
+            let points_to_target = reference.target_symbol_id == target_id
+                || reference
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.symbol_id == target_id);
+            let definition_allowed = request.include_definition
+                || !matches!(
+                    reference.reference_kind,
+                    crate::relations::ReferenceKind::Definition
+                        | crate::relations::ReferenceKind::Declaration
+                );
+            let kind_allowed = if request.reference_kinds.is_empty() {
+                request.include_non_code || reference.reference_kind.is_code()
             } else {
-                match self
-                    .create_file_info(&target.to_string_lossy(), request.project.clone())
-                    .await
-                {
-                    Ok(fi) => fi,
-                    Err(e) => {
-                        tracing::debug!("Skipping unreadable candidate {:?}: {}", target, e);
-                        continue;
-                    }
-                }
+                request.reference_kinds.contains(&reference.reference_kind)
             };
+            let language_allowed = request
+                .language
+                .as_ref()
+                .is_none_or(|wanted| reference.language.eq_ignore_ascii_case(wanted));
+            let path_allowed = path_filter
+                .as_ref()
+                .is_none_or(|wanted| &reference.file_path == wanted);
+            let resolution_allowed = request.resolution_statuses.is_empty()
+                || request
+                    .resolution_statuses
+                    .contains(&reference.resolution_status);
+            let evidence_allowed = request.evidence_kinds.is_empty()
+                || request.evidence_kinds.contains(&reference.evidence_kind);
+            points_to_target
+                && definition_allowed
+                && kind_allowed
+                && language_allowed
+                && path_allowed
+                && resolution_allowed
+                && evidence_allowed
+        });
+        persisted.sort_by(|a, b| {
+            (&a.file_path, a.start_line, a.start_col, &a.location_id).cmp(&(
+                &b.file_path,
+                b.start_line,
+                b.start_col,
+                &b.location_id,
+            ))
+        });
 
-            let references = match self
-                .relations_provider
-                .extract_references(&scan_info, &symbol_index)
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!("Reference extraction failed for {:?}: {}", target, e);
-                    continue;
-                }
-            };
-
-            for r in references.iter() {
-                if matching_refs.len() >= request.limit {
-                    break;
-                }
-                if r.target_symbol_id.contains(&symbol_name_str) {
-                    matching_refs.push(ReferenceResult::from(r));
-                }
-            }
-        }
-
-        let total_count = matching_refs.len();
+        let total_matches = persisted.len();
+        let resolved_count = persisted
+            .iter()
+            .filter(|r| r.resolution_status == crate::relations::ResolutionStatus::Resolved)
+            .count();
+        let ambiguous_count = persisted
+            .iter()
+            .filter(|r| r.resolution_status == crate::relations::ResolutionStatus::Ambiguous)
+            .count();
+        let unresolved_count = persisted
+            .iter()
+            .filter(|r| r.resolution_status == crate::relations::ResolutionStatus::Unresolved)
+            .count();
+        let page: Vec<_> = persisted
+            .iter()
+            .skip(request.cursor)
+            .take(request.limit)
+            .map(ReferenceResult::from)
+            .collect();
+        let returned_matches = page.len();
+        let next_offset = request.cursor.saturating_add(returned_matches);
+        let next_cursor = (next_offset < total_matches).then_some(next_offset);
 
         Ok(FindReferencesResponse {
             symbol_name,
-            references: matching_refs,
-            total_count,
+            target_resolution_status,
+            target_evidence_kind,
+            target_candidates,
+            references: page,
+            total_count: total_matches,
+            total_matches,
+            returned_matches,
+            results_truncated: next_cursor.is_some(),
+            next_cursor,
+            statistics: ReferenceStatistics {
+                code_reference_count: total_matches,
+                resolved_count,
+                ambiguous_count,
+                unresolved_count,
+            },
             precision: format!("{:?}", precision).to_lowercase(),
             duration_ms: start.elapsed().as_millis() as u64,
         })
@@ -1334,6 +1472,7 @@ impl RagClient {
     /// Control-flow and cast keywords that are followed by a parenthesis but are not
     /// calls. Without this, `if (` is reported as a callee whenever some file happens
     /// to carry a bogus definition of that name.
+    #[cfg(test)]
     fn is_call_like_keyword(name: &str) -> bool {
         matches!(
             name,
@@ -1360,6 +1499,7 @@ impl RagClient {
     ///
     /// Used to widen the callee symbol index beyond the defining file. Deliberately
     /// crude: over-reporting costs one extra lookup, under-reporting loses a callee.
+    #[cfg(test)]
     fn call_identifiers_in_span(content: &str, start_line: usize, end_line: usize) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -1445,12 +1585,17 @@ impl RagClient {
         // If no function found at position, return empty result
         let root_symbol = match target_function {
             Some(func) => crate::relations::SymbolInfo {
+                symbol_id: func.to_storage_id(),
+                location_id: func.location.to_storage_id(),
                 name: func.symbol_id.name.clone(),
-                kind: func.symbol_id.kind.clone(),
+                qualified_name: func.symbol_id.qualified_name.clone(),
+                kind: func.symbol_id.kind,
                 file_path: request.file_path.clone(),
                 start_line: func.symbol_id.start_line,
                 end_line: func.end_line,
                 signature: func.signature.clone(),
+                language: func.symbol_id.language.clone(),
+                location_role: func.location.role,
             },
             None => {
                 return Ok(GetCallGraphResponse {
@@ -1463,232 +1608,55 @@ impl RagClient {
             }
         };
 
-        let function_name = root_symbol.name.clone();
-
-        // Build symbol index from definitions
-        let mut symbol_index: std::collections::HashMap<String, Vec<crate::relations::Definition>> =
-            std::collections::HashMap::new();
-        for def in &definitions {
-            symbol_index
-                .entry(def.symbol_id.name.clone())
-                .or_default()
-                .push(def.clone());
-        }
-
-        // References in this file, used for the callee side.
-        //
-        // The index handed to extract_references decides what is even visible: a
-        // reference is emitted only when its identifier is a key in that map. Building
-        // it from this file alone therefore drops every callee defined in another
-        // translation unit, and TForm1 alone is spread over five .cpp files. So widen
-        // it first with definitions of the names actually called inside the target
-        // span. Bounded on both axes so a large function cannot fan out forever.
-        const MAX_CALLEE_PROBES: usize = 40;
-        const FILES_PER_NAME: usize = 5;
-
-        let mut callee_index = symbol_index.clone();
-        let mut probed_files: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::from([file_info.path.clone()]);
-
-        let called_names = Self::call_identifiers_in_span(
-            &file_info.content,
-            root_symbol.start_line,
-            root_symbol.end_line,
-        );
-
-        for name in called_names
-            .iter()
-            .filter(|n| !symbol_index.contains_key(*n))
-            .take(MAX_CALLEE_PROBES)
-        {
-            let candidates = match self
-                .files_mentioning(name, request.project.clone(), FILES_PER_NAME)
-                .await
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::debug!("Callee candidate lookup failed for {}: {}", name, e);
-                    continue;
-                }
-            };
-            for f in candidates {
-                if !probed_files.insert(f.clone()) {
-                    continue;
-                }
-                let fi = match self
-                    .create_file_info(&f.to_string_lossy(), request.project.clone())
-                    .await
-                {
-                    Ok(fi) => fi,
-                    Err(e) => {
-                        tracing::debug!("Skipping unreadable callee candidate {:?}: {}", f, e);
-                        continue;
-                    }
-                };
-                match self.relations_provider.extract_definitions(&fi) {
-                    Ok(defs) => {
-                        for d in defs {
-                            callee_index
-                                .entry(d.symbol_id.name.clone())
-                                .or_default()
-                                .push(d);
-                        }
-                    }
-                    Err(e) => tracing::debug!("Definition extraction failed for {:?}: {}", f, e),
-                }
-            }
-        }
-
-        let references = self
-            .relations_provider
-            .extract_references(&file_info, &callee_index)
-            .context("Failed to extract references")?;
-
-        // Callers can live anywhere, so scan the defining file plus every file the index
-        // says mentions the function. Restricting this to the defining file is why the
-        // caller list came back empty for anything with an external call site.
-        let caller_index: std::collections::HashMap<String, Vec<crate::relations::Definition>> =
-            std::collections::HashMap::from([(
-                function_name.clone(),
-                definitions
-                    .iter()
-                    .filter(|d| d.symbol_id.name == function_name)
-                    .cloned()
-                    .collect(),
-            )]);
-
-        let mut scan_targets: Vec<std::path::PathBuf> = vec![file_info.path.clone()];
-        match self
-            .files_mentioning(&function_name, request.project.clone(), 20)
-            .await
-        {
-            Ok(found) => {
-                for f in found {
-                    if !scan_targets.iter().any(|p| p == &f) {
-                        scan_targets.push(f);
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(
-                "Candidate lookup failed, scanning defining file only: {}",
-                e
-            ),
-        }
-
-        let mut seen_callers = std::collections::HashSet::new();
-        let mut callers: Vec<crate::relations::CallGraphNode> = Vec::new();
-
-        for target in &scan_targets {
-            let (scan_info, scan_defs) = if target == &file_info.path {
-                (file_info.clone(), definitions.clone())
-            } else {
-                match self
-                    .create_file_info(&target.to_string_lossy(), request.project.clone())
-                    .await
-                {
-                    Ok(fi) => {
-                        let defs = self
-                            .relations_provider
-                            .extract_definitions(&fi)
-                            .unwrap_or_default();
-                        (fi, defs)
-                    }
-                    Err(e) => {
-                        tracing::debug!("Skipping unreadable candidate {:?}: {}", target, e);
-                        continue;
-                    }
-                }
-            };
-
-            let refs = match self
-                .relations_provider
-                .extract_references(&scan_info, &caller_index)
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!("Reference extraction failed for {:?}: {}", target, e);
-                    continue;
-                }
-            };
-
-            for r in refs.iter().filter(|r| {
-                r.reference_kind == crate::relations::ReferenceKind::Call
-                    && r.target_symbol_id.contains(&function_name)
-            }) {
-                // Attribute the call to the innermost function containing it, in the file
-                // the call was actually found in.
-                let enclosing = scan_defs
-                    .iter()
-                    .filter(|def| {
-                        matches!(
-                            def.symbol_id.kind,
-                            crate::relations::SymbolKind::Function
-                                | crate::relations::SymbolKind::Method
-                        ) && r.start_line >= def.symbol_id.start_line
-                            && r.start_line <= def.end_line
-                    })
-                    .min_by_key(|def| def.end_line.saturating_sub(def.symbol_id.start_line));
-
-                if let Some(def) = enclosing
-                    && seen_callers
-                        .insert((scan_info.relative_path.clone(), def.symbol_id.name.clone()))
-                {
-                    callers.push(crate::relations::CallGraphNode {
-                        name: def.symbol_id.name.clone(),
-                        kind: def.symbol_id.kind.clone(),
-                        file_path: scan_info.relative_path.clone(),
-                        line: def.symbol_id.start_line,
-                        children: Vec::new(),
-                    });
-                }
-            }
-        }
-
-        // Find callees (calls made from within our function)
-        let target_func = target_function.unwrap();
-        let mut seen_callees = std::collections::HashSet::new();
-        let callees: Vec<crate::relations::CallGraphNode> = references
-            .iter()
-            .filter(|r| {
-                r.reference_kind == crate::relations::ReferenceKind::Call
-                    && r.start_line >= target_func.symbol_id.start_line
-                    && r.start_line <= target_func.end_line
-            })
-            .filter_map(|r| {
-                // Extract the called function name from target_symbol_id.
-                // target_symbol_id is a Definition id -- `def:<file>:<name>:<line>` --
-                // NOT a SymbolId id (`<file>:<name>:<line>:<col>`). Parsing it with the
-                // wrong layout, or with a forward split that yields the file path, is why
-                // callees were always empty and assumed unimplemented.
-                crate::relations::Definition::name_from_storage_id(&r.target_symbol_id)
-                    .map(|s| s.to_string())
-            })
-            .filter(|name| !Self::is_call_like_keyword(name))
-            .filter(|name| seen_callees.insert(name.clone()))
-            .filter_map(|name| {
-                // Resolve against the widened index so a callee defined in another
-                // translation unit still resolves to a definition. Skip past import
-                // bindings: the callee should be shown at its real definition, not at
-                // the `use`/`import` line that pulled it into this file.
-                callee_index
-                    .get(&name)
-                    .and_then(|defs| {
-                        defs.iter()
-                            .find(|d| d.symbol_id.kind != crate::relations::SymbolKind::Import)
-                            .or_else(|| defs.first())
-                    })
-                    .cloned()
-            })
-            .map(|def| crate::relations::CallGraphNode {
-                name: def.symbol_id.name.clone(),
-                kind: def.symbol_id.kind.clone(),
-                // The definition own file, not the requested one: a cross-TU callee
-                // does not live in request.file_path.
-                file_path: def.symbol_id.file_path.clone(),
-                line: def.symbol_id.start_line,
+        let target_symbol_id = root_symbol.symbol_id.clone();
+        let root_path = &file_info.root_path;
+        let to_node = |edge: &crate::relations::CallEdge,
+                       definition: &crate::relations::Definition| {
+            crate::relations::CallGraphNode {
+                name: definition.symbol_id.name.clone(),
+                kind: definition.symbol_id.kind,
+                file_path: definition.symbol_id.file_path.clone(),
+                line: definition.symbol_id.start_line,
+                call_site_file: edge.call_site_file.clone(),
+                call_site_line: edge.call_site_line,
+                call_site_col: edge.call_site_col,
+                reference_kind: edge.reference_kind,
+                resolution_status: edge.resolution_status,
+                evidence_kind: edge.evidence_kind,
+                parser: edge.parser.clone(),
                 children: Vec::new(),
-            })
-            .collect();
+            }
+        };
+
+        let mut callers = Vec::new();
+        if request.include_callers {
+            for edge in self.relations_store.get_callers(&target_symbol_id).await? {
+                if let Some(definition) = self
+                    .relations_store
+                    .find_definitions_by_symbol_id_in_root(&edge.caller_id, root_path)
+                    .await?
+                    .into_iter()
+                    .next()
+                {
+                    callers.push(to_node(&edge, &definition));
+                }
+            }
+        }
+
+        let mut callees = Vec::new();
+        if request.include_callees {
+            for edge in self.relations_store.get_callees(&target_symbol_id).await? {
+                if let Some(definition) = self
+                    .relations_store
+                    .find_definitions_by_symbol_id_in_root(&edge.callee_id, root_path)
+                    .await?
+                    .into_iter()
+                    .next()
+                {
+                    callees.push(to_node(&edge, &definition));
+                }
+            }
+        }
 
         Ok(GetCallGraphResponse {
             root_symbol: Some(root_symbol),
@@ -1730,12 +1698,17 @@ impl RagClient {
                     || wanted.contains(&format!("{:?}", d.symbol_id.kind).to_lowercase())
             })
             .map(|d| crate::relations::SymbolInfo {
+                symbol_id: d.to_storage_id(),
+                location_id: d.location.to_storage_id(),
                 name: d.symbol_id.name.clone(),
-                kind: d.symbol_id.kind.clone(),
+                qualified_name: d.symbol_id.qualified_name.clone(),
+                kind: d.symbol_id.kind,
                 file_path: file_info.relative_path.clone(),
                 start_line: d.symbol_id.start_line,
                 end_line: d.end_line,
                 signature: d.signature.clone(),
+                language: d.symbol_id.language.clone(),
+                location_role: d.location.role,
             })
             .collect();
         symbols.sort_by_key(|s| s.start_line);

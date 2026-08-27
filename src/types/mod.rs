@@ -200,6 +200,9 @@ pub struct StatisticsResponse {
     /// e.g. by tools that verify usage; 0 unless references were stored)
     #[serde(default)]
     pub total_references: usize,
+    /// Persisted code references, excluding documentation/comments/strings.
+    #[serde(default)]
+    pub code_reference_count: usize,
     /// Number of files with at least one stored definition
     #[serde(default)]
     pub files_with_definitions: usize,
@@ -421,6 +424,11 @@ impl FindDefinitionRequest {
 pub struct FindDefinitionResponse {
     /// The found definition, if any
     pub definition: Option<crate::relations::DefinitionResult>,
+    /// Resolution state of the symbol occurrence at the requested position.
+    pub resolution_status: crate::relations::ResolutionStatus,
+    pub evidence_kind: crate::relations::EvidenceKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<crate::relations::ReferenceCandidate>,
     /// Precision level of the result
     pub precision: String,
     /// Time taken in milliseconds
@@ -445,6 +453,27 @@ pub struct FindReferencesRequest {
     /// Include the definition itself in results
     #[serde(default = "default_include_definition")]
     pub include_definition: bool,
+    /// Filter references by parser language (case-insensitive).
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Filter by canonical project-relative reference path.
+    #[serde(default)]
+    pub path_filter: Option<String>,
+    /// Restrict reference kinds. Empty uses the default code-only set.
+    #[serde(default)]
+    pub reference_kinds: Vec<crate::relations::ReferenceKind>,
+    /// Restrict resolution states. Empty includes all states.
+    #[serde(default)]
+    pub resolution_statuses: Vec<crate::relations::ResolutionStatus>,
+    /// Restrict evidence kinds. Empty includes all evidence kinds.
+    #[serde(default)]
+    pub evidence_kinds: Vec<crate::relations::EvidenceKind>,
+    /// Include documentation, comment, and string matches when no kind filter is supplied.
+    #[serde(default)]
+    pub include_non_code: bool,
+    /// Zero-based result offset for deterministic pagination.
+    #[serde(default)]
+    pub cursor: usize,
 }
 
 fn default_references_limit() -> usize {
@@ -471,6 +500,11 @@ impl FindReferencesRequest {
                 self.limit, MAX_LIMIT
             ));
         }
+        if let Some(path) = &self.path_filter
+            && path.trim().is_empty()
+        {
+            return Err("path_filter cannot be empty".to_string());
+        }
         Ok(())
     }
 }
@@ -480,14 +514,35 @@ impl FindReferencesRequest {
 pub struct FindReferencesResponse {
     /// The symbol being referenced
     pub symbol_name: Option<String>,
+    pub target_resolution_status: crate::relations::ResolutionStatus,
+    pub target_evidence_kind: crate::relations::EvidenceKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_candidates: Vec<crate::relations::ReferenceCandidate>,
     /// List of found references
     pub references: Vec<crate::relations::ReferenceResult>,
     /// Total count (may be higher than returned if limit applied)
     pub total_count: usize,
+    /// Total matches after all explicit/default filters, before pagination.
+    pub total_matches: usize,
+    /// Number of rows returned in this page.
+    pub returned_matches: usize,
+    pub results_truncated: bool,
+    pub next_cursor: Option<usize>,
+    /// Counts computed from the same filtered reference set as this response.
+    pub statistics: ReferenceStatistics,
     /// Precision level of the results
     pub precision: String,
     /// Time taken in milliseconds
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReferenceStatistics {
+    /// Exact count after the active filters; never the current page length.
+    pub code_reference_count: usize,
+    pub resolved_count: usize,
+    pub ambiguous_count: usize,
+    pub unresolved_count: usize,
 }
 
 /// Request to get call graph for a function

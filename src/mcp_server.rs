@@ -226,7 +226,7 @@ impl RagMcpServer {
     }
 
     #[tool(
-        description = "Find the definition of a symbol at a given file location (line and column)"
+        description = "Find the definition of a symbol occurrence at a file location. Returns explicit resolution status, evidence kind, and candidates; ambiguous or unresolved occurrences do not fall back to the enclosing function."
     )]
     async fn find_definition(
         &self,
@@ -244,7 +244,9 @@ impl RagMcpServer {
         serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
     }
 
-    #[tool(description = "Find all references to a symbol at a given file location")]
+    #[tool(
+        description = "Find persisted, classified references to the logical symbol at a file location. Defaults to code-only matches (documentation/comments/strings excluded); supports language, canonical path, reference-kind, resolution-status, and evidence-kind filters. Unverified textual candidates remain ambiguous or unresolved and expose candidates instead of a false target. Totals are computed before pagination."
+    )]
     async fn find_references(
         &self,
         Parameters(req): Parameters<FindReferencesRequest>,
@@ -262,7 +264,7 @@ impl RagMcpServer {
     }
 
     #[tool(
-        description = "Get the call graph for a function at a given file location (callers and callees)"
+        description = "Get callers and callees for a function at a file location. Only explicitly resolved call edges are authoritative; nodes include call-site parser/evidence provenance. Recursive graph depth is completed in milestone M3."
     )]
     async fn get_call_graph(
         &self,

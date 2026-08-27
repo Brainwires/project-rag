@@ -168,8 +168,9 @@ fn test_statistics_response() {
         ],
         total_definitions: 250,
         total_references: 0,
+        code_reference_count: 0,
         files_with_definitions: 90,
-        index_schema_version: 2,
+        index_schema_version: 3,
         invalid_history_records: 0,
         index_diagnostics: vec![],
     };
@@ -634,8 +635,9 @@ fn test_statistics_response_serialization() {
         }],
         total_definitions: 250,
         total_references: 10,
+        code_reference_count: 10,
         files_with_definitions: 90,
-        index_schema_version: 2,
+        index_schema_version: 3,
         invalid_history_records: 0,
         index_diagnostics: vec![],
     };
@@ -658,6 +660,23 @@ fn test_statistics_response_serialization() {
     assert_eq!(parsed.total_definitions, 0);
     assert_eq!(parsed.total_references, 0);
     assert_eq!(parsed.files_with_definitions, 0);
+}
+
+#[test]
+fn find_references_m2_filters_default_to_code_only() {
+    let request: FindReferencesRequest = serde_json::from_value(serde_json::json!({
+        "file_path": "src/lib.rs",
+        "line": 10,
+        "column": 2
+    }))
+    .unwrap();
+    assert_eq!(request.limit, 100);
+    assert!(request.include_definition);
+    assert!(!request.include_non_code);
+    assert!(request.reference_kinds.is_empty());
+    assert!(request.resolution_statuses.is_empty());
+    assert!(request.evidence_kinds.is_empty());
+    assert_eq!(request.cursor, 0);
 }
 
 #[test]
