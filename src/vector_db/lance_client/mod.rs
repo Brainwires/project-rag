@@ -851,10 +851,10 @@ impl VectorDatabase for LanceVectorDB {
                         };
 
                         // Filter by root_path if specified
-                        if let Some(ref filter_path) = root_path {
-                            if result_root_path.as_ref() != Some(filter_path) {
-                                continue;
-                            }
+                        if let Some(ref filter_path) = root_path
+                            && result_root_path.as_ref() != Some(filter_path)
+                        {
+                            continue;
                         }
 
                         search_results.push(SearchResult {
@@ -952,10 +952,10 @@ impl VectorDatabase for LanceVectorDB {
             }
 
             // Filter by path pattern using proper glob matching
-            if !path_patterns.is_empty() {
-                if !glob_utils::matches_any_pattern(&result.file_path, &path_patterns) {
-                    return false;
-                }
+            if !path_patterns.is_empty()
+                && !glob_utils::matches_any_pattern(&result.file_path, &path_patterns)
+            {
+                return false;
             }
 
             true
@@ -1138,7 +1138,7 @@ impl VectorDatabase for LanceVectorDB {
                 }
             })
             .collect();
-        language_breakdown.sort_by(|a, b| b.chunk_count.cmp(&a.chunk_count));
+        language_breakdown.sort_by_key(|entry| std::cmp::Reverse(entry.chunk_count));
 
         Ok(DatabaseStats {
             total_files: all_files.len(),

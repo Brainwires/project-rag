@@ -1007,7 +1007,7 @@ fn test_default_functions() {
     assert_eq!(default_max_file_size(), 1_048_576);
     assert_eq!(default_limit(), 10);
     assert_eq!(default_min_score(), 0.7);
-    assert_eq!(default_hybrid(), true);
+    assert!(default_hybrid());
     assert_eq!(default_git_path(), ".");
     assert_eq!(default_max_commits(), 10);
 }

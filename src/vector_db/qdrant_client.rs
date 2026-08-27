@@ -213,7 +213,7 @@ impl QdrantVectorDB {
         let normalized_score = score / query_terms.len() as f32;
 
         // Clamp to [0, 1]
-        normalized_score.min(1.0).max(0.0)
+        normalized_score.clamp(0.0, 1.0)
     }
 }
 
@@ -275,8 +275,8 @@ impl VectorDatabase for QdrantVectorDB {
 
         let points: Vec<PointStruct> = embeddings
             .into_iter()
-            .zip(metadata.into_iter())
-            .zip(contents.into_iter())
+            .zip(metadata)
+            .zip(contents)
             .map(|((embedding, meta), content)| {
                 let point_id = stable_point_id(&meta);
                 let payload: Payload = json!({
@@ -475,10 +475,10 @@ impl VectorDatabase for QdrantVectorDB {
                 .unwrap_or_default();
 
             // Filter by root_path if specified
-            if let Some(ref filter_path) = root_path {
-                if result_root_path.as_ref() != Some(filter_path) {
-                    continue;
-                }
+            if let Some(ref filter_path) = root_path
+                && result_root_path.as_ref() != Some(filter_path)
+            {
+                continue;
             }
 
             results.push(SearchResult {

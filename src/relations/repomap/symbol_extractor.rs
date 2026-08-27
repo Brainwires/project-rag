@@ -93,6 +93,7 @@ impl SymbolExtractor {
     }
 
     /// Extract definitions from a node and its children
+    #[allow(clippy::too_many_arguments)]
     fn extract_from_node(
         &self,
         node: Node,
@@ -556,10 +557,10 @@ fn find_name_node<'a>(node: Node<'a>, language: &str) -> Option<Node<'a>> {
                 return Some(name_node);
             }
             // For impl items, look for type name
-            if kind == "impl_item" {
-                if let Some(type_node) = node.child_by_field_name("type") {
-                    return Some(type_node);
-                }
+            if kind == "impl_item"
+                && let Some(type_node) = node.child_by_field_name("type")
+            {
+                return Some(type_node);
             }
         }
         "Python" => {
@@ -583,15 +584,12 @@ fn find_name_node<'a>(node: Node<'a>, language: &str) -> Option<Node<'a>> {
                 return Some(name_node);
             }
             // Arrow functions in variable declarations need special handling
-            if kind == "arrow_function" {
-                // Look at parent for variable name
-                if let Some(parent) = node.parent() {
-                    if parent.kind() == "variable_declarator" {
-                        if let Some(name_node) = parent.child_by_field_name("name") {
-                            return Some(name_node);
-                        }
-                    }
-                }
+            if kind == "arrow_function"
+                && let Some(parent) = node.parent()
+                && parent.kind() == "variable_declarator"
+                && let Some(name_node) = parent.child_by_field_name("name")
+            {
+                return Some(name_node);
             }
         }
         "Go" => {
@@ -626,10 +624,9 @@ fn find_name_node<'a>(node: Node<'a>, language: &str) -> Option<Node<'a>> {
             if matches!(
                 kind,
                 "struct_specifier" | "class_specifier" | "enum_specifier" | "namespace_definition"
-            ) {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    return Some(name_node);
-                }
+            ) && let Some(name_node) = node.child_by_field_name("name")
+            {
+                return Some(name_node);
             }
         }
         "C#" => {
@@ -652,16 +649,9 @@ fn find_name_node<'a>(node: Node<'a>, language: &str) -> Option<Node<'a>> {
 
     // Fallback: find first identifier child
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "identifier"
-            || child.kind() == "type_identifier"
-            || child.kind() == "name"
-        {
-            return Some(child);
-        }
-    }
-
-    None
+    node.children(&mut cursor).find(|child| {
+        child.kind() == "identifier" || child.kind() == "type_identifier" || child.kind() == "name"
+    })
 }
 
 /// Find the innermost identifier in a declarator chain (for C/C++)
@@ -679,10 +669,10 @@ fn find_innermost_identifier<'a>(node: Node<'a>) -> Option<Node<'a>> {
 
     // Check for name field. Only return on success -- an unconditional return here
     // skips the child scan below, which is the same defect as in find_name_node.
-    if let Some(name_node) = node.child_by_field_name("declarator") {
-        if let Some(id) = find_innermost_identifier(name_node) {
-            return Some(id);
-        }
+    if let Some(name_node) = node.child_by_field_name("declarator")
+        && let Some(id) = find_innermost_identifier(name_node)
+    {
+        return Some(id);
     }
 
     // Fallback: look through children
