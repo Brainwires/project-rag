@@ -4,6 +4,7 @@
 /// CLI args > Environment variables > Config file > Defaults
 use crate::error::{ConfigError, RagError};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Main configuration structure
@@ -33,7 +34,7 @@ pub struct VectorDbConfig {
     pub backend: String,
 
     /// LanceDB data directory path
-    #[serde(default = "default_lancedb_path")]
+    #[serde(default = "unset_lancedb_path")]
     pub lancedb_path: PathBuf,
 
     /// Qdrant server URL
@@ -125,8 +126,21 @@ fn default_db_backend() -> String {
     return "lancedb".to_string();
 }
 
-fn default_lancedb_path() -> PathBuf {
-    crate::paths::PlatformPaths::default_lancedb_path()
+fn unset_lancedb_path() -> PathBuf {
+    PathBuf::new()
+}
+
+fn required_lancedb_path(value: Option<OsString>) -> Result<PathBuf, RagError> {
+    value
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            ConfigError::MissingRequired(
+                "PROJECT_RAG_LANCEDB_PATH must be set in the project-local MCP configuration"
+                    .to_string(),
+            )
+            .into()
+        })
 }
 
 fn default_qdrant_url() -> String {
@@ -200,7 +214,7 @@ impl Default for VectorDbConfig {
     fn default() -> Self {
         Self {
             backend: default_db_backend(),
-            lancedb_path: default_lancedb_path(),
+            lancedb_path: unset_lancedb_path(),
             qdrant_url: default_qdrant_url(),
             collection_name: default_collection_name(),
         }
@@ -366,15 +380,17 @@ impl Config {
     }
 
     /// Apply environment variable overrides
-    pub fn apply_env_overrides(&mut self) {
+    pub fn apply_env_overrides(&mut self) -> Result<(), RagError> {
         // Vector DB backend
         if let Ok(backend) = std::env::var("PROJECT_RAG_DB_BACKEND") {
             self.vector_db.backend = backend;
         }
 
-        // LanceDB path
-        if let Ok(path) = std::env::var("PROJECT_RAG_LANCEDB_PATH") {
-            self.vector_db.lancedb_path = PathBuf::from(path);
+        // LanceDB has no process-global fallback. Every MCP instance must receive
+        // an explicit path from its project-local configuration.
+        if self.vector_db.backend == "lancedb" {
+            self.vector_db.lancedb_path =
+                required_lancedb_path(std::env::var_os("PROJECT_RAG_LANCEDB_PATH"))?;
         }
 
         // Qdrant URL
@@ -400,12 +416,14 @@ impl Config {
         {
             self.search.min_score = score;
         }
+
+        Ok(())
     }
 
     /// Create a new Config with defaults and environment overrides
     pub fn new() -> Result<Self, RagError> {
         let mut config = Self::load_or_default()?;
-        config.apply_env_overrides();
+        config.apply_env_overrides()?;
         config.validate()?;
         Ok(config)
     }
@@ -414,6 +432,39 @@ impl Config {
 // Tests are inline in this module
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn test_required_lancedb_path_rejects_missing_value() {
+        let error = required_lancedb_path(None).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RagError::Config(ConfigError::MissingRequired(_))
+        ));
+        assert!(error.to_string().contains("PROJECT_RAG_LANCEDB_PATH"));
+    }
+
+    #[test]
+    fn test_required_lancedb_path_rejects_empty_value() {
+        let error = required_lancedb_path(Some(OsString::new())).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RagError::Config(ConfigError::MissingRequired(_))
+        ));
+    }
+
+    #[test]
+    fn test_required_lancedb_path_accepts_explicit_value() {
+        let expected = PathBuf::from("project-local/lancedb");
+
+        assert_eq!(
+            required_lancedb_path(Some(expected.clone().into_os_string())).unwrap(),
+            expected
+        );
+    }
+
     #[test]
     fn test_config_placeholder() {
         // Placeholder for config tests

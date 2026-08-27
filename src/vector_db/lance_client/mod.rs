@@ -54,13 +54,7 @@ fn directory_size_bytes(path: &Path) -> u64 {
 }
 
 impl LanceVectorDB {
-    /// Create a new LanceDB instance with default path
-    pub async fn new() -> Result<Self> {
-        let db_path = Self::default_lancedb_path();
-        Self::with_path(&db_path).await
-    }
-
-    /// Create a new LanceDB instance with custom path
+    /// Create a new LanceDB instance with an explicit path
     pub async fn with_path(db_path: &str) -> Result<Self> {
         tracing::info!("Connecting to LanceDB at: {}", db_path);
 
@@ -79,13 +73,6 @@ impl LanceVectorDB {
             db_path: db_path.to_string(),
             bm25_indexes,
         })
-    }
-
-    /// Get default database path (public for CLI version info)
-    pub fn default_lancedb_path() -> String {
-        crate::paths::PlatformPaths::default_lancedb_path()
-            .to_string_lossy()
-            .to_string()
     }
 
     /// Hash a root path to create a unique identifier for per-project BM25 indexes

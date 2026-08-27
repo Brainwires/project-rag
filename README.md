@@ -181,7 +181,10 @@ The server provides 9 tools that can be used directly:
 
 **LanceDB (Default - Embedded, Stable)**
 
-No additional setup needed! LanceDB is an embedded vector database that runs directly in the application. It stores data in `./.lancedb` directory by default.
+LanceDB is embedded and needs no separate server, but its storage location must be explicit.
+Set `PROJECT_RAG_LANCEDB_PATH` to a project-local directory before starting project-RAG.
+The process returns a configuration error when the variable is missing or empty; it never
+falls back to a shared user-level database.
 
 **Why LanceDB is the default:**
 - **Embedded** - No external dependencies or servers required

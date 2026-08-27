@@ -11,9 +11,9 @@ pub fn detect_language(extension: &str) -> Option<String> {
         "jsx" => "JavaScript (JSX)",
         "tsx" => "TypeScript (TSX)",
         "java" => "Java",
-        "cpp" | "cc" | "cxx" => "C++",
+        "cpp" | "cc" | "cxx" | "cu" => "C++",
         "c" => "C",
-        "h" | "hpp" => "C/C++ Header",
+        "h" | "hpp" | "cuh" => "C/C++ Header",
         "go" => "Go",
         "rb" => "Ruby",
         "php" => "PHP",
@@ -95,6 +95,7 @@ mod tests {
         assert_eq!(detect_language("cpp"), Some("C++".to_string()));
         assert_eq!(detect_language("cc"), Some("C++".to_string()));
         assert_eq!(detect_language("cxx"), Some("C++".to_string()));
+        assert_eq!(detect_language("cu"), Some("C++".to_string()));
     }
 
     #[test]
@@ -106,6 +107,7 @@ mod tests {
     fn test_detect_language_headers() {
         assert_eq!(detect_language("h"), Some("C/C++ Header".to_string()));
         assert_eq!(detect_language("hpp"), Some("C/C++ Header".to_string()));
+        assert_eq!(detect_language("cuh"), Some("C/C++ Header".to_string()));
     }
 
     #[test]

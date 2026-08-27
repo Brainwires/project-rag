@@ -116,13 +116,6 @@ impl PlatformPaths {
         Self::config_dir().join(PROJECT_FOLDER_NAME)
     }
 
-    /// Get default LanceDB database path
-    ///
-    /// Returns: {data_dir}/{project_folder_name}/lancedb
-    pub fn default_lancedb_path() -> PathBuf {
-        Self::project_data_dir().join("lancedb")
-    }
-
     /// Get default hash cache path
     ///
     /// Returns: {cache_dir}/{project_folder_name}/hash_cache.json
@@ -148,6 +141,7 @@ impl PlatformPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::env;
 
     #[test]
@@ -177,13 +171,6 @@ mod tests {
         assert!(data_dir.to_string_lossy().contains("project-rag"));
         assert!(cache_dir.to_string_lossy().contains("project-rag"));
         assert!(config_dir.to_string_lossy().contains("project-rag"));
-    }
-
-    #[test]
-    fn test_default_lancedb_path() {
-        let path = PlatformPaths::default_lancedb_path();
-        assert!(path.to_string_lossy().contains("project-rag"));
-        assert!(path.to_string_lossy().contains("lancedb"));
     }
 
     #[test]
@@ -384,18 +371,12 @@ mod tests {
     #[test]
     fn test_specific_file_paths() {
         // Test that specific file paths include expected components
-        let lancedb_path = PlatformPaths::default_lancedb_path();
         let hash_cache_path = PlatformPaths::default_hash_cache_path();
         let git_cache_path = PlatformPaths::default_git_cache_path();
         let config_path = PlatformPaths::default_config_path();
 
-        // All should contain project name
-        for path in [
-            &lancedb_path,
-            &hash_cache_path,
-            &git_cache_path,
-            &config_path,
-        ] {
+        // All default support-file paths should contain the project name.
+        for path in [&hash_cache_path, &git_cache_path, &config_path] {
             assert!(
                 path.to_string_lossy().contains("project-rag"),
                 "Path {:?} should contain 'project-rag'",
@@ -404,7 +385,6 @@ mod tests {
         }
 
         // Specific components
-        assert!(lancedb_path.ends_with("lancedb"));
         assert!(hash_cache_path.ends_with("hash_cache.json"));
         assert!(git_cache_path.ends_with("git_cache.json"));
         assert!(config_path.ends_with("config.toml"));

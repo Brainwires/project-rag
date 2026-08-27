@@ -257,7 +257,7 @@ pub fn language_name_for_extension(extension: &str) -> Option<&'static str> {
         "java" => "Java",
         "swift" => "Swift",
         "c" => "C",
-        "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "C++",
+        "h" | "cpp" | "cc" | "cxx" | "cu" | "hpp" | "hxx" | "hh" | "cuh" => "C++",
         "cs" => "C#",
         "rb" => "Ruby",
         "php" => "PHP",
@@ -749,7 +749,7 @@ class Calculator {
     #[test]
     fn test_language_name_for_extension_c_family() {
         assert_eq!(language_name_for_extension("c"), Some("C"));
-        for ext in ["h", "hh", "hxx", "hpp", "cpp", "cc", "cxx"] {
+        for ext in ["h", "hh", "hxx", "hpp", "cuh", "cpp", "cc", "cxx", "cu"] {
             assert_eq!(language_name_for_extension(ext), Some("C++"), "{}", ext);
         }
         assert_eq!(language_name_for_extension("xyz"), None);
@@ -766,5 +766,27 @@ class Calculator {
         assert!(definitions.iter().any(|d| d.name() == "KioskNotify"));
         assert!(definitions.iter().any(|d| d.name() == "kiosk"));
         assert!(definitions.iter().any(|d| d.name() == "S"));
+    }
+
+    #[test]
+    fn test_cuda_extracted_with_cpp_grammar() {
+        let source = "__global__ void scale_kernel(float * data) { data[threadIdx.x] *= 2.0f; }\n__device__ int lane_id() { return threadIdx.x; }\n";
+        let extractor = SymbolExtractor::new();
+
+        for extension in ["cu", "cuh"] {
+            let file_info = make_file_info(source, extension);
+            let definitions = extractor.extract_definitions(&file_info).unwrap();
+
+            assert!(
+                definitions.iter().any(|d| d.name() == "scale_kernel"),
+                "{}",
+                extension
+            );
+            assert!(
+                definitions.iter().any(|d| d.name() == "lane_id"),
+                "{}",
+                extension
+            );
+        }
     }
 }

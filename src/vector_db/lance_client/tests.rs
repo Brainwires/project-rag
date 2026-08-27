@@ -35,13 +35,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_default_path() {
-        let path = LanceVectorDB::default_lancedb_path();
-        assert!(path.contains("project-rag"));
-        assert!(path.contains("lancedb"));
-    }
-
-    #[tokio::test]
     async fn test_initialize_creates_table() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir

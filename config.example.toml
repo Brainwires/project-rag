@@ -12,8 +12,10 @@
 backend = "lancedb"
 
 # LanceDB database directory path (only used if backend = "lancedb")
-# Default: Platform-specific data directory + "/project-rag/lancedb"
-# lancedb_path = "/custom/path/to/lancedb"
+# No process-global default is provided. Set PROJECT_RAG_LANCEDB_PATH in the
+# project-local MCP environment. This field remains available to callers that
+# construct and pass Config directly.
+# lancedb_path = "/project/local/path/to/lancedb"
 
 # Qdrant server URL (only used if backend = "qdrant")
 # Default: "http://localhost:6334"
@@ -87,12 +89,13 @@ hybrid = true
 # You can override any configuration value using environment variables:
 #
 #   PROJECT_RAG_DB_BACKEND         - Vector database backend
-#   PROJECT_RAG_LANCEDB_PATH       - LanceDB path
+#   PROJECT_RAG_LANCEDB_PATH       - LanceDB path (required for LanceDB)
 #   PROJECT_RAG_QDRANT_URL         - Qdrant server URL
 #   PROJECT_RAG_MODEL              - Embedding model name
 #   PROJECT_RAG_BATCH_SIZE         - Embedding batch size
 #   PROJECT_RAG_MIN_SCORE          - Minimum search score
 #
 # Example:
+#   export PROJECT_RAG_LANCEDB_PATH="/project/local/path/to/lancedb"
 #   export PROJECT_RAG_MODEL="BAAI/bge-base-en-v1.5"
 #   export PROJECT_RAG_MIN_SCORE="0.8"
