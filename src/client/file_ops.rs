@@ -282,7 +282,7 @@ impl RagClient {
         Ok(EditFileResponse {
             status: match patch_response.status.as_str() {
                 "conflict" => "hash_conflict".to_string(),
-                "reindex_failed" => "ok".to_string(),
+                "applied" | "reindex_failed" => "ok".to_string(),
                 _ => patch_response.status,
             },
             file_hash: file.and_then(|file| file.new_hash.clone()),

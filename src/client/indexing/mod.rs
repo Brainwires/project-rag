@@ -625,6 +625,10 @@ pub async fn do_index(
     progress_token: Option<ProgressToken>,
     cancel_token: CancellationToken,
 ) -> Result<IndexResponse> {
+    // Direct callers must receive the same canonical root identity as the smart
+    // indexing wrapper. On Windows, TempDir and other APIs may spell one path
+    // with an 8.3 component while canonicalization returns a long `\\?\` path.
+    let path = RagClient::normalize_path(&path).context("Failed to walk directory")?;
     let start = Instant::now();
     let mut errors = Vec::new();
 
@@ -876,6 +880,10 @@ pub async fn do_incremental_update(
     progress_token: Option<ProgressToken>,
     cancel_token: CancellationToken,
 ) -> Result<IndexResponse> {
+    // Keep cache, chunk metadata, relation rows, and vector storage on exactly
+    // one canonical root spelling even when this lower-level API is called
+    // directly.
+    let path = RagClient::normalize_path(&path).context("Failed to walk directory")?;
     let start = Instant::now();
 
     // Send initial progress
