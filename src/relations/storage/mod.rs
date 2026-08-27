@@ -43,6 +43,13 @@ pub trait RelationsStore: Send + Sync {
         root_path: &str,
     ) -> Result<Vec<Definition>>;
 
+    /// Batch form used by graph traversal to avoid one definition query per node.
+    async fn find_definitions_by_symbol_ids_in_root(
+        &self,
+        symbol_ids: &[String],
+        root_path: &str,
+    ) -> Result<Vec<Definition>>;
+
     /// Find the innermost persisted reference occurrence at a source position.
     async fn find_reference_at_in_root(
         &self,
@@ -61,6 +68,22 @@ pub trait RelationsStore: Send + Sync {
     async fn find_references_by_name_in_root(
         &self,
         symbol_name: &str,
+        root_path: &str,
+    ) -> Result<Vec<Reference>>;
+
+    /// References whose source is in the supplied logical-symbol frontier.
+    /// The persistent `source_symbol_id` index is the outgoing adjacency index.
+    async fn get_outgoing_references_in_root(
+        &self,
+        symbol_ids: &[String],
+        root_path: &str,
+    ) -> Result<Vec<Reference>>;
+
+    /// References whose resolved target is in the supplied logical-symbol frontier.
+    /// The persistent `target_symbol_id` index is the incoming adjacency index.
+    async fn get_incoming_references_in_root(
+        &self,
+        symbol_ids: &[String],
         root_path: &str,
     ) -> Result<Vec<Reference>>;
 

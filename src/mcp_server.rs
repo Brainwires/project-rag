@@ -264,7 +264,7 @@ impl RagMcpServer {
     }
 
     #[tool(
-        description = "Get callers and callees for a function at a file location. Only explicitly resolved call edges are authoritative; nodes include call-site parser/evidence provenance. Recursive graph depth is completed in milestone M3."
+        description = "Get a bounded dependency graph for a function at a file location. Depth is exact (0=root, 1=direct neighbors), nodes are unique stable symbols, cycles are safe, and edges include source provenance plus explicit resolution/evidence. Defaults to resolved call and constructor-call edges; supports direction, kind, status, language, path, node, and edge filters/budgets."
     )]
     async fn get_call_graph(
         &self,

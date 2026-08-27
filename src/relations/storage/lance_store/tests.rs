@@ -399,6 +399,33 @@ async fn test_callers_and_callees() {
 }
 
 #[tokio::test]
+async fn reference_store_maintains_incoming_and_outgoing_adjacency_indexes() {
+    let (_dir, store) = make_store().await;
+    let target = make_def("target", "src/target.rs", 1, 5, SymbolKind::Function);
+    let source = make_def("source", "src/source.rs", 1, 5, SymbolKind::Function);
+    let mut reference = make_call_ref(&target.to_storage_id(), "src/source.rs", 2);
+    reference.source_symbol_id = Some(source.to_storage_id());
+    store
+        .store_references(vec![reference], "/test")
+        .await
+        .unwrap();
+
+    let indexes = store
+        .references_table()
+        .await
+        .unwrap()
+        .list_indices()
+        .await
+        .unwrap();
+    assert!(indexes.iter().any(|index| {
+        index.name == "relations_outgoing_v1" && index.columns == ["source_symbol_id"]
+    }));
+    assert!(indexes.iter().any(|index| {
+        index.name == "relations_incoming_v1" && index.columns == ["target_symbol_id"]
+    }));
+}
+
+#[tokio::test]
 async fn test_clear_and_stats() {
     let (_dir, store) = make_store().await;
 

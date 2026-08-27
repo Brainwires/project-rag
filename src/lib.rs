@@ -168,9 +168,10 @@ pub mod mcp_server;
 pub use types::{
     AdvancedSearchRequest, ClearRequest, ClearResponse, FindDefinitionRequest,
     FindDefinitionResponse, FindReferencesRequest, FindReferencesResponse, GetCallGraphRequest,
-    GetCallGraphResponse, GitSearchResult, IndexRequest, IndexResponse, IndexingMode,
-    LanguageStats, QueryRequest, QueryResponse, ReferenceStatistics, SearchGitHistoryRequest,
-    SearchGitHistoryResponse, SearchResult, StatisticsRequest, StatisticsResponse,
+    GetCallGraphResponse, GitSearchResult, GraphContinuation, GraphTotals, IndexRequest,
+    IndexResponse, IndexingMode, LanguageStats, QueryRequest, QueryResponse, ReferenceStatistics,
+    SearchGitHistoryRequest, SearchGitHistoryResponse, SearchResult, StatisticsRequest,
+    StatisticsResponse,
 };
 
 pub use config::Config;

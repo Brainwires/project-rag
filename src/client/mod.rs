@@ -10,7 +10,8 @@ use crate::git_cache::GitCache;
 use crate::indexer::{CodeChunker, FileInfo, detect_language};
 use crate::relations::storage::{LanceRelationsStore, RelationsStore};
 use crate::relations::{
-    DefinitionResult, HybridRelationsProvider, ReferenceResult, RelationsProvider,
+    DefinitionResult, HybridRelationsProvider, ReferenceKind, ReferenceResult, RelationsProvider,
+    ResolutionStatus,
 };
 use crate::types::*;
 use crate::vector_db::VectorDatabase;
@@ -1582,86 +1583,84 @@ impl RagClient {
             true,
         );
 
-        // If no function found at position, return empty result
-        let root_symbol = match target_function {
-            Some(func) => crate::relations::SymbolInfo {
-                symbol_id: func.to_storage_id(),
-                location_id: func.location.to_storage_id(),
-                name: func.symbol_id.name.clone(),
-                qualified_name: func.symbol_id.qualified_name.clone(),
-                kind: func.symbol_id.kind,
-                file_path: request.file_path.clone(),
-                start_line: func.symbol_id.start_line,
-                end_line: func.end_line,
-                signature: func.signature.clone(),
-                language: func.symbol_id.language.clone(),
-                location_role: func.location.role,
-            },
-            None => {
-                return Ok(GetCallGraphResponse {
-                    root_symbol: None,
-                    callers: Vec::new(),
-                    callees: Vec::new(),
-                    precision: format!("{:?}", precision).to_lowercase(),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                });
-            }
+        let edge_kinds = if request.edge_kinds.is_empty() {
+            vec![ReferenceKind::Call, ReferenceKind::ConstructorCall]
+        } else {
+            request.edge_kinds.clone()
+        };
+        let resolution_statuses = if request.resolution_statuses.is_empty() {
+            vec![ResolutionStatus::Resolved]
+        } else {
+            request.resolution_statuses.clone()
         };
 
-        let target_symbol_id = root_symbol.symbol_id.clone();
-        let root_path = &file_info.root_path;
-        let to_node = |edge: &crate::relations::CallEdge,
-                       definition: &crate::relations::Definition| {
-            crate::relations::CallGraphNode {
-                name: definition.symbol_id.name.clone(),
-                kind: definition.symbol_id.kind,
-                file_path: definition.symbol_id.file_path.clone(),
-                line: definition.symbol_id.start_line,
-                call_site_file: edge.call_site_file.clone(),
-                call_site_line: edge.call_site_line,
-                call_site_col: edge.call_site_col,
-                reference_kind: edge.reference_kind,
-                resolution_status: edge.resolution_status,
-                evidence_kind: edge.evidence_kind,
-                parser: edge.parser.clone(),
-                children: Vec::new(),
-            }
+        let Some(root_definition) = target_function.cloned() else {
+            return Ok(GetCallGraphResponse {
+                root_symbol: None,
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                requested_depth: request.depth,
+                graph_truncated: false,
+                returned_nodes: 0,
+                returned_edges: 0,
+                estimated_or_known_total: GraphTotals {
+                    nodes: 0,
+                    edges: 0,
+                    exact: true,
+                },
+                continuation: None,
+                applied_edge_kinds: edge_kinds,
+                applied_resolution_statuses: resolution_statuses,
+                precision: format!("{:?}", precision).to_lowercase(),
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
         };
-
-        let mut callers = Vec::new();
-        if request.include_callers {
-            for edge in self.relations_store.get_callers(&target_symbol_id).await? {
-                if let Some(definition) = self
-                    .relations_store
-                    .find_definitions_by_symbol_id_in_root(&edge.caller_id, root_path)
-                    .await?
-                    .into_iter()
-                    .next()
-                {
-                    callers.push(to_node(&edge, &definition));
-                }
-            }
-        }
-
-        let mut callees = Vec::new();
-        if request.include_callees {
-            for edge in self.relations_store.get_callees(&target_symbol_id).await? {
-                if let Some(definition) = self
-                    .relations_store
-                    .find_definitions_by_symbol_id_in_root(&edge.callee_id, root_path)
-                    .await?
-                    .into_iter()
-                    .next()
-                {
-                    callees.push(to_node(&edge, &definition));
-                }
-            }
-        }
+        let root_symbol = crate::relations::SymbolInfo {
+            symbol_id: root_definition.to_storage_id(),
+            location_id: root_definition.location.to_storage_id(),
+            name: root_definition.symbol_id.name.clone(),
+            qualified_name: root_definition.symbol_id.qualified_name.clone(),
+            kind: root_definition.symbol_id.kind,
+            file_path: root_definition.symbol_id.file_path.clone(),
+            start_line: root_definition.symbol_id.start_line,
+            end_line: root_definition.end_line,
+            signature: root_definition.signature.clone(),
+            language: root_definition.symbol_id.language.clone(),
+            location_role: root_definition.location.role,
+        };
+        let options = crate::relations::graph::GraphTraversalOptions {
+            depth: request.depth,
+            include_incoming: request.include_callers,
+            include_outgoing: request.include_callees,
+            max_nodes: request.max_nodes,
+            max_edges: request.max_edges,
+            edge_kinds: edge_kinds.clone(),
+            resolution_statuses: resolution_statuses.clone(),
+            language_filters: request.language_filters,
+            path_filters: request.path_filters,
+        };
+        let graph = crate::relations::graph::traverse_dependency_graph(
+            self.relations_store.as_ref(),
+            &root_definition,
+            &file_info.root_path,
+            &options,
+        )
+        .await?;
+        let returned_nodes = graph.nodes.len();
+        let returned_edges = graph.edges.len();
 
         Ok(GetCallGraphResponse {
             root_symbol: Some(root_symbol),
-            callers,
-            callees,
+            nodes: graph.nodes,
+            edges: graph.edges,
+            requested_depth: request.depth,
+            graph_truncated: graph.graph_truncated,
+            returned_nodes,
+            returned_edges,
+            estimated_or_known_total: graph.estimated_or_known_total,
+            continuation: graph.continuation,
+            applied_edge_kinds: edge_kinds,
+            applied_resolution_statuses: resolution_statuses,
             precision: format!("{:?}", precision).to_lowercase(),
             duration_ms: start.elapsed().as_millis() as u64,
         })

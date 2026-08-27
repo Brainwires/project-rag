@@ -790,27 +790,116 @@ impl From<&Reference> for ReferenceResult {
     }
 }
 
-/// A node in the call graph
+/// A unique logical-symbol node in a dependency graph.
+///
+/// Location fields are optional because a trustworthy edge can occasionally
+/// point at a logical symbol whose definition location was not extracted. Such
+/// nodes stay visible rather than making the edge disappear.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CallGraphNode {
-    /// Symbol name
+    pub symbol_id: String,
+    pub location_id: Option<String>,
     pub name: String,
-    /// Symbol kind
+    pub qualified_name: String,
     pub kind: SymbolKind,
-    /// File path
-    pub file_path: String,
-    /// Line number
-    pub line: usize,
-    /// Exact call-site provenance for this relationship.
-    pub call_site_file: String,
-    pub call_site_line: usize,
-    pub call_site_col: usize,
+    pub file_path: Option<String>,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
+    pub signature: Option<String>,
+    pub language: Option<String>,
+    pub location_role: Option<LocationRole>,
+    /// Shortest number of traversed edges from the requested root.
+    pub distance: usize,
+    pub definition_available: bool,
+}
+
+impl CallGraphNode {
+    pub fn from_definition(definition: &Definition, distance: usize) -> Self {
+        Self {
+            symbol_id: definition.to_storage_id(),
+            location_id: Some(definition.location.to_storage_id()),
+            name: definition.symbol_id.name.clone(),
+            qualified_name: definition.symbol_id.qualified_name.clone(),
+            kind: definition.symbol_id.kind,
+            file_path: Some(definition.symbol_id.file_path.clone()),
+            start_line: Some(definition.symbol_id.start_line),
+            end_line: Some(definition.end_line),
+            signature: Some(definition.signature.clone()),
+            language: Some(definition.symbol_id.language.clone()),
+            location_role: Some(definition.location.role),
+            distance,
+            definition_available: true,
+        }
+    }
+
+    pub fn without_definition(symbol_id: String, distance: usize) -> Self {
+        let name = Definition::name_from_storage_id(&symbol_id)
+            .unwrap_or(&symbol_id)
+            .to_string();
+        Self {
+            symbol_id,
+            location_id: None,
+            name: name.clone(),
+            qualified_name: name,
+            kind: SymbolKind::Unknown,
+            file_path: None,
+            start_line: None,
+            end_line: None,
+            signature: None,
+            language: None,
+            location_role: None,
+            distance,
+            definition_available: false,
+        }
+    }
+}
+
+/// One source occurrence in graph form. An ambiguous or unresolved observation
+/// has no authoritative target and is never traversed through its candidates.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GraphEdge {
+    pub edge_id: String,
+    pub source_symbol_id: String,
+    pub target_symbol_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<ReferenceCandidate>,
     pub reference_kind: ReferenceKind,
     pub resolution_status: ResolutionStatus,
     pub evidence_kind: EvidenceKind,
+    pub dispatch_kind: DispatchKind,
+    pub path: String,
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+    pub language: String,
     pub parser: String,
-    /// Nested callers/callees (for depth > 1)
-    pub children: Vec<CallGraphNode>,
+}
+
+impl GraphEdge {
+    pub fn from_reference(reference: &Reference) -> Option<Self> {
+        let source_symbol_id = reference.source_symbol_id.clone()?;
+        let target_symbol_id = (reference.resolution_status == ResolutionStatus::Resolved
+            && !reference.target_symbol_id.is_empty())
+        .then(|| reference.target_symbol_id.clone());
+        Some(Self {
+            edge_id: reference.location_id.clone(),
+            source_symbol_id,
+            target_symbol_id,
+            candidates: reference.candidates.clone(),
+            reference_kind: reference.reference_kind,
+            resolution_status: reference.resolution_status,
+            evidence_kind: reference.evidence_kind,
+            dispatch_kind: reference.dispatch_kind,
+            path: reference.file_path.clone(),
+            start_line: reference.start_line,
+            start_column: reference.start_col,
+            end_line: reference.end_line,
+            end_column: reference.end_col,
+            language: reference.language.clone(),
+            parser: reference.parser.clone(),
+        })
+    }
 }
 
 /// Symbol info for call graph root

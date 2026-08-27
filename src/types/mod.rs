@@ -566,6 +566,24 @@ pub struct GetCallGraphRequest {
     /// Include callees (functions this function calls)
     #[serde(default = "default_true")]
     pub include_callees: bool,
+    /// Maximum unique nodes in the returned graph, including the root.
+    #[serde(default = "default_graph_max_nodes")]
+    pub max_nodes: usize,
+    /// Maximum source occurrences in the returned graph.
+    #[serde(default = "default_graph_max_edges")]
+    pub max_edges: usize,
+    /// Edge/reference kinds to traverse. Empty defaults to calls and constructor calls.
+    #[serde(default)]
+    pub edge_kinds: Vec<crate::relations::ReferenceKind>,
+    /// Resolution states to include. Empty defaults to resolved edges only.
+    #[serde(default)]
+    pub resolution_statuses: Vec<crate::relations::ResolutionStatus>,
+    /// Exact, case-insensitive parser-language filters.
+    #[serde(default)]
+    pub language_filters: Vec<String>,
+    /// Canonical project-relative path substring filters.
+    #[serde(default)]
+    pub path_filters: Vec<String>,
 }
 
 fn default_call_graph_depth() -> usize {
@@ -574,6 +592,14 @@ fn default_call_graph_depth() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_graph_max_nodes() -> usize {
+    200
+}
+
+fn default_graph_max_edges() -> usize {
+    500
 }
 
 impl GetCallGraphRequest {
@@ -592,8 +618,57 @@ impl GetCallGraphRequest {
                 self.depth, MAX_DEPTH
             ));
         }
+        if self.max_nodes == 0 {
+            return Err("max_nodes must be at least 1".to_string());
+        }
+        if self.max_edges == 0 {
+            return Err("max_edges must be at least 1".to_string());
+        }
+        const HARD_MAX_NODES: usize = 5_000;
+        const HARD_MAX_EDGES: usize = 20_000;
+        if self.max_nodes > HARD_MAX_NODES {
+            return Err(format!(
+                "max_nodes too large: {} (max: {})",
+                self.max_nodes, HARD_MAX_NODES
+            ));
+        }
+        if self.max_edges > HARD_MAX_EDGES {
+            return Err(format!(
+                "max_edges too large: {} (max: {})",
+                self.max_edges, HARD_MAX_EDGES
+            ));
+        }
+        if self.path_filters.iter().any(|path| path.trim().is_empty()) {
+            return Err("path_filters cannot contain an empty value".to_string());
+        }
+        if self
+            .language_filters
+            .iter()
+            .any(|language| language.trim().is_empty())
+        {
+            return Err("language_filters cannot contain an empty value".to_string());
+        }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GraphTotals {
+    /// Discovered total. This is a lower bound when `exact` is false.
+    pub nodes: usize,
+    /// Discovered total. This is a lower bound when `exact` is false.
+    pub edges: usize,
+    /// True only when traversal completed within the requested depth and filters.
+    pub exact: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GraphContinuation {
+    /// Stable symbols at which a capped traversal can continue.
+    pub pending_symbol_ids: Vec<String>,
+    pub next_depth: usize,
+    pub remaining_depth: usize,
+    pub reason: String,
 }
 
 /// Response from get_call_graph
@@ -601,10 +676,20 @@ impl GetCallGraphRequest {
 pub struct GetCallGraphResponse {
     /// The root symbol (function/method at the requested location)
     pub root_symbol: Option<crate::relations::SymbolInfo>,
-    /// Functions/methods that call this symbol (incoming calls)
-    pub callers: Vec<crate::relations::CallGraphNode>,
-    /// Functions/methods called by this symbol (outgoing calls)
-    pub callees: Vec<crate::relations::CallGraphNode>,
+    /// Unique logical symbols, including the root at distance zero.
+    pub nodes: Vec<crate::relations::CallGraphNode>,
+    /// Deduplicated source occurrences between nodes, plus explicitly requested
+    /// ambiguous/unresolved outgoing observations with no authoritative target.
+    pub edges: Vec<crate::relations::GraphEdge>,
+    pub requested_depth: usize,
+    pub graph_truncated: bool,
+    pub returned_nodes: usize,
+    pub returned_edges: usize,
+    pub estimated_or_known_total: GraphTotals,
+    pub continuation: Option<GraphContinuation>,
+    /// Filters actually applied after defaults were expanded.
+    pub applied_edge_kinds: Vec<crate::relations::ReferenceKind>,
+    pub applied_resolution_statuses: Vec<crate::relations::ResolutionStatus>,
     /// Precision level of the results
     pub precision: String,
     /// Time taken in milliseconds

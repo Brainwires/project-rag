@@ -14,6 +14,7 @@ use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use futures::stream::TryStreamExt;
+use lancedb::index::{Index, scalar::BTreeIndexBuilder};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table};
 use std::collections::HashSet;
@@ -37,6 +38,8 @@ pub struct LanceRelationsStore {
     db_path: PathBuf,
     /// Database connection (lazy initialized)
     db: Arc<RwLock<Option<Connection>>>,
+    /// Avoid listing/rebuilding scalar adjacency indexes on warm graph queries.
+    adjacency_ready: Arc<RwLock<bool>>,
 }
 
 impl LanceRelationsStore {
@@ -49,6 +52,7 @@ impl LanceRelationsStore {
         Ok(Self {
             db_path,
             db: Arc::new(RwLock::new(None)),
+            adjacency_ready: Arc::new(RwLock::new(false)),
         })
     }
 
@@ -131,6 +135,59 @@ impl LanceRelationsStore {
             out.extend(codec::batch_to_references(batch)?);
         }
         Ok(out)
+    }
+
+    /// Rebuild the two scalar indexes that are the persisted incoming/outgoing
+    /// adjacency maps. M2 currently publishes references in one project-wide
+    /// batch, so rebuilding here also makes newly published rows warm immediately.
+    async fn refresh_adjacency_indexes(&self, table: &Table) -> Result<()> {
+        for (column, name) in [
+            ("source_symbol_id", "relations_outgoing_v1"),
+            ("target_symbol_id", "relations_incoming_v1"),
+        ] {
+            table
+                .create_index(&[column], Index::BTree(BTreeIndexBuilder::default()))
+                .name(name.to_string())
+                .replace(true)
+                .execute()
+                .await
+                .with_context(|| format!("Failed to refresh {} adjacency index", column))?;
+        }
+        *self.adjacency_ready.write().await = true;
+        Ok(())
+    }
+
+    /// Materialize adjacency indexes for an existing M2 table on first graph use.
+    /// This is the schema-compatible M3 migration path: correctness does not
+    /// require reindexing, while the first query pays the one-time index build.
+    async fn ensure_adjacency_indexes(&self, table: &Table) -> Result<()> {
+        if *self.adjacency_ready.read().await {
+            return Ok(());
+        }
+        let mut ready = self.adjacency_ready.write().await;
+        if *ready {
+            return Ok(());
+        }
+        let existing = table
+            .list_indices()
+            .await
+            .context("Failed to inspect relation adjacency indexes")?;
+        for (column, name) in [
+            ("source_symbol_id", "relations_outgoing_v1"),
+            ("target_symbol_id", "relations_incoming_v1"),
+        ] {
+            if existing.iter().any(|index| index.name == name) {
+                continue;
+            }
+            table
+                .create_index(&[column], Index::BTree(BTreeIndexBuilder::default()))
+                .name(name.to_string())
+                .execute()
+                .await
+                .with_context(|| format!("Failed to create {} adjacency index", column))?;
+        }
+        *ready = true;
+        Ok(())
     }
 
     /// Delete every row belonging to the given files within one project root.
@@ -238,6 +295,7 @@ impl RelationsStore for LanceRelationsStore {
             .execute()
             .await
             .context("Failed to store references")?;
+        self.refresh_adjacency_indexes(&table).await?;
 
         tracing::debug!("Stored {} references for {} files", count, files.len());
         Ok(count)
@@ -275,6 +333,22 @@ impl RelationsStore for LanceRelationsStore {
         let filter = format!(
             "id = '{}' AND root_path = '{}'",
             codec::escape_sql(symbol_id),
+            codec::escape_sql(root_path)
+        );
+        self.query_definitions(&filter).await
+    }
+
+    async fn find_definitions_by_symbol_ids_in_root(
+        &self,
+        symbol_ids: &[String],
+        root_path: &str,
+    ) -> Result<Vec<Definition>> {
+        if symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = format!(
+            "id IN ({}) AND root_path = '{}'",
+            codec::sql_in_list(symbol_ids),
             codec::escape_sql(root_path)
         );
         self.query_definitions(&filter).await
@@ -329,6 +403,52 @@ impl RelationsStore for LanceRelationsStore {
             codec::escape_sql(root_path)
         );
         self.query_references(&filter).await
+    }
+
+    async fn get_outgoing_references_in_root(
+        &self,
+        symbol_ids: &[String],
+        root_path: &str,
+    ) -> Result<Vec<Reference>> {
+        if symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let table = self.references_table().await?;
+        self.ensure_adjacency_indexes(&table).await?;
+        let filter = format!(
+            "source_symbol_id IN ({}) AND root_path = '{}'",
+            codec::sql_in_list(symbol_ids),
+            codec::escape_sql(root_path)
+        );
+        let batches = Self::collect_batches(&table, &filter).await?;
+        let mut out = Vec::new();
+        for batch in &batches {
+            out.extend(codec::batch_to_references(batch)?);
+        }
+        Ok(out)
+    }
+
+    async fn get_incoming_references_in_root(
+        &self,
+        symbol_ids: &[String],
+        root_path: &str,
+    ) -> Result<Vec<Reference>> {
+        if symbol_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let table = self.references_table().await?;
+        self.ensure_adjacency_indexes(&table).await?;
+        let filter = format!(
+            "target_symbol_id IN ({}) AND root_path = '{}'",
+            codec::sql_in_list(symbol_ids),
+            codec::escape_sql(root_path)
+        );
+        let batches = Self::collect_batches(&table, &filter).await?;
+        let mut out = Vec::new();
+        for batch in &batches {
+            out.extend(codec::batch_to_references(batch)?);
+        }
+        Ok(out)
     }
 
     async fn get_callers(&self, symbol_id: &str) -> Result<Vec<CallEdge>> {
@@ -483,6 +603,7 @@ impl RelationsStore for LanceRelationsStore {
                 tracing::debug!("Dropping relations table {} failed: {}", name, e);
             }
         }
+        *self.adjacency_ready.write().await = false;
         Ok(())
     }
 

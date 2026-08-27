@@ -96,7 +96,10 @@ Returns locations categorized by reference type (Call, Read, Write, Import, etc.
 
 ### `/project:callgraph`
 
-Get the call graph for a function showing callers and callees.
+Get a bounded graph of incoming callers and outgoing callees. Results contain
+unique stable-symbol nodes and provenance-bearing edges; depth 0 is root-only,
+depth 1 adds direct neighbors, and depth 2 expands those neighbors. Cycles do not
+duplicate nodes, and capped graphs report their continuation frontier.
 
 ```
 /project:callgraph

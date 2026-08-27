@@ -176,8 +176,13 @@ Normal retrieval never searches Git history implicitly. History results expose v
 
 9. **get_call_graph** - Get call graph for a function
    - Specify file path, line number, and column for a function
-   - Returns callers (what calls this function) and callees (what this function calls)
-   - Configurable traversal depth (default: 1 level)
+   - Returns a graph-form `nodes`/`edges` response with one node per stable logical `symbol_id`
+   - Exact breadth-first depth semantics: 0 is root-only, 1 adds direct neighbors, and 2 adds their neighbors
+   - Traverses incoming callers, outgoing callees, or both without looping on cycles or duplicating diamond nodes
+   - Defaults to resolved call and constructor-call edges; ambiguous observations can be requested but are never traversed as targets
+   - Supports node/edge budgets plus kind, resolution, language, and canonical path filters
+   - Reports explicit truncation totals and continuation frontier information
+   - Uses persisted incoming/outgoing LanceDB adjacency indexes over the authoritative reference store
    - Useful for understanding code flow and impact analysis
 
 ## Prerequisites
@@ -370,7 +375,11 @@ Add to your Claude Desktop config:
   "file_path": "/path/to/your/project/src/api.rs",
   "line": 100,
   "column": 4,
-  "depth": 2
+  "depth": 2,
+  "max_nodes": 200,
+  "max_edges": 500,
+  "edge_kinds": ["call", "constructor_call"],
+  "resolution_statuses": ["resolved"]
 }
 ```
 
@@ -508,8 +517,11 @@ Project RAG provides code navigation capabilities similar to a Language Server P
 
 **Get Call Graph** (`get_call_graph`):
 - Analyze function call relationships
-- Shows both callers (what calls this function) and callees (what this function calls)
-- Configurable traversal depth for multi-level analysis
+- Returns unique symbol nodes and provenance-bearing edges rather than a duplicated recursive tree
+- Shows incoming callers, outgoing callees, or both with exact configurable traversal depth
+- Handles cycles and diamonds with stable `symbol_id` visited sets
+- Enforces explicit `max_nodes` and `max_edges` response budgets
+- Filters by edge kind, resolution state, language, and canonical project-relative path
 - Great for impact analysis and understanding code flow
 
 **Architecture:**

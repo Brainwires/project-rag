@@ -23,6 +23,7 @@
 //! let references = provider.extract_references(&file_info, &symbol_index)?;
 //! ```
 
+pub mod graph;
 pub mod repomap;
 pub mod storage;
 pub mod types;
@@ -33,10 +34,10 @@ pub mod stack_graphs;
 use anyhow::Result;
 
 pub use types::{
-    CallEdge, CallGraphNode, Definition, DefinitionResult, DispatchKind, EvidenceKind, LinkageKind,
-    LocationRole, PrecisionLevel, Reference, ReferenceCandidate, ReferenceKind, ReferenceResult,
-    ResolutionStatus, SkippedDefinition, SourceLocation, SymbolId, SymbolInfo, SymbolKind,
-    Visibility,
+    CallEdge, CallGraphNode, Definition, DefinitionResult, DispatchKind, EvidenceKind, GraphEdge,
+    LinkageKind, LocationRole, PrecisionLevel, Reference, ReferenceCandidate, ReferenceKind,
+    ReferenceResult, ResolutionStatus, SkippedDefinition, SourceLocation, SymbolId, SymbolInfo,
+    SymbolKind, Visibility,
 };
 
 use crate::indexer::FileInfo;

@@ -679,6 +679,70 @@ fn find_references_m2_filters_default_to_code_only() {
     assert_eq!(request.cursor, 0);
 }
 
+fn graph_request() -> GetCallGraphRequest {
+    GetCallGraphRequest {
+        file_path: "src/main.rs".to_string(),
+        line: 1,
+        column: 0,
+        depth: 2,
+        project: None,
+        include_callers: true,
+        include_callees: true,
+        max_nodes: 200,
+        max_edges: 500,
+        edge_kinds: Vec::new(),
+        resolution_statuses: Vec::new(),
+        language_filters: Vec::new(),
+        path_filters: Vec::new(),
+    }
+}
+
+#[test]
+fn graph_request_accepts_depth_zero_and_bounded_budgets() {
+    let mut request = graph_request();
+    request.depth = 0;
+    request.max_nodes = 1;
+    request.max_edges = 1;
+    assert!(request.validate().is_ok());
+}
+
+#[test]
+fn graph_request_legacy_payload_gets_m3_defaults() {
+    let request: GetCallGraphRequest = serde_json::from_value(serde_json::json!({
+        "file_path": "src/main.rs",
+        "line": 1,
+        "column": 0
+    }))
+    .unwrap();
+    assert_eq!(request.depth, 2);
+    assert_eq!(request.max_nodes, 200);
+    assert_eq!(request.max_edges, 500);
+    assert!(request.include_callers);
+    assert!(request.include_callees);
+    assert!(request.edge_kinds.is_empty());
+    assert!(request.resolution_statuses.is_empty());
+}
+
+#[test]
+fn graph_request_rejects_zero_or_excessive_budgets() {
+    let mut request = graph_request();
+    request.max_nodes = 0;
+    assert!(request.validate().is_err());
+    request.max_nodes = 200;
+    request.max_edges = 20_001;
+    assert!(request.validate().is_err());
+}
+
+#[test]
+fn graph_request_rejects_empty_filters() {
+    let mut request = graph_request();
+    request.path_filters = vec![" ".to_string()];
+    assert!(request.validate().is_err());
+    request.path_filters.clear();
+    request.language_filters = vec![String::new()];
+    assert!(request.validate().is_err());
+}
+
 #[test]
 fn test_incremental_update_request_serialization() {
     let request = IncrementalUpdateRequest {
