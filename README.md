@@ -1,7 +1,6 @@
 # Project RAG - MCP Server for Code Understanding
 
-[![Tests](https://img.shields.io/badge/tests-413%20passing-brightgreen)](https://github.com/Brainwires/project-rag)
-[![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)](https://github.com/Brainwires/project-rag)
+[![Tests](https://img.shields.io/badge/tests-583%20passing-brightgreen)](https://github.com/Brainwires/project-rag)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange)](https://www.rust-lang.org/)
 [![Crates.io](https://img.shields.io/crates/v/project-rag)](https://crates.io/crates/project-rag)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -32,12 +31,14 @@ This MCP server enables AI assistants to efficiently search and understand large
 - **Advanced Filtering**: Search by file type, language, or path patterns
 - **Respects .gitignore**: Automatically excludes ignored files during indexing
 - **Code Navigation**: Find definitions, references, and call graphs (lightweight LSP-like features)
+- **Guarded Runtime Editing**: Read files, apply hash-guarded edits, and atomically patch multiple files with automatic reindexing
+- **Build-Aware Analysis**: Conservatively find unused code and validate removals within explicit build configurations
 - **Adaptive Search Thresholds**: Automatically lowers similarity threshold when no results found (0.7 → 0.6 → 0.5 → 0.4 → 0.3)
-- **Slash Commands**: 9 convenient slash commands via MCP Prompts
+- **Slash Commands**: 14 convenient slash commands via MCP Prompts
 
 ## MCP Slash Commands
 
-The server provides 9 slash commands for quick access in Claude Code:
+The server provides 14 slash commands for quick access in Claude Code:
 
 1. **`/project:index`** - Index a codebase directory (automatically performs full or incremental)
 2. **`/project:query`** - Search the indexed codebase
@@ -48,6 +49,11 @@ The server provides 9 slash commands for quick access in Claude Code:
 7. **`/project:definition`** - Find where a symbol is defined (LSP-like)
 8. **`/project:references`** - Find all references to a symbol
 9. **`/project:callgraph`** - Get call graph for a function (callers/callees)
+10. **`/project:read`** - Read a bounded file range and obtain a content hash
+11. **`/project:edit`** - Apply a guarded single-file edit and reindex
+12. **`/project:patch`** - Apply a guarded atomic multi-file transaction
+13. **`/project:unused`** - Find conservative unused-code candidates
+14. **`/project:validate-removal`** - Validate removal safety within an explicit scope
 
 See [slash-commands.md](docs/slash-commands.md) for detailed usage.
 
@@ -117,7 +123,7 @@ search_by_filters(query="JWT validation", file_extensions=["rs", "go"])
 
 ## MCP Tools
 
-The server provides 9 tools that can be used directly:
+The server provides 15 tools that can be used directly:
 
 1. **index_codebase** - Smartly index a codebase directory
    - Automatically performs full indexing for new codebases
@@ -125,7 +131,7 @@ The server provides 9 tools that can be used directly:
    - Respects .gitignore and exclude patterns
    - Returns mode information (full or incremental)
 
-2. **query_codebase** - Hybrid semantic + keyword search across the indexed code
+2. **query_codebase** - Snippet-first hybrid semantic + keyword search across current indexed code (history is excluded)
    - Combines vector similarity with BM25 keyword matching (enabled by default)
    - Returns relevant code chunks with both vector and keyword scores
    - Configurable result limit and score threshold
@@ -154,23 +160,68 @@ The server provides 9 tools that can be used directly:
    - Date range filtering (ISO 8601 or Unix timestamp)
    - Branch selection support
 
+Normal retrieval never searches Git history implicitly. History results expose validated commit metadata and `origin: "history"`; current-tree results expose `origin: "current"`.
+
 7. **find_definition** - Find where a symbol is defined (LSP-like)
    - Specify file path, line number, and column
    - Returns definition location with symbol metadata
-   - Uses hybrid approach: high-precision stack-graphs (Python, TypeScript, Java, Ruby) or AST-based RepoMap fallback
+   - Uses AST-based RepoMap extraction; the optional stack-graphs feature currently falls back to RepoMap
    - Reports precision level of results
+   - Reports explicit resolution/evidence and candidates; unresolved references never fall back to the enclosing function
 
 8. **find_references** - Find all references to a symbol
    - Specify file path, line number, and column
-   - Returns all locations where the symbol is used
-   - Categorizes reference types: Call, Read, Write, Import, TypeReference, Inheritance, Instantiation
+   - Uses the persisted reference store shared with statistics and graph tools
+   - Separates logical `symbol_id` from declaration/definition/reference `location_id`
+   - Categorizes definitions, declarations, calls, reads, writes, imports/includes, type uses, documentation, comments, and strings
+   - Exposes independent `resolution_status` and `evidence_kind` fields plus candidate sets
+   - Supports language, canonical path, reference-kind, resolution, evidence, and build-configuration filters
+   - Reports per-configuration active/inactive/unknown preprocessor scope
+   - Excludes documentation, comments, and strings by default
+   - Reports exact pre-pagination totals and continuation offsets
    - Optional: include definition site in results
 
 9. **get_call_graph** - Get call graph for a function
    - Specify file path, line number, and column for a function
-   - Returns callers (what calls this function) and callees (what this function calls)
-   - Configurable traversal depth (default: 1 level)
+   - Returns a graph-form `nodes`/`edges` response with one node per stable logical `symbol_id`
+   - Exact breadth-first depth semantics: 0 is root-only, 1 adds direct neighbors, and 2 adds their neighbors
+   - Traverses incoming callers, outgoing callees, or both without looping on cycles or duplicating diamond nodes
+   - Defaults to resolved call, method-call, constructor-call, and object-construction edges; ambiguous observations can be requested but are never traversed as targets
+   - Supports node/edge budgets plus kind, resolution, language, canonical path, and build-configuration filters
+   - Reports explicit truncation totals and continuation frontier information
+   - Uses persisted incoming/outgoing LanceDB adjacency indexes over the authoritative reference store
    - Useful for understanding code flow and impact analysis
+
+10. **list_symbols** - List indexed symbols in a file or project scope
+   - Returns stable symbol IDs, kinds, signatures, and source locations
+   - Supports bounded discovery without requiring a precise cursor position
+
+11. **read_file** - Read a file within an indexed project root
+   - Supports bounded line ranges and reports a content hash for guarded edits
+   - Rejects paths outside indexed roots
+
+12. **edit_file** - Edit a file within an indexed project root
+   - Supports whole-file replacement, range replacement, deletion, and insertion
+   - Accepts an expected hash to prevent overwriting unseen changes
+   - Automatically reindexes the affected project
+
+13. **apply_patch** - Atomic multi-file editing transaction
+   - Validates canonical paths, hashes, line ranges, encodings, newline styles, and sizes before writing
+   - Supports dry-run, creation, replacement, insertion, deletion, rollback, and one reindex per transaction
+   - Publishes one monotonic index generation or marks analysis stale on reindex failure
+
+14. **find_unused** - Conservative configuration-scoped unused analysis
+   - Auto-discovers `compile_commands.json` and supports explicit build configurations
+   - Tracks include paths, definitions, language standards, forced includes, and generated headers
+   - Reports `unused_in_analyzed_configurations` or `inconclusive`, never context-free universal unused claims
+   - Exposes analyzed config IDs, preprocessor state, completeness, unresolved dependency kinds, and limitations
+   - Dynamic registration, reflection, generated wiring, missing configurations, and parser omissions prevent destructive-edit safety
+   - `safe_for_destructive_edit` remains false; use findings as evidence to investigate, not permission to delete
+
+15. **validate_removal** - Scoped removal-safety validation
+   - Returns `SAFE`, `UNSAFE`, or `INCONCLUSIVE` for one authoritative current-tree symbol
+   - Checks resolved/uncertain references, build and preprocessor scope, generated wiring, and dynamic dispatch
+   - Reports evidence, limitations, blocking references, and the exact index generation analyzed
 
 ## Prerequisites
 
@@ -181,7 +232,10 @@ The server provides 9 tools that can be used directly:
 
 **LanceDB (Default - Embedded, Stable)**
 
-No additional setup needed! LanceDB is an embedded vector database that runs directly in the application. It stores data in `./.lancedb` directory by default.
+LanceDB is embedded and needs no separate server, but its storage location must be explicit.
+Set `PROJECT_RAG_LANCEDB_PATH` to a project-local directory before starting project-RAG.
+The process returns a configuration error when the variable is missing or empty; it never
+falls back to a shared user-level database.
 
 **Why LanceDB is the default:**
 - **Embedded** - No external dependencies or servers required
@@ -248,8 +302,12 @@ cargo build --release --no-default-features --features qdrant-backend
 The server communicates over stdio following the MCP protocol:
 
 ```bash
+export PROJECT_RAG_LANCEDB_PATH="$PWD/.project-rag/lancedb"
 ./target/release/project-rag
 ```
+
+The default LanceDB build requires `PROJECT_RAG_LANCEDB_PATH`. Give each project
+its own database directory; the server intentionally has no shared user-level fallback.
 
 ### Configuring in Claude Code
 
@@ -260,10 +318,13 @@ Add the MCP server to Claude Code using the CLI:
 cd /path/to/project-rag
 
 # Add the MCP server to Claude Code
-claude mcp add project --command "$(pwd)/target/release/project-rag"
+claude mcp add project --command "$(pwd)/target/release/project-rag" \
+  --env PROJECT_RAG_LANCEDB_PATH="$(pwd)/.project-rag/lancedb"
 
 # Or with logging enabled
-claude mcp add project --command "$(pwd)/target/release/project-rag" --env RUST_LOG=info
+claude mcp add project --command "$(pwd)/target/release/project-rag" \
+  --env PROJECT_RAG_LANCEDB_PATH="$(pwd)/.project-rag/lancedb" \
+  --env RUST_LOG=info
 ```
 
 After adding, restart Claude Code to load the server. The slash commands (`/project:index`, `/project:query`, etc.) will be available immediately.
@@ -282,6 +343,7 @@ Add to your Claude Desktop config:
     "project-rag": {
       "command": "/absolute/path/to/project-rag/target/release/project-rag",
       "env": {
+        "PROJECT_RAG_LANCEDB_PATH": "/absolute/path/to/project/.project-rag/lancedb",
         "RUST_LOG": "info"
       }
     }
@@ -359,7 +421,11 @@ Add to your Claude Desktop config:
   "file_path": "/path/to/your/project/src/api.rs",
   "line": 100,
   "column": 4,
-  "depth": 2
+  "depth": 2,
+  "max_nodes": 200,
+  "max_edges": 500,
+  "edge_kinds": ["call", "constructor_call"],
+  "resolution_statuses": ["resolved"]
 }
 ```
 
@@ -377,7 +443,7 @@ project-rag/
 │   │   └── fastembed_manager.rs  # all-MiniLM-L6-v2 implementation
 │   ├── vector_db/          # Vector database implementations
 │   │   ├── mod.rs          # VectorDatabase trait
-│   │   ├── lance_client.rs # LanceDB + Tantivy hybrid search (default)
+│   │   ├── lance_client/   # LanceDB + Tantivy hybrid search (default)
 │   │   └── qdrant_client.rs  # Qdrant implementation (optional)
 │   ├── indexer/            # File walking and code chunking
 │   │   ├── mod.rs          # Module exports
@@ -394,10 +460,10 @@ project-rag/
 │   │   │   └── reference_finder.rs  # Find references via identifier matching
 │   │   ├── storage/        # Relations storage layer
 │   │   │   ├── mod.rs      # RelationsStore trait
-│   │   │   └── lance_store.rs  # LanceDB storage (placeholder)
-│   │   └── stack_graphs/   # Optional: High-precision name resolution
-│   │       └── mod.rs      # StackGraphsProvider (feature-gated)
-│   ├── mcp_server.rs       # MCP server with 9 tools
+│   │   │   └── lance_store/ # Persistent LanceDB relation storage
+│   │   └── stack_graphs/   # Reserved feature-gated provider (currently falls back)
+│   │       └── mod.rs      # StackGraphsProvider placeholder
+│   ├── mcp_server.rs       # MCP server with 15 tools and 14 prompts
 │   ├── types/              # Request/Response types with JSON schema
 │   │   └── mod.rs          # All MCP request/response types
 │   ├── main.rs             # Binary entry point with stdio transport
@@ -412,12 +478,19 @@ project-rag/
 ## Configuration
 
 ### Environment Variables
+- `PROJECT_RAG_LANCEDB_PATH` - Required project-local database directory for the default LanceDB build
+- `PROJECT_RAG_DB_BACKEND` - Backend name (`lancedb` or `qdrant`); the compiled feature must support it
+- `PROJECT_RAG_QDRANT_URL` - Qdrant gRPC URL (default: `http://localhost:6334`)
+- `PROJECT_RAG_MODEL` - FastEmbed model name
+- `PROJECT_RAG_BATCH_SIZE` - Embedding batch size (default: `8`)
+- `PROJECT_RAG_MIN_SCORE` - Default minimum search score (default: `0.7`)
 - `RUST_LOG` - Set logging level (options: `error`, `warn`, `info`, `debug`, `trace`)
-  - Example: `RUST_LOG=debug cargo run`
+  - Example: `PROJECT_RAG_LANCEDB_PATH=.project-rag/lancedb RUST_LOG=debug cargo run`
 
 ### Qdrant Configuration
-- Currently hardcoded to `http://localhost:6334`
-- Future: Add configuration file support
+- Build with `--no-default-features --features qdrant-backend`
+- Defaults to `http://localhost:6334`; override with `PROJECT_RAG_QDRANT_URL`
+- Requires a running Qdrant server
 
 ### Embedding Model
 - Default: `all-MiniLM-L6-v2` (384 dimensions)
@@ -435,12 +508,13 @@ project-rag/
 - **Model**: all-MiniLM-L6-v2 (Sentence Transformers)
 - **Dimensions**: 384
 - **Library**: fastembed-rs with ONNX runtime
-- **Performance**: ~500 embeddings/second
+- **Execution**: Local ONNX inference; throughput depends on CPU and configured batch size
 
 ### Vector Database
-- **Engine**: Qdrant
+- **Default engine**: Embedded LanceDB with a required project-local storage path
+- **Optional engine**: Qdrant, selected at compile time with `qdrant-backend`
 - **Distance Metric**: Cosine similarity
-- **Index**: HNSW for fast approximate nearest neighbor search
+- **Keyword Index**: Tantivy BM25 for current-tree hybrid retrieval
 - **Payload**: Stores file path, project, line numbers, language, hash, timestamp, content
 
 ### Hybrid Search
@@ -450,6 +524,7 @@ project-rag/
 - **BM25 Parameters**: Uses Tantivy's optimized BM25 implementation
 - **Ranking**: RRF combines both rankings using 1/(k+rank) formula
 - **Performance**: Both indexes queried in parallel for fast results
+- **Isolation**: Current-tree and Git-history records occupy distinct retrieval spaces
 
 ### Adaptive Threshold Logic
 
@@ -482,29 +557,35 @@ Project RAG provides code navigation capabilities similar to a Language Server P
 
 **Find Definition** (`find_definition`):
 - Locate where symbols (functions, classes, variables) are defined
-- Uses hybrid approach: high-precision stack-graphs for Python, TypeScript, Java, Ruby
-- Falls back to AST-based RepoMap analysis for all other languages
+- Uses AST-based RepoMap analysis for supported tree-sitter languages
+- The optional `stack-graphs` feature is reserved for future high-precision resolution and currently falls back to RepoMap
 - Reports precision level (High, Medium, Low) in results
 
 **Find References** (`find_references`):
 - Find all locations where a symbol is used across the codebase
-- Categorizes reference types: Call, Read, Write, Import, TypeReference, Inheritance, Instantiation
+- Reads the same persisted, classified reference rows used for relation statistics
+- Categorizes executable references separately from documentation, comments, and strings
+- Never turns a highest-ranked name match into a resolved edge without parser/resolver evidence
+- Returns `resolved`, `ambiguous`, or `unresolved` independently from `semantic`, `syntactic`, or `heuristic` evidence
 - Useful for understanding how code is connected
 - Option to include/exclude the definition site
 
 **Get Call Graph** (`get_call_graph`):
 - Analyze function call relationships
-- Shows both callers (what calls this function) and callees (what this function calls)
-- Configurable traversal depth for multi-level analysis
+- Returns unique symbol nodes and provenance-bearing edges rather than a duplicated recursive tree
+- Shows incoming callers, outgoing callees, or both with exact configurable traversal depth
+- Handles cycles and diamonds with stable `symbol_id` visited sets
+- Enforces explicit `max_nodes` and `max_edges` response budgets
+- Filters by edge kind, resolution state, language, and canonical project-relative path
 - Great for impact analysis and understanding code flow
 
 **Architecture:**
 ```
 RelationsProvider (trait)
-├── StackGraphsProvider (high precision: ~95%)
-│   └── Supports: Python, TypeScript, Java, Ruby
-└── RepoMapProvider (fallback: ~70% precision)
-    └── Supports: All tree-sitter languages (12+)
+├── RepoMapProvider (active AST-based provider)
+│   └── Supports: All configured tree-sitter languages (12+)
+└── StackGraphsProvider (reserved feature; not yet implemented)
+    └── Initialization falls back to RepoMap
 ```
 
 **When to Use:**
@@ -517,8 +598,8 @@ RelationsProvider (trait)
 Project RAG uses a **two-layer locking system** to prevent multiple processes from indexing the same codebase simultaneously:
 
 **Layer 1: Filesystem Locks (Cross-Process)**
-- Uses `flock()` system call for OS-level exclusive locks
-- Lock files stored in `~/.local/share/project-rag/locks/` (or `brainwires/locks/`)
+- Uses cross-platform OS-level file locking through `fs2`
+- Lock files are stored in the platform-specific project-rag data directory
 - Automatically released when process exits (even on crash)
 - Prevents multiple Claude Code sessions from hammering CPU with duplicate indexing
 
@@ -602,7 +683,10 @@ The BM25 (Tantivy) index uses additional file-based locks to prevent concurrent 
 ### Running Tests
 
 ```bash
-# Run all unit tests (413 tests with ~94% coverage)
+# Run the complete suite serially (583 passing; 12 intentionally ignored)
+PROJECT_RAG_LANCEDB_PATH="$PWD/target/test-lancedb" cargo test -- --test-threads=1
+
+# Run the 564 library tests
 cargo test --lib
 
 # Run specific module tests
@@ -617,7 +701,7 @@ cargo test --lib indexing::tests       # Includes error path & edge case tests
 cargo test --lib -- --nocapture
 
 # Run with code coverage
-cargo llvm-cov --lib --html
+PROJECT_RAG_LANCEDB_PATH="$PWD/target/test-lancedb" cargo llvm-cov --all-targets --html
 # Open target/llvm-cov/html/index.html to view coverage report
 ```
 
@@ -640,8 +724,9 @@ cargo check
 # Format code
 cargo fmt
 
-# Lint with clippy
-cargo clippy
+# Lint both supported backend configurations with warnings denied
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --no-default-features --features qdrant-backend -- -D warnings
 
 # Fix clippy warnings
 cargo clippy --fix
@@ -659,39 +744,33 @@ RUST_LOG=trace cargo run
 
 ## Performance
 
-### Benchmarks (Typical Hardware)
+### Benchmarks
 
-- **Indexing Speed**: ~1000 files/minute
-  - Depends on file size and complexity
-  - Includes file I/O, hashing, chunking, embedding generation
+Performance depends on the model cache, storage, CPU, project languages, and backend.
+Run the included Criterion indexing/chunking benchmarks on the deployment hardware:
 
-- **Search Latency**: 20-30ms per query
-  - ~95% recall with HNSW index
-  - Sub-50ms for most queries
+```bash
+cargo bench --bench indexing_benchmark
+```
 
-- **Memory Usage**:
-  - Base: ~100MB
-  - Embedding model: ~50MB
-  - Per 10k chunks: ~40MB (embeddings + metadata)
-
-- **Storage**:
-  - Embeddings: ~1.5KB per chunk (384 floats)
-  - Typical project (1000 files): ~75MB in Qdrant
+Additional ignored tests provide manual measurements for relation storage and graph
+queries, build-aware unused analysis, generation caches, removal decisions, and atomic
+multi-file staging. Run a named measurement explicitly with `--ignored --nocapture`.
 
 ### Optimization Tips
 
 1. **Adjust chunk size**: Smaller chunks = more precise but slower indexing
 2. **Use filters**: Pre-filter by language/extension for faster searches
-3. **Batch processing**: Default 32 chunks per batch is optimal for most systems
+3. **Batch processing**: Tune `PROJECT_RAG_BATCH_SIZE` from its responsive default of 8
 4. **Incremental updates**: Use after initial index to save time
 
 ## Current Status
 
-### ✅ Production Ready - 100% Complete
+### Current implementation
 
 - Core architecture with modular design
-- All 9 MCP tools implemented and working
-- **All 9 MCP slash commands implemented**
+- All 15 MCP tools implemented and working
+- **All 14 MCP slash commands implemented**
 - **Hybrid search** - Vector similarity + Full BM25 with IDF
 - **AST-based chunking** - Semantic code extraction for 12 languages
 - **Code navigation** - Find definitions, references, and call graphs (LSP-like)
@@ -699,30 +778,16 @@ RUST_LOG=trace cargo run
 - **Persistent hash cache** - Fast incremental updates across restarts
 - **Concurrent access protection** - Smart lock management prevents index corruption
 - FastEmbed integration for local embeddings
-- Qdrant vector database integration
+- Embedded LanceDB default and optional Qdrant integration
 - File walking with .gitignore support
 - Language detection (40+ file types: code, docs, configs)
 - PDF to Markdown conversion with table preservation
 - SHA256-based change detection
-- 413 unit tests passing (including relations, PDF extraction, BM25/RRF, adaptive threshold, cross-process locking, and lock safety tests)
+- 583 tests passing across library, integration, and documentation suites (12 manual or documentation tests intentionally ignored)
 - Comprehensive documentation
 - **Full MCP prompts support enabled**
 - **Hybrid search with Tantivy BM25 + LanceDB vector using RRF**
-- **Hybrid relations provider** - Stack-graphs for Python/TS/Java/Ruby, RepoMap fallback for all languages
-
-### 📋 Known Limitations
-
-1. **Qdrant API Changes**
-   - Requires builder patterns (UpsertPointsBuilder, SearchPointsBuilder, etc.)
-   - All builders implemented correctly
-
-2. **FastEmbed Mutability**
-   - Uses unsafe workaround for mutable model access
-   - Works correctly but should be refactored to use Arc<Mutex<>>
-
-3. **Async Trait Warnings**
-   - 9 harmless warnings about `async fn` in public traits
-   - Cosmetic issue, does not affect functionality
+- **Relations provider** - AST-based RepoMap extraction with explicit resolution and evidence metadata
 
 ## Limitations
 
@@ -737,8 +802,8 @@ RUST_LOG=trace cargo run
 - **Path Filtering**: Currently post-query filtering (not optimized)
   - Future: Add Qdrant payload indexing for path patterns
 
-- **No Configuration File**: All settings hardcoded
-  - Future: Add TOML/YAML config support
+- **Conservative removal analysis**: Missing build configurations, generated wiring,
+  reflection, or dynamic dispatch can intentionally produce `INCONCLUSIVE`
 
 ### Scale Limitations
 
@@ -801,14 +866,12 @@ export HF_ENDPOINT=https://hf-mirror.com
 ## Future Enhancements
 
 ### High Priority
-- [ ] Add comprehensive integration tests
-- [ ] Configuration file support (TOML)
 - [ ] Cache IDF statistics to disk for faster startup
+- [ ] Expand automated Qdrant integration coverage against supported server versions
 
 ### Medium Priority
-- [ ] Embedded vector DB option (no external dependencies)
 - [ ] Support for more embedding models
-- [ ] Performance benchmarks and profiling
+- [ ] Expand cross-platform performance baselines and profiling
 - [ ] AST support for more languages (Kotlin, Perl, Scala, etc.)
 
 ### Low Priority
@@ -850,6 +913,8 @@ Contributions welcome! Please ensure:
 
 - **rmcp**: Official Rust Model Context Protocol SDK
 - **Qdrant**: High-performance vector database
+- **LanceDB**: Embedded vector storage
+- **Tantivy**: Local BM25 keyword indexing
 - **FastEmbed**: Fast local embedding generation
 - **Claude**: For MCP protocol and testing
 

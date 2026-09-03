@@ -7,6 +7,51 @@ fn test_cancel_token() -> CancellationToken {
     CancellationToken::new()
 }
 
+fn diagnostic_file(path: &str, extension: &str) -> FileInfo {
+    FileInfo {
+        path: std::path::PathBuf::from(path),
+        relative_path: path.to_string(),
+        root_path: "/test".to_string(),
+        project: None,
+        extension: Some(extension.to_string()),
+        language: None,
+        content: String::new(),
+        hash: "hash".to_string(),
+    }
+}
+
+#[test]
+fn missing_compilation_database_is_reported_only_for_build_sensitive_files() {
+    let catalog = BuildConfigCatalog {
+        configurations: Vec::new(),
+        diagnostics: vec![
+            "No compile_commands.json found; configure it".to_string(),
+            "No analyzed build configuration is available".to_string(),
+        ],
+    };
+
+    assert!(
+        relevant_build_diagnostics(&catalog, &[diagnostic_file("src/lib.rs", "rs")]).is_empty()
+    );
+    assert_eq!(
+        relevant_build_diagnostics(&catalog, &[diagnostic_file("src/main.cpp", "cpp")]).len(),
+        2
+    );
+}
+
+#[test]
+fn invalid_explicit_build_database_is_reported_for_every_project_type() {
+    let catalog = BuildConfigCatalog {
+        configurations: Vec::new(),
+        diagnostics: vec!["Invalid compilation database 'custom.json'".to_string()],
+    };
+
+    assert_eq!(
+        relevant_build_diagnostics(&catalog, &[diagnostic_file("src/lib.rs", "rs")]),
+        catalog.diagnostics
+    );
+}
+
 // Helper to create test client
 async fn create_test_client() -> (RagClient, TempDir) {
     let temp_dir = TempDir::new().unwrap();
@@ -534,7 +579,8 @@ async fn test_index_preserves_cache_across_operations() {
 
     // Verify cache was saved
     let cache = client.hash_cache.read().await;
-    let cached_hashes = cache.get_root(&data_dir.to_string_lossy().to_string());
+    let normalized = RagClient::normalize_path(&data_dir.to_string_lossy()).unwrap();
+    let cached_hashes = cache.get_root(&normalized);
     assert!(cached_hashes.is_some());
     assert!(!cached_hashes.unwrap().is_empty());
 }
@@ -980,8 +1026,14 @@ async fn test_concurrent_index_same_path_waits_for_result() {
     // - Other task waits for filesystem lock, then returns (files_indexed = 0 since it waited)
     //
     // The important thing is both succeed without errors
-    assert!(response1.errors.is_empty(), "Task 1 should succeed without errors");
-    assert!(response2.errors.is_empty(), "Task 2 should succeed without errors");
+    assert!(
+        response1.errors.is_empty(),
+        "Task 1 should succeed without errors"
+    );
+    assert!(
+        response2.errors.is_empty(),
+        "Task 2 should succeed without errors"
+    );
 
     // At least one should have done actual indexing
     let total = response1.files_indexed + response2.files_indexed;
@@ -1047,8 +1099,14 @@ async fn test_concurrent_index_different_paths_both_run() {
 
     // Both should succeed independently
     let (result1, result2) = tokio::join!(handle1, handle2);
-    assert!(result1.unwrap().is_ok(), "First path should index successfully");
-    assert!(result2.unwrap().is_ok(), "Second path should index successfully");
+    assert!(
+        result1.unwrap().is_ok(),
+        "First path should index successfully"
+    );
+    assert!(
+        result2.unwrap().is_ok(),
+        "Second path should index successfully"
+    );
 }
 
 // ===== Cancellation Tests =====
@@ -1130,9 +1188,9 @@ async fn test_cancellation_during_file_walk() {
 
     // Should either succeed quickly (if file walk completed before cancel)
     // or fail with cancellation error
-    if result.is_err() {
+    if let Err(error) = result {
         // Use {:#} format to see full error chain (anyhow wraps errors with context)
-        let error = format!("{:#}", result.unwrap_err());
+        let error = format!("{error:#}");
         assert!(
             error.contains("cancelled"),
             "Error should mention cancellation: {}",
@@ -1277,10 +1335,16 @@ async fn test_uncancelled_token_completes_normally() {
 async fn test_cancel_token_cancellation_is_detected() {
     // Test that our check_cancelled macro works correctly
     let cancel_token = CancellationToken::new();
-    assert!(!cancel_token.is_cancelled(), "Should not be cancelled initially");
+    assert!(
+        !cancel_token.is_cancelled(),
+        "Should not be cancelled initially"
+    );
 
     cancel_token.cancel();
-    assert!(cancel_token.is_cancelled(), "Should be cancelled after cancel()");
+    assert!(
+        cancel_token.is_cancelled(),
+        "Should be cancelled after cancel()"
+    );
 }
 
 #[tokio::test]
@@ -1296,7 +1360,9 @@ async fn test_cancellation_during_embedding_batch() {
             data_dir.join(format!("file{}.rs", i)),
             format!(
                 "fn func_{} () {{\n    let x = {};\n    let y = {};\n    println!(\"test\");\n}}",
-                i, i, i * 2
+                i,
+                i,
+                i * 2
             ),
         )
         .unwrap();
@@ -1325,9 +1391,9 @@ async fn test_cancellation_during_embedding_batch() {
     .await;
 
     // Either succeeds (if embedding finished before cancel) or fails with cancellation
-    if result.is_err() {
+    if let Err(error) = result {
         // Use {:#} format to see full error chain (anyhow wraps errors with context)
-        let error = format!("{:#}", result.unwrap_err());
+        let error = format!("{error:#}");
         assert!(
             error.contains("cancelled"),
             "Error should mention cancellation: {}",

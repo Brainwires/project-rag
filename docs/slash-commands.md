@@ -1,6 +1,6 @@
 # Slash Commands
 
-Project RAG provides 9 slash commands via MCP Prompts for quick access in Claude Code.
+Project RAG provides 14 slash commands via MCP Prompts for quick access in Claude Code.
 
 ## Quick Reference
 
@@ -15,6 +15,11 @@ Project RAG provides 9 slash commands via MCP Prompts for quick access in Claude
 | `/project:definition` | Find where a symbol is defined |
 | `/project:references` | Find all references to a symbol |
 | `/project:callgraph` | Get call graph for a function |
+| `/project:read` | Read a file inside an indexed project |
+| `/project:edit` | Edit and reindex a file inside an indexed project |
+| `/project:patch` | Apply one guarded atomic multi-file transaction |
+| `/project:unused` | Find conservative unused-code candidates |
+| `/project:validate-removal` | Validate removal safety in an explicit scope |
 
 ## Usage
 
@@ -96,13 +101,63 @@ Returns locations categorized by reference type (Call, Read, Write, Import, etc.
 
 ### `/project:callgraph`
 
-Get the call graph for a function showing callers and callees.
+Get a bounded graph of incoming callers and outgoing callees. Results contain
+unique stable-symbol nodes and provenance-bearing edges; depth 0 is root-only,
+depth 1 adds direct neighbors, and depth 2 expands those neighbors. Cycles do not
+duplicate nodes, and capped graphs report their continuation frontier.
 
 ```
 /project:callgraph
 ```
 
 Useful for understanding code flow and impact analysis.
+
+### `/project:read`
+
+Read all or part of a file within an indexed project root. The result includes a
+content hash that can guard a subsequent edit against concurrent changes.
+
+```
+/project:read
+```
+
+### `/project:edit`
+
+Replace a whole file, replace or delete a line range, or insert lines within an
+indexed project root. Successful edits automatically reindex the affected project.
+
+```
+/project:edit
+```
+
+### `/project:unused`
+
+Find unused imports and dead-symbol candidates within analyzed build
+configurations. Results disclose conditional state, completeness, unresolved
+dependency kinds, and limitations; they are evidence for investigation and never
+automatic permission to delete code.
+
+```
+/project:unused
+```
+
+### `/project:patch`
+
+Read affected files for their raw-content hashes, dry-run one multi-file patch,
+then atomically commit and reindex once if validation succeeds.
+
+```
+/project:patch
+```
+
+### `/project:validate-removal`
+
+Validate one current-tree `symbol_id`. The result is scoped `SAFE`, `UNSAFE`, or
+`INCONCLUSIVE` with evidence, limitations, and blocking reference provenance.
+
+```
+/project:validate-removal
+```
 
 ## How Slash Commands Work
 

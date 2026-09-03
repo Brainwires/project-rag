@@ -78,7 +78,9 @@ fn test_normalize_path_absolute() {
     let result = RagClient::normalize_path(&path);
     assert!(result.is_ok());
     let normalized = result.unwrap();
-    assert!(normalized.starts_with('/'));
+    // `starts_with('/')` doesn't hold on Windows, where canonicalize() yields
+    // `\\?\C:\...`; `Path::is_absolute()` is the real, cross-platform invariant.
+    assert!(std::path::Path::new(&normalized).is_absolute());
 }
 
 // ===== index_codebase Tests =====
@@ -205,7 +207,7 @@ async fn test_query_codebase_with_data() {
     assert!(result.is_ok());
 
     let response = result.unwrap();
-    assert!(response.results.len() > 0);
+    assert!(!response.results.is_empty());
     assert!(response.duration_ms > 0);
 }
 
@@ -478,9 +480,17 @@ async fn test_search_with_filters_language_filter() {
     // Create files in different languages
     let data_dir = temp_dir.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
-    std::fs::write(data_dir.join("main.rs"), "fn main() { println!(\"Hello\"); }").unwrap();
+    std::fs::write(
+        data_dir.join("main.rs"),
+        "fn main() { println!(\"Hello\"); }",
+    )
+    .unwrap();
     std::fs::write(data_dir.join("main.py"), "def main(): print('Hello')").unwrap();
-    std::fs::write(data_dir.join("main.js"), "function main() { console.log('Hello'); }").unwrap();
+    std::fs::write(
+        data_dir.join("main.js"),
+        "function main() { console.log('Hello'); }",
+    )
+    .unwrap();
 
     let index_req = IndexRequest {
         path: data_dir.to_string_lossy().to_string(),
@@ -528,7 +538,11 @@ async fn test_search_with_filters_path_pattern() {
     std::fs::create_dir_all(&src_dir).unwrap();
     std::fs::create_dir_all(&tests_dir).unwrap();
 
-    std::fs::write(src_dir.join("lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { a + b }").unwrap();
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+    )
+    .unwrap();
     std::fs::write(
         tests_dir.join("test_lib.rs"),
         "fn test_add() { assert_eq!(add(1, 2), 3); }",
@@ -560,10 +574,13 @@ async fn test_search_with_filters_path_pattern() {
     assert!(result.is_ok());
 
     let response = result.unwrap();
-    // All results should be from src directory
+    // All results should be from src directory. Compare with '/'-normalized
+    // separators since `file_path` uses the OS-native separator, which is '\'
+    // on Windows.
     for result in &response.results {
+        let normalized = result.file_path.replace('\\', "/");
         assert!(
-            result.file_path.contains("src/") || result.file_path.starts_with("src/"),
+            normalized.contains("src/") || normalized.starts_with("src/"),
             "Expected path to contain src/, got: {}",
             result.file_path
         );
@@ -627,15 +644,18 @@ async fn test_search_with_filters_combined_filters() {
     assert!(result.is_ok());
 
     let response = result.unwrap();
-    // All results should be Rust files in src directory
+    // All results should be Rust files in src directory. Compare with
+    // '/'-normalized separators since `file_path` uses the OS-native separator,
+    // which is '\' on Windows.
     for result in &response.results {
         assert!(
             result.file_path.ends_with(".rs"),
             "Expected .rs file, got: {}",
             result.file_path
         );
+        let normalized = result.file_path.replace('\\', "/");
         assert!(
-            result.file_path.contains("src/") || result.file_path.starts_with("src/"),
+            normalized.contains("src/") || normalized.starts_with("src/"),
             "Expected path to contain src/, got: {}",
             result.file_path
         );
@@ -925,7 +945,7 @@ async fn test_full_workflow_index_query_clear() {
         hybrid: true,
     };
     let query_resp = client.query_codebase(query_req).await.unwrap();
-    assert!(query_resp.results.len() > 0);
+    assert!(!query_resp.results.is_empty());
 
     // Step 3: Statistics
     let stats = client.get_statistics().await.unwrap();
@@ -998,7 +1018,11 @@ async fn test_index_lock_prevents_duplicate_indexing() {
     // Create data to index
     let data_dir = temp_dir.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
-    std::fs::write(data_dir.join("test.rs"), "fn main() { println!(\"test\"); }").unwrap();
+    std::fs::write(
+        data_dir.join("test.rs"),
+        "fn main() { println!(\"test\"); }",
+    )
+    .unwrap();
 
     let path = data_dir.to_string_lossy().to_string();
 
@@ -1014,7 +1038,10 @@ async fn test_index_lock_prevents_duplicate_indexing() {
     // With cross-process locking, this could be WaitForResult (same process, in-memory)
     // or WaitForFilesystemLock (different process holding filesystem lock)
     assert!(
-        matches!(lock_result2, IndexLockResult::WaitForResult(_) | IndexLockResult::WaitForFilesystemLock(_)),
+        matches!(
+            lock_result2,
+            IndexLockResult::WaitForResult(_) | IndexLockResult::WaitForFilesystemLock(_)
+        ),
         "Second call should wait for the first operation (got: {:?})",
         match &lock_result2 {
             IndexLockResult::Acquired(_) => "Acquired",
@@ -1134,7 +1161,10 @@ async fn test_index_lock_path_normalization() {
     // Both WaitForResult and WaitForFilesystemLock indicate the lock is shared
     let lock_result2 = client.try_acquire_index_lock(&path2).await.unwrap();
     assert!(
-        matches!(lock_result2, IndexLockResult::WaitForResult(_) | IndexLockResult::WaitForFilesystemLock(_)),
+        matches!(
+            lock_result2,
+            IndexLockResult::WaitForResult(_) | IndexLockResult::WaitForFilesystemLock(_)
+        ),
         "Equivalent paths should share the same lock"
     );
 
@@ -1276,12 +1306,21 @@ async fn test_concurrent_index_calls_share_result() {
     //   waits for filesystem lock then returns immediately (files_indexed = 0)
     //
     // The important thing is both succeed without errors
-    assert!(resp1.errors.is_empty(), "Task 1 should succeed without errors");
-    assert!(resp2.errors.is_empty(), "Task 2 should succeed without errors");
+    assert!(
+        resp1.errors.is_empty(),
+        "Task 1 should succeed without errors"
+    );
+    assert!(
+        resp2.errors.is_empty(),
+        "Task 2 should succeed without errors"
+    );
 
     // At least one should have done the actual indexing
     let total_indexed = resp1.files_indexed + resp2.files_indexed;
-    assert!(total_indexed >= 1, "At least one task should have indexed files");
+    assert!(
+        total_indexed >= 1,
+        "At least one task should have indexed files"
+    );
 }
 
 #[tokio::test]
@@ -1387,4 +1426,188 @@ async fn test_index_lock_can_reacquire_after_drop_without_release() {
         guard.broadcast_result(&result);
         guard.release().await;
     }
+}
+
+// ===== Regression tests for the get_call_graph callee path =====
+
+#[test]
+fn callee_fix_definition_storage_id_parsing() {
+    // Reference::target_symbol_id holds a logical `sym:v3:<digest>:<name>` id.
+    use crate::relations::Definition;
+
+    let plain = "sym:v3:0123456789abcdef:WndProc";
+    assert_eq!(Definition::name_from_storage_id(plain), Some("WndProc"));
+    assert_eq!(
+        crate::relations::SymbolId::from_storage_id(plain).map(|s| s.name),
+        Some("WndProc".to_string())
+    );
+
+    // Malformed input is rejected rather than guessed at.
+    assert_eq!(
+        Definition::name_from_storage_id("Unit1.cpp:WndProc:16359"),
+        None
+    );
+    assert_eq!(Definition::name_from_storage_id("sym:v2:nocolons"), None);
+}
+
+#[test]
+fn callee_fix_call_identifiers_in_span() {
+    let src = concat!(
+        "void __fastcall TForm1::WndProc(TMessage& msg)\n",
+        "{\n",
+        "    EnterServiceMenu();\n",
+        "    if (flag) { CheckTerminalState(); }\n",
+        "    int total = alpha + beta;\n",
+        "}\n",
+        "void TForm1::Other() { NotInSpan(); }\n",
+    );
+
+    let names = RagClient::call_identifiers_in_span(src, 1, 6);
+    assert!(names.contains(&"EnterServiceMenu".to_string()));
+    assert!(names.contains(&"CheckTerminalState".to_string()));
+
+    // Plain operands are not call sites.
+    assert!(!names.contains(&"total".to_string()));
+    assert!(!names.contains(&"alpha".to_string()));
+
+    // The span bound is honoured in both directions.
+    assert!(!names.contains(&"NotInSpan".to_string()));
+    let tail = RagClient::call_identifiers_in_span(src, 7, 7);
+    assert!(tail.contains(&"NotInSpan".to_string()));
+    assert!(!tail.contains(&"EnterServiceMenu".to_string()));
+}
+
+#[test]
+fn unresolved_identifier_does_not_resolve_to_enclosing_function() {
+    use crate::relations::RelationsProvider;
+
+    let source = "fn owner() {\n    unknown_call();\n}\n";
+    let info = crate::indexer::FileInfo {
+        path: std::path::PathBuf::from("src/lib.rs"),
+        relative_path: "src/lib.rs".to_string(),
+        root_path: "/project".to_string(),
+        project: Some("stable-project".to_string()),
+        extension: Some("rs".to_string()),
+        language: Some("Rust".to_string()),
+        content: source.to_string(),
+        hash: "hash".to_string(),
+    };
+    let provider = crate::relations::HybridRelationsProvider::new(false).unwrap();
+    let definitions = provider.extract_definitions(&info).unwrap();
+    let column = source.lines().nth(1).unwrap().find("unknown_call").unwrap();
+    let resolved = RagClient::resolve_symbol_at(&definitions, source, 2, column, false);
+    assert!(resolved.is_none());
+}
+
+/// Smoke test for list_symbols against a real source tree.
+///
+/// Skipped unless PROJECT_RAG_SMOKE_FILE is set, because it depends on a file outside
+/// this repository. list_symbols touches no vector DB, so this exercises the real
+/// extraction path without an index.
+#[tokio::test]
+async fn list_symbols_smoke_on_real_file() {
+    let path = match std::env::var("PROJECT_RAG_SMOKE_FILE") {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let (client, _tmp) = create_test_client().await;
+    let resp = client
+        .list_symbols(ListSymbolsRequest {
+            file_path: path,
+            project: None,
+            kinds: Vec::new(),
+        })
+        .await
+        .expect("list_symbols should succeed");
+
+    eprintln!(
+        "SMOKE total_count={} precision={}",
+        resp.total_count, resp.precision
+    );
+    for s in resp.symbols.iter().take(12) {
+        eprintln!("SMOKE  {:>6}  {:?}  {}", s.start_line, s.kind, s.name);
+    }
+    for want in [
+        "WndProc",
+        "BindCommands",
+        "AttachPinPadEventHandlers",
+        "IsSmartCardPresent",
+    ] {
+        let hit = resp.symbols.iter().find(|s| s.name == want);
+        eprintln!(
+            "SMOKE  want {:<26} -> {:?}",
+            want,
+            hit.map(|s| s.start_line)
+        );
+    }
+
+    assert!(resp.total_count > 0, "expected at least one symbol");
+}
+
+#[test]
+fn retrieval_budget_returns_snippets_with_exact_lines() {
+    let content = (1..=300)
+        .map(|line| {
+            if line == 200 {
+                "needle_call();".to_string()
+            } else {
+                format!("line_{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let result = SearchResult {
+        file_path: "src/large.rs".to_string(),
+        root_path: None,
+        content,
+        full_start_line: 1,
+        full_end_line: 300,
+        content_truncated: false,
+        score: 1.0,
+        vector_score: 1.0,
+        keyword_score: None,
+        start_line: 1,
+        end_line: 300,
+        language: "Rust".to_string(),
+        project: Some("project-id".to_string()),
+        origin: RecordOrigin::Current,
+        source_id: None,
+        indexed_at: 1,
+    };
+
+    let (results, total, truncated) = apply_search_budget("needle_call", vec![result], 10);
+    assert_eq!(total, 1);
+    assert_eq!(results.len(), 1);
+    assert!(truncated);
+    assert_eq!(results[0].start_line, 185);
+    assert_eq!(results[0].end_line, 215);
+    assert!(results[0].content.contains("needle_call();"));
+    assert!(!results[0].content.contains("line_1\n"));
+}
+
+#[test]
+fn retrieval_budget_caps_total_result_count() {
+    let make_result = |index: usize| SearchResult {
+        file_path: format!("src/{index}.rs"),
+        root_path: None,
+        content: "needle".to_string(),
+        full_start_line: 1,
+        full_end_line: 1,
+        content_truncated: false,
+        score: 1.0,
+        vector_score: 1.0,
+        keyword_score: None,
+        start_line: 1,
+        end_line: 1,
+        language: "Rust".to_string(),
+        project: None,
+        origin: RecordOrigin::Current,
+        source_id: None,
+        indexed_at: 1,
+    };
+    let input = (0..150).map(make_result).collect();
+    let (results, total, truncated) = apply_search_budget("needle", input, 150);
+    assert_eq!(total, 150);
+    assert_eq!(results.len(), SEARCH_MAX_RESULTS);
+    assert!(truncated);
 }

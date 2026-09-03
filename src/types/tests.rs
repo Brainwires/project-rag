@@ -94,6 +94,9 @@ fn test_search_result_creation() {
         file_path: "src/main.rs".to_string(),
         root_path: None,
         content: "fn main() {}".to_string(),
+        full_start_line: 1,
+        full_end_line: 10,
+        content_truncated: false,
         score: 0.95,
         vector_score: 0.92,
         keyword_score: Some(0.85),
@@ -101,6 +104,9 @@ fn test_search_result_creation() {
         end_line: 10,
         language: "Rust".to_string(),
         project: None,
+        origin: RecordOrigin::Current,
+        source_id: None,
+        indexed_at: 0,
     };
 
     assert_eq!(result.score, 0.95);
@@ -121,6 +127,7 @@ fn test_chunk_metadata_creation() {
         extension: Some("rs".to_string()),
         file_hash: "abc123".to_string(),
         indexed_at: 1234567890,
+        origin: RecordOrigin::Current,
     };
 
     assert_eq!(metadata.start_line, 1);
@@ -159,11 +166,20 @@ fn test_statistics_response() {
                 chunk_count: 100,
             },
         ],
+        total_definitions: 250,
+        total_references: 0,
+        code_reference_count: 0,
+        files_with_definitions: 90,
+        index_schema_version: 3,
+        invalid_history_records: 0,
+        index_diagnostics: vec![],
     };
 
     assert_eq!(stats.total_files, 100);
     assert_eq!(stats.language_breakdown.len(), 2);
     assert_eq!(stats.language_breakdown[0].language, "Rust");
+    assert_eq!(stats.total_definitions, 250);
+    assert_eq!(stats.files_with_definitions, 90);
 }
 
 // ===== Validation Tests =====
@@ -573,6 +589,9 @@ fn test_query_response_serialization() {
             file_path: "test.rs".to_string(),
             root_path: None,
             content: "test content".to_string(),
+            full_start_line: 1,
+            full_end_line: 10,
+            content_truncated: false,
             score: 0.9,
             vector_score: 0.85,
             keyword_score: Some(0.95),
@@ -580,10 +599,17 @@ fn test_query_response_serialization() {
             end_line: 10,
             language: "Rust".to_string(),
             project: None,
+            origin: RecordOrigin::Current,
+            source_id: None,
+            indexed_at: 0,
         }],
         duration_ms: 100,
         threshold_used: 0.7,
         threshold_lowered: false,
+        total_matches: 1,
+        returned_matches: 1,
+        results_truncated: false,
+        next_cursor: None,
     };
 
     let json = serde_json::to_string(&response).unwrap();
@@ -607,6 +633,13 @@ fn test_statistics_response_serialization() {
             file_count: 100,
             chunk_count: 500,
         }],
+        total_definitions: 250,
+        total_references: 10,
+        code_reference_count: 10,
+        files_with_definitions: 90,
+        index_schema_version: 3,
+        invalid_history_records: 0,
+        index_diagnostics: vec![],
     };
 
     let json = serde_json::to_string(&response).unwrap();
@@ -618,6 +651,98 @@ fn test_statistics_response_serialization() {
         response.language_breakdown.len(),
         deserialized.language_breakdown.len()
     );
+    assert_eq!(response.total_definitions, deserialized.total_definitions);
+    assert_eq!(response.total_references, deserialized.total_references);
+
+    // Old payloads without the relations fields must still deserialize.
+    let legacy = r#"{"total_files":1,"total_chunks":2,"total_embeddings":2,"database_size_bytes":10,"language_breakdown":[]}"#;
+    let parsed: StatisticsResponse = serde_json::from_str(legacy).unwrap();
+    assert_eq!(parsed.total_definitions, 0);
+    assert_eq!(parsed.total_references, 0);
+    assert_eq!(parsed.files_with_definitions, 0);
+}
+
+#[test]
+fn find_references_m2_filters_default_to_code_only() {
+    let request: FindReferencesRequest = serde_json::from_value(serde_json::json!({
+        "file_path": "src/lib.rs",
+        "line": 10,
+        "column": 2
+    }))
+    .unwrap();
+    assert_eq!(request.limit, 100);
+    assert!(request.include_definition);
+    assert!(!request.include_non_code);
+    assert!(request.reference_kinds.is_empty());
+    assert!(request.resolution_statuses.is_empty());
+    assert!(request.evidence_kinds.is_empty());
+    assert!(request.configurations.is_empty());
+    assert_eq!(request.cursor, 0);
+}
+
+fn graph_request() -> GetCallGraphRequest {
+    GetCallGraphRequest {
+        file_path: "src/main.rs".to_string(),
+        line: 1,
+        column: 0,
+        depth: 2,
+        project: None,
+        include_callers: true,
+        include_callees: true,
+        max_nodes: 200,
+        max_edges: 500,
+        edge_kinds: Vec::new(),
+        resolution_statuses: Vec::new(),
+        language_filters: Vec::new(),
+        path_filters: Vec::new(),
+        configurations: Vec::new(),
+    }
+}
+
+#[test]
+fn graph_request_accepts_depth_zero_and_bounded_budgets() {
+    let mut request = graph_request();
+    request.depth = 0;
+    request.max_nodes = 1;
+    request.max_edges = 1;
+    assert!(request.validate().is_ok());
+}
+
+#[test]
+fn graph_request_legacy_payload_gets_m3_defaults() {
+    let request: GetCallGraphRequest = serde_json::from_value(serde_json::json!({
+        "file_path": "src/main.rs",
+        "line": 1,
+        "column": 0
+    }))
+    .unwrap();
+    assert_eq!(request.depth, 2);
+    assert_eq!(request.max_nodes, 200);
+    assert_eq!(request.max_edges, 500);
+    assert!(request.include_callers);
+    assert!(request.include_callees);
+    assert!(request.edge_kinds.is_empty());
+    assert!(request.resolution_statuses.is_empty());
+}
+
+#[test]
+fn graph_request_rejects_zero_or_excessive_budgets() {
+    let mut request = graph_request();
+    request.max_nodes = 0;
+    assert!(request.validate().is_err());
+    request.max_nodes = 200;
+    request.max_edges = 20_001;
+    assert!(request.validate().is_err());
+}
+
+#[test]
+fn graph_request_rejects_empty_filters() {
+    let mut request = graph_request();
+    request.path_filters = vec![" ".to_string()];
+    assert!(request.validate().is_err());
+    request.path_filters.clear();
+    request.language_filters = vec![String::new()];
+    assert!(request.validate().is_err());
 }
 
 #[test]
@@ -719,15 +844,19 @@ fn test_search_git_history_request_serialization() {
 fn test_git_search_result_serialization() {
     let result = GitSearchResult {
         commit_hash: "abc123".to_string(),
+        subject: "Test commit".to_string(),
         commit_message: "Test commit".to_string(),
         author: "John Doe".to_string(),
         author_email: "john@example.com".to_string(),
+        author_date: 1234567800,
         commit_date: 1234567890,
         score: 0.95,
         vector_score: 0.92,
         keyword_score: Some(0.88),
         files_changed: vec!["src/main.rs".to_string(), "README.md".to_string()],
+        path_at_commit: vec!["src/main.rs".to_string(), "README.md".to_string()],
         diff_snippet: "diff --git a/src/main.rs".to_string(),
+        origin: RecordOrigin::History,
     };
 
     let json = serde_json::to_string(&result).unwrap();
@@ -750,19 +879,25 @@ fn test_search_git_history_response_serialization() {
     let response = SearchGitHistoryResponse {
         results: vec![GitSearchResult {
             commit_hash: "abc123".to_string(),
+            subject: "Test commit".to_string(),
             commit_message: "Test commit".to_string(),
             author: "John Doe".to_string(),
             author_email: "john@example.com".to_string(),
+            author_date: 1234567800,
             commit_date: 1234567890,
             score: 0.95,
             vector_score: 0.92,
             keyword_score: Some(0.88),
             files_changed: vec!["src/main.rs".to_string()],
+            path_at_commit: vec!["src/main.rs".to_string()],
             diff_snippet: "diff --git a/src/main.rs".to_string(),
+            origin: RecordOrigin::History,
         }],
         commits_indexed: 10,
         total_cached_commits: 50,
         duration_ms: 500,
+        invalid_records: 0,
+        diagnostics: vec![],
     };
 
     let json = serde_json::to_string(&response).unwrap();
@@ -872,7 +1007,7 @@ fn test_default_functions() {
     assert_eq!(default_max_file_size(), 1_048_576);
     assert_eq!(default_limit(), 10);
     assert_eq!(default_min_score(), 0.7);
-    assert_eq!(default_hybrid(), true);
+    assert!(default_hybrid());
     assert_eq!(default_git_path(), ".");
     assert_eq!(default_max_commits(), 10);
 }

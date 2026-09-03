@@ -225,7 +225,9 @@ impl RagMcpServer {
         serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
     }
 
-    #[tool(description = "Find the definition of a symbol at a given file location (line and column)")]
+    #[tool(
+        description = "Find the definition of a symbol occurrence at a file location. Returns explicit resolution status, evidence kind, and candidates; ambiguous or unresolved occurrences do not fall back to the enclosing function."
+    )]
     async fn find_definition(
         &self,
         Parameters(req): Parameters<FindDefinitionRequest>,
@@ -242,7 +244,9 @@ impl RagMcpServer {
         serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
     }
 
-    #[tool(description = "Find all references to a symbol at a given file location")]
+    #[tool(
+        description = "Find persisted, classified references to the logical symbol at a file location. Defaults to code-only matches (documentation/comments/strings excluded); supports language, canonical path, reference-kind, resolution-status, and evidence-kind filters. Unverified textual candidates remain ambiguous or unresolved and expose candidates instead of a false target. Totals are computed before pagination."
+    )]
     async fn find_references(
         &self,
         Parameters(req): Parameters<FindReferencesRequest>,
@@ -259,7 +263,9 @@ impl RagMcpServer {
         serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
     }
 
-    #[tool(description = "Get the call graph for a function at a given file location (callers and callees)")]
+    #[tool(
+        description = "Get a bounded dependency graph for a function at a file location. Depth is exact (0=root, 1=direct neighbors), nodes are unique stable symbols, cycles are safe, and edges include source provenance plus explicit resolution/evidence. Defaults to resolved call and constructor-call edges; supports direction, kind, status, language, path, node, and edge filters/budgets."
+    )]
     async fn get_call_graph(
         &self,
         Parameters(req): Parameters<GetCallGraphRequest>,
@@ -273,6 +279,111 @@ impl RagMcpServer {
             .await
             .map_err(|e| format!("{:#}", e))?;
 
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
+
+    #[tool(
+        description = "List every symbol defined in one file (name, kind, line span, signature) with no file content. Use this to enumerate a file: query_codebase and search_by_filters are relevance-ranked with a limit and cannot enumerate, while find_definition and find_references need a position you already have."
+    )]
+    async fn list_symbols(
+        &self,
+        Parameters(req): Parameters<ListSymbolsRequest>,
+    ) -> Result<String, String> {
+        // Validate request inputs
+        req.validate()?;
+
+        let response = self
+            .client
+            .list_symbols(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
+
+    #[tool(
+        description = "Read a bounded slice of a file inside an indexed project root. Defaults to start_line=1 and line_count=30. Explicit larger reads are allowed up to the server hard limit. The legacy inclusive end_line field remains supported but cannot be combined with line_count. range_clamped reports EOF clamping; content_truncated reports a server cap. Returns a SHA256 file_hash for guarded edits."
+    )]
+    async fn read_file(
+        &self,
+        Parameters(req): Parameters<ReadFileRequest>,
+    ) -> Result<String, String> {
+        req.validate()?;
+
+        let response = self
+            .client
+            .read_file(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
+
+    #[tool(
+        description = "Replace a line range (or the whole file) in a file inside an already-indexed project root, then automatically reindex that root so search results stay current. Pass expected_hash (from read_file) to guard against overwriting a change you haven't seen - a mismatch returns status: \"hash_conflict\" instead of applying the edit. Omit start_line/end_line to replace or create the whole file. Set start_line to end_line + 1 to insert content without deleting anything."
+    )]
+    async fn edit_file(
+        &self,
+        Parameters(req): Parameters<EditFileRequest>,
+    ) -> Result<String, String> {
+        req.validate()?;
+
+        let response = self
+            .client
+            .edit_file(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
+
+    #[tool(
+        description = "Apply an atomic multi-file patch transaction inside one indexed project. Every canonical path, expected raw-content hash, line range, encoding, newline style, size limit, and parent directory is validated before any write. dry_run validates without writing. A conflict or commit failure leaves every file unchanged. A successful transaction performs exactly one incremental reindex and publishes one new index generation; if reindexing fails, files remain committed but analysis is blocked as stale until recovery."
+    )]
+    async fn apply_patch(
+        &self,
+        Parameters(req): Parameters<ApplyPatchRequest>,
+    ) -> Result<String, String> {
+        req.validate()?;
+        let response = self
+            .client
+            .apply_patch(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
+
+    #[tool(
+        description = "Conservatively analyze unused imports and symbols within explicit build-configuration scope. Auto-discovers compile_commands.json and accepts configured alternatives. Findings report referenced/unused_in_analyzed_configurations/inconclusive semantics, analyzed config IDs, completeness, unresolved dependency kinds, limitations, and safe_for_destructive_edit=false when build, generated, preprocessor, reflection, or dynamic wiring evidence is incomplete. Treat findings as evidence, never as safe to auto-delete."
+    )]
+    async fn find_unused(
+        &self,
+        Parameters(req): Parameters<FindUnusedRequest>,
+    ) -> Result<String, String> {
+        req.validate()?;
+
+        let response = self
+            .client
+            .find_unused(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+
+        serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
+    }
+
+    #[tool(
+        description = "Validate removal of one authoritative current-tree symbol within explicit build configurations. Checks resolved, ambiguous, and unresolved references; preprocessor/build coverage; generated and forced inputs; configuration/project wiring; and indirect/dynamic dispatch. Returns SAFE only within the reported scope, otherwise UNSAFE or INCONCLUSIVE, with evidence, limitations, and blocking references. Git history is never liveness evidence."
+    )]
+    async fn validate_removal(
+        &self,
+        Parameters(req): Parameters<ValidateRemovalRequest>,
+    ) -> Result<String, String> {
+        req.validate()?;
+        let response = self
+            .client
+            .validate_removal(req)
+            .await
+            .map_err(|e| format!("{:#}", e))?;
         serde_json::to_string_pretty(&response).map_err(|e| format!("Serialization failed: {}", e))
     }
 }
@@ -443,6 +554,103 @@ impl RagMcpServer {
             ),
         )])
     }
+
+    #[prompt(
+        name = "read",
+        description = "Read a slice (or all) of a file's current content"
+    )]
+    async fn read_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let file = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
+
+        Ok(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!("Please read the file '{}'.", file),
+        )])
+    }
+
+    #[prompt(
+        name = "edit",
+        description = "Edit a file inside an indexed project and reindex it automatically"
+    )]
+    async fn edit_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let file = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
+
+        Ok(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Please edit the file '{}'. First read it with read_file to get its current content and file_hash, then call edit_file with the new content and that expected_hash.",
+                file
+            ),
+        )])
+    }
+
+    #[prompt(
+        name = "unused",
+        description = "Find unused imports and dead-code candidates in a file or directory"
+    )]
+    async fn unused_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+
+        Ok(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Please run the find_unused tool on '{}' and summarize findings by status and analyzed build configuration. \
+                 Highlight inconclusive limitations and never imply destructive-edit safety when it is false.",
+                path
+            ),
+        )])
+    }
+
+    #[prompt(
+        name = "patch",
+        description = "Apply a guarded atomic multi-file patch with one reindex transaction"
+    )]
+    async fn patch_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let path = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        Ok(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Please read the affected files beginning with '{}', collect their file_hash values, dry-run one apply_patch transaction, then apply it once if validation succeeds.",
+                path
+            ),
+        )])
+    }
+
+    #[prompt(
+        name = "validate-removal",
+        description = "Validate whether a current-tree symbol can be removed in an explicit scope"
+    )]
+    async fn validate_removal_prompt(
+        &self,
+        Parameters(args): Parameters<serde_json::Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let symbol_id = args
+            .get("symbol_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        Ok(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!(
+                "Please run validate_removal for symbol_id '{}' and report its exact analysis scope, blocking references, and limitations. Do not broaden SAFE beyond that scope.",
+                symbol_id
+            ),
+        )])
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -465,7 +673,10 @@ impl ServerHandler for RagMcpServer {
             instructions: Some(
                 "RAG-based codebase indexing and semantic search. \
                 Use index_codebase to create embeddings (automatically performs full or incremental indexing), \
-                query_codebase to search, and search_by_filters for advanced queries."
+                query_codebase to search, and search_by_filters for advanced queries. \
+                Use read_file and atomic apply_patch to modify files inside an indexed project; \
+                each patch transaction reindexes once and publishes one generation. \
+                Use find_unused for conservative leads and validate_removal for scoped SAFE/UNSAFE/INCONCLUSIVE decisions."
                     .into(),
             ),
         }

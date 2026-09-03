@@ -116,13 +116,6 @@ impl PlatformPaths {
         Self::config_dir().join(PROJECT_FOLDER_NAME)
     }
 
-    /// Get default LanceDB database path
-    ///
-    /// Returns: {data_dir}/{project_folder_name}/lancedb
-    pub fn default_lancedb_path() -> PathBuf {
-        Self::project_data_dir().join("lancedb")
-    }
-
     /// Get default hash cache path
     ///
     /// Returns: {cache_dir}/{project_folder_name}/hash_cache.json
@@ -148,6 +141,7 @@ impl PlatformPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::env;
 
     #[test]
@@ -180,13 +174,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default_lancedb_path() {
-        let path = PlatformPaths::default_lancedb_path();
-        assert!(path.to_string_lossy().contains("project-rag"));
-        assert!(path.to_string_lossy().contains("lancedb"));
-    }
-
-    #[test]
     fn test_default_hash_cache_path() {
         let path = PlatformPaths::default_hash_cache_path();
         assert!(path.to_string_lossy().contains("project-rag"));
@@ -211,7 +198,7 @@ mod tests {
     fn test_paths_are_absolute_or_relative() {
         // Paths should either be absolute or fallback to "."
         let data_dir = PlatformPaths::data_dir();
-        assert!(data_dir.is_absolute() || data_dir == PathBuf::from("."));
+        assert!(data_dir.is_absolute() || data_dir.as_os_str() == ".");
     }
 
     #[test]
@@ -368,7 +355,7 @@ mod tests {
         let project_data = PlatformPaths::project_data_dir();
 
         assert!(
-            project_data.starts_with(&data_dir) || data_dir == PathBuf::from("."),
+            project_data.starts_with(&data_dir) || data_dir.as_os_str() == ".",
             "project_data_dir should be subdirectory of data_dir"
         );
 
@@ -376,7 +363,7 @@ mod tests {
         let project_cache = PlatformPaths::project_cache_dir();
 
         assert!(
-            project_cache.starts_with(&cache_dir) || cache_dir == PathBuf::from("."),
+            project_cache.starts_with(&cache_dir) || cache_dir.as_os_str() == ".",
             "project_cache_dir should be subdirectory of cache_dir"
         );
     }
@@ -384,18 +371,12 @@ mod tests {
     #[test]
     fn test_specific_file_paths() {
         // Test that specific file paths include expected components
-        let lancedb_path = PlatformPaths::default_lancedb_path();
         let hash_cache_path = PlatformPaths::default_hash_cache_path();
         let git_cache_path = PlatformPaths::default_git_cache_path();
         let config_path = PlatformPaths::default_config_path();
 
-        // All should contain project name
-        for path in [
-            &lancedb_path,
-            &hash_cache_path,
-            &git_cache_path,
-            &config_path,
-        ] {
+        // All default support-file paths should contain the project name.
+        for path in [&hash_cache_path, &git_cache_path, &config_path] {
             assert!(
                 path.to_string_lossy().contains("project-rag"),
                 "Path {:?} should contain 'project-rag'",
@@ -404,7 +385,6 @@ mod tests {
         }
 
         // Specific components
-        assert!(lancedb_path.ends_with("lancedb"));
         assert!(hash_cache_path.ends_with("hash_cache.json"));
         assert!(git_cache_path.ends_with("git_cache.json"));
         assert!(config_path.ends_with("config.toml"));

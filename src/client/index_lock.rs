@@ -7,11 +7,11 @@
 use super::fs_lock::FsLockGuard;
 use crate::types::IndexResponse;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::broadcast;
 use tokio::sync::RwLock;
+use tokio::sync::broadcast;
 
 /// Maximum time an indexing operation can run before being considered stale (30 minutes)
 /// This handles cases where the process crashes or panics without proper cleanup
@@ -124,7 +124,9 @@ impl Drop for IndexLockGuard {
                 chunks_created: 0,
                 embeddings_generated: 0,
                 duration_ms: 0,
-                errors: vec!["Indexing operation was interrupted (panic or early return)".to_string()],
+                errors: vec![
+                    "Indexing operation was interrupted (panic or early return)".to_string(),
+                ],
                 files_updated: 0,
                 files_removed: 0,
             };

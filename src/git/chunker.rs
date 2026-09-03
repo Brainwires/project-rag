@@ -37,6 +37,14 @@ impl CommitChunker {
         content.push_str(&commit.message);
         content.push_str("\n\n");
 
+        content.push_str("Subject: ");
+        content.push_str(&commit.subject);
+        content.push_str("\nAuthor Date: ");
+        content.push_str(&commit.author_date.to_string());
+        content.push_str("\nCommit Date: ");
+        content.push_str(&commit.commit_date.to_string());
+        content.push_str("\n\n");
+
         // Add author info
         content.push_str("Author: ");
         content.push_str(&commit.author_name);
@@ -66,15 +74,17 @@ impl CommitChunker {
 
         // Truncate if too long
         if content.len() > self.max_content_length {
-            content.truncate(self.max_content_length);
+            // Byte cap: floor to a character boundary before truncating.
+            let end = crate::git::floor_char_boundary(&content, self.max_content_length);
+            content.truncate(end);
             content.push_str("\n\n[... content truncated for embedding ...]");
         }
 
         // Create chunk metadata
         // Note: Git commits don't have line numbers, so we use 0
         let metadata = ChunkMetadata {
-            file_path: format!("git://{}", repo_path),
-            root_path: None,
+            file_path: format!("history://{}", commit.hash),
+            root_path: Some(repo_path.to_string()),
             project,
             start_line: 0,
             end_line: 0,
@@ -82,6 +92,7 @@ impl CommitChunker {
             extension: Some("commit".to_string()),
             file_hash: commit.hash.clone(),
             indexed_at: commit.commit_date,
+            origin: crate::types::RecordOrigin::History,
         };
 
         Ok(CodeChunk { content, metadata })
@@ -117,13 +128,37 @@ mod tests {
             message:
                 "Fix authentication bug\n\nThis commit fixes a critical bug in the auth module."
                     .to_string(),
+            subject: "Fix authentication bug".to_string(),
             author_name: "John Doe".to_string(),
             author_email: "john@example.com".to_string(),
+            author_date: 1704067100,
             commit_date: 1704067200, // 2024-01-01
             files_changed: vec!["src/auth.rs".to_string(), "tests/auth_tests.rs".to_string()],
             diff_content: "@@ -10,7 +10,7 @@\n-    old_line\n+    new_line\n".to_string(),
             parent_hashes: vec!["parent123".to_string()],
         }
+    }
+
+    #[test]
+    fn test_commit_to_chunk_truncates_multibyte_content_without_panicking() {
+        // Regression: the length cap was applied with String::truncate on a
+        // raw byte offset, which panics when that offset lands inside a
+        // multi-byte character. A diff of Cyrillic text reproduces it.
+        let mut commit = create_test_commit();
+        commit.diff_content = "привет мир ".repeat(2000);
+
+        let chunker = CommitChunker::with_max_length(6000);
+        let chunk = chunker
+            .commit_to_chunk(&commit, "/repo/path", None)
+            .expect("Should convert commit to chunk");
+
+        assert!(
+            chunk.content.contains("content truncated"),
+            "content should have been truncated"
+        );
+        // Surviving this assertion at all proves the cut landed on a
+        // character boundary: an invalid cut would have panicked above.
+        assert!(chunk.content.len() < commit.diff_content.len());
     }
 
     #[test]
@@ -135,7 +170,7 @@ mod tests {
             .commit_to_chunk(&commit, "/repo/path", None)
             .expect("Should convert commit to chunk");
 
-        assert_eq!(chunk.metadata.file_path, "git:///repo/path");
+        assert_eq!(chunk.metadata.file_path, "history://abc123def456");
         assert_eq!(chunk.metadata.language, Some("git-commit".to_string()));
         assert_eq!(chunk.metadata.file_hash, "abc123def456");
         assert!(chunk.content.contains("Fix authentication bug"));

@@ -86,6 +86,7 @@ impl CodeChunker {
                 extension: file_info.extension.clone(),
                 file_hash: file_info.hash.clone(),
                 indexed_at: timestamp,
+                origin: crate::types::RecordOrigin::Current,
             };
 
             chunks.push(CodeChunk { content, metadata });
@@ -140,6 +141,7 @@ impl CodeChunker {
                 extension: file_info.extension.clone(),
                 file_hash: file_info.hash.clone(),
                 indexed_at: timestamp,
+                origin: crate::types::RecordOrigin::Current,
             };
 
             chunks.push(CodeChunk { content, metadata });
@@ -219,6 +221,7 @@ impl CodeChunker {
                 extension: file_info.extension.clone(),
                 file_hash: file_info.hash.clone(),
                 indexed_at: timestamp,
+                origin: crate::types::RecordOrigin::Current,
             };
 
             chunks.push(CodeChunk { content, metadata });

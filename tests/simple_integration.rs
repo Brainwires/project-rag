@@ -23,12 +23,19 @@ async fn test_server_creation_with_config() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_server_creation_with_defaults() -> Result<()> {
-    // This should work with default configuration
+async fn test_server_creation_respects_required_project_path() -> Result<()> {
+    // LanceDB deliberately has no process-global default: each MCP project must
+    // provide its own storage directory. Exercise `new()` in both supported host
+    // states without mutating the process environment shared by parallel tests.
     let server = RagMcpServer::new().await;
-
-    // Server creation should succeed
-    assert!(server.is_ok());
+    if std::env::var_os("PROJECT_RAG_LANCEDB_PATH").is_some() {
+        assert!(server.is_ok());
+    } else {
+        match server {
+            Ok(_) => panic!("server unexpectedly started without a project-local database path"),
+            Err(error) => assert!(format!("{error:#}").contains("PROJECT_RAG_LANCEDB_PATH")),
+        }
+    }
 
     Ok(())
 }
@@ -38,7 +45,10 @@ async fn test_path_normalization() -> Result<()> {
     // Test path normalization with current directory
     let normalized = RagMcpServer::normalize_path(".")?;
     assert!(normalized.len() > 1);
-    assert!(normalized.starts_with('/') || normalized.chars().nth(1) == Some(':'));
+    // Canonicalization must yield an absolute path. Checked via Path rather
+    // than string shape: on Windows the result is the verbatim form
+    // (`\\?\C:\...`), which has neither a leading '/' nor ':' at index 1.
+    assert!(std::path::Path::new(&normalized).is_absolute());
 
     Ok(())
 }

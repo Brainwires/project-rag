@@ -105,7 +105,7 @@ docker logs <container-id>
 
 1. **Modular Trait-Based Design**: Each major component is defined by a trait (EmbeddingProvider, VectorDatabase) with concrete implementations, enabling easy swapping of backends.
 
-2. **MCP Protocol Integration**: Uses `rmcp` macros (`#[tool]`, `#[prompt]`, `#[tool_router]`, `#[prompt_router]`) to define 9 MCP tools and 9 slash commands. The server communicates over stdio following MCP spec.
+2. **MCP Protocol Integration**: Uses `rmcp` macros (`#[tool]`, `#[prompt]`, `#[tool_router]`, `#[prompt_router]`) to define 13 MCP tools and 12 slash commands. The server communicates over stdio following MCP spec.
 
 3. **Async-First Architecture**: Built on Tokio runtime with async traits. File walking runs on blocking threads via `tokio::task::spawn_blocking` to avoid blocking the async runtime.
 
@@ -117,7 +117,7 @@ docker logs <container-id>
 
 ```
 src/
-├── mcp_server.rs           # Main MCP server with 9 tools + 9 prompts
+├── mcp_server.rs           # Main MCP server with 13 tools + 12 prompts
 │   ├── RagMcpServer        # Server state (embedding provider, vector DB, chunker, hash cache)
 │   ├── Tool handlers       # index_codebase (smart), query_codebase, find_definition, etc.
 │   └── Prompt handlers     # Slash commands for each tool
@@ -142,10 +142,12 @@ src/
 │   ├── repomap/            # AST-based symbol extraction (fallback provider)
 │   │   ├── mod.rs          # RepoMapProvider implementing RelationsProvider
 │   │   ├── symbol_extractor.rs  # Extract definitions from AST nodes
+│   │   ├── import_extractor.rs  # Extract import/use/include bindings (SymbolKind::Import)
 │   │   └── reference_finder.rs  # Find references via identifier matching
 │   ├── storage/            # Relations storage layer
 │   │   ├── mod.rs          # RelationsStore trait
-│   │   └── lance_store.rs  # LanceDB storage for definitions/references
+│   │   └── lance_store/    # LanceDB storage (definitions + references tables,
+│   │                       #   populated with definitions during indexing)
 │   └── stack_graphs/       # Optional: High-precision name resolution (feature-gated)
 │       └── mod.rs          # StackGraphsProvider for Python, TypeScript, Java, Ruby
 ├── bm25_search.rs          # Tantivy BM25 keyword search with RRF fusion
@@ -220,6 +222,8 @@ src/
 - **Hybrid Architecture**: Uses stack-graphs (high precision, ~95%) for Python, TypeScript, Java, Ruby when feature enabled; RepoMap fallback (~70%) for all other languages
 - **RelationsProvider Trait**: Abstraction for extracting definitions and references from source files
 - **SymbolExtractor**: Uses tree-sitter AST to extract function, class, method, struct definitions
+- **ImportExtractor**: Extracts import/use/include statements as `SymbolKind::Import` definitions, one per bound name (`use a::{B, C as D}` yields `B` and `D`); glob/side-effect imports are reported as skipped definitions
+- **LanceRelationsStore**: Definitions are persisted to LanceDB tables (`relations_definitions`, `relations_references`) during indexing; idempotent per file, cleaned up on file removal and clear_index
 - **ReferenceFinder**: Text-based identifier matching with context analysis (call, read, write, import, etc.)
 - **PrecisionLevel**: High (stack-graphs), Medium (AST-based RepoMap), Low (text-based)
 - **Symbol Types**: Function, Method, Class, Struct, Interface, Trait, Enum, Module, Variable, Constant, etc.
@@ -286,11 +290,12 @@ When adding new tools:
 All tools return JSON responses conforming to types defined in `types.rs`. Key response types:
 - `IndexResponse`: files_indexed, chunks_created, embeddings_generated, duration_ms, errors, mode (full or incremental)
 - `QueryResponse`: results (SearchResult[] with vector_score, keyword_score, combined_score), duration_ms
-- `StatisticsResponse`: total_files, total_chunks, language_breakdown
+- `StatisticsResponse`: total_files, total_chunks, language_breakdown, total_definitions, total_references, files_with_definitions
 - `ClearResponse`: success, message
 - `FindDefinitionResponse`: definitions (DefinitionResult[] with file_path, line, symbol info), precision_level
 - `FindReferencesResponse`: references (ReferenceResult[] with file_path, line, reference_kind), precision_level
 - `GetCallGraphResponse`: node (CallGraphNode with callers/callees), precision_level
+- `FindUnusedResponse`: candidates (UnusedCandidate[] with confidence high/medium/low and reason), unverifiable_imports, probes_exhausted, truncated
 
 ### Prompt (Slash Command) Pattern
 Prompts in `#[prompt_router]` expand to user messages that instruct the AI to call the corresponding tool. Example:
@@ -302,7 +307,7 @@ async fn index_prompt(&self, Parameters(args): Parameters<serde_json::Value>)
 
 ### Server Capabilities
 Defined in `ServerHandler::get_info()`:
-- Tools: Enabled (9 tools available):
+- Tools: Enabled (13 tools available):
   - `index_codebase` - Index a codebase with smart full/incremental detection
   - `query_codebase` - Semantic search across indexed code
   - `get_statistics` - Get index statistics
@@ -312,7 +317,11 @@ Defined in `ServerHandler::get_info()`:
   - `find_definition` - Find where a symbol is defined (LSP-like)
   - `find_references` - Find all references to a symbol (LSP-like)
   - `get_call_graph` - Get callers/callees for a function
-- Prompts: Enabled (9 slash commands: /project:index, /project:query, /project:stats, /project:clear, /project:search, /project:git-search, /project:definition, /project:references, /project:callgraph)
+  - `list_symbols` - List every symbol defined in one file
+  - `read_file` - Read a slice (or all) of a file inside an indexed project root
+  - `edit_file` - Replace a line range (or the whole file), then auto-reindex the affected root
+  - `find_unused` - Find unused imports and dead-code candidates (report-only, confidence-rated)
+- Prompts: Enabled (12 slash commands: /project:index, /project:query, /project:stats, /project:clear, /project:search, /project:git-search, /project:definition, /project:references, /project:callgraph, /project:read, /project:edit, /project:unused)
 - Resources: Not implemented
 - Sampling: Not implemented
 

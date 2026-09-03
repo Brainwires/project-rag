@@ -10,10 +10,14 @@ pub struct CommitInfo {
     pub hash: String,
     /// Commit message (first line and body)
     pub message: String,
+    /// First line of the commit message.
+    pub subject: String,
     /// Author's name
     pub author_name: String,
     /// Author's email address
     pub author_email: String,
+    /// Author timestamp (may differ from commit timestamp after rebases/patch application).
+    pub author_date: i64,
     /// Commit timestamp (Unix epoch seconds)
     pub commit_date: i64,
     /// List of file paths changed in this commit
@@ -137,9 +141,11 @@ impl GitWalker {
     fn extract_commit_info(&self, commit: &git2::Commit) -> Result<CommitInfo> {
         let hash = format!("{}", commit.id());
         let message = commit.message().unwrap_or("").to_string();
+        let subject = commit.summary().unwrap_or("").to_string();
         let author = commit.author();
         let author_name = author.name().unwrap_or("Unknown").to_string();
         let author_email = author.email().unwrap_or("").to_string();
+        let author_date = author.when().seconds();
         let commit_date = commit.time().seconds();
 
         // Extract parent hashes
@@ -151,8 +157,10 @@ impl GitWalker {
         Ok(CommitInfo {
             hash,
             message,
+            subject,
             author_name,
             author_email,
+            author_date,
             commit_date,
             files_changed,
             diff_content,
@@ -245,7 +253,9 @@ impl GitWalker {
 
         // Truncate if too large and add marker
         if diff_content.len() > 8000 {
-            diff_content.truncate(8000);
+            // 8000 is a byte cap and may land inside a multi-byte character.
+            let end = crate::git::floor_char_boundary(&diff_content, 8000);
+            diff_content.truncate(end);
             diff_content.push_str("\n\n[... diff truncated ...]");
             tracing::warn!("Truncated large diff for commit {}", commit.id());
         }

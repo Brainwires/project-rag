@@ -19,6 +19,187 @@ async fn test_new_creates_server() {
     assert!(client.is_ok(), "Server creation should succeed");
 }
 
+/// Prove every tool and prompt is actually REACHABLE through the routers, not
+/// merely defined. A handler written outside the `#[tool_router]` /
+/// `#[prompt_router]` impl block compiles fine but is never exposed to MCP
+/// clients; enumerating the routers is the only check that catches that. The
+/// exact counts are asserted so adding a handler without routing it (or
+/// forgetting to update the docs' tool count) fails here instead of silently.
+#[test]
+fn test_all_tools_and_prompts_are_routed() {
+    let tool_names: Vec<String> = RagMcpServer::tool_router()
+        .list_all()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    for expected in [
+        "index_codebase",
+        "query_codebase",
+        "get_statistics",
+        "clear_index",
+        "search_by_filters",
+        "search_git_history",
+        "find_definition",
+        "find_references",
+        "get_call_graph",
+        "list_symbols",
+        "read_file",
+        "edit_file",
+        "apply_patch",
+        "find_unused",
+        "validate_removal",
+    ] {
+        assert!(
+            tool_names.iter().any(|n| n == expected),
+            "tool '{}' is not routed; routed tools: {:?}",
+            expected,
+            tool_names
+        );
+    }
+    assert_eq!(
+        tool_names.len(),
+        15,
+        "unexpected tool count: {:?}",
+        tool_names
+    );
+
+    let prompt_names: Vec<String> = RagMcpServer::prompt_router()
+        .list_all()
+        .iter()
+        .map(|p| p.name.to_string())
+        .collect();
+    assert!(
+        prompt_names.iter().any(|n| n == "unused"),
+        "prompt 'unused' is not routed; routed prompts: {:?}",
+        prompt_names
+    );
+    assert!(prompt_names.iter().any(|n| n == "patch"));
+    assert!(prompt_names.iter().any(|n| n == "validate-removal"));
+    assert_eq!(
+        prompt_names.len(),
+        14,
+        "unexpected prompt count: {:?}",
+        prompt_names
+    );
+}
+
+/// The MCP input schema for find_unused is generated from FindUnusedRequest's
+/// JsonSchema derive; this pins the contract a client actually sees: all six
+/// parameters present, only `path` required (the rest have serde defaults),
+/// and doc comments surfaced as descriptions.
+#[test]
+fn test_find_unused_tool_schema() {
+    let router = RagMcpServer::tool_router();
+    let tools = router.list_all();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == "find_unused")
+        .expect("find_unused not routed");
+
+    let schema = serde_json::to_value(&*tool.input_schema).unwrap();
+    eprintln!(
+        "find_unused input_schema:\n{}",
+        serde_json::to_string_pretty(&schema).unwrap()
+    );
+
+    let properties = schema["properties"]
+        .as_object()
+        .expect("schema has no properties");
+    for field in [
+        "path",
+        "project",
+        "check",
+        "limit",
+        "max_file_size",
+        "configurations",
+    ] {
+        assert!(properties.contains_key(field), "schema missing '{}'", field);
+        assert!(
+            properties[field]["description"].is_string(),
+            "'{}' has no description",
+            field
+        );
+    }
+
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .expect("schema has no required list")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(required, vec!["path"], "only 'path' should be required");
+    assert_eq!(
+        schema["properties"]["configurations"]["default"],
+        serde_json::json!([])
+    );
+
+    assert!(
+        tool.description
+            .as_deref()
+            .is_some_and(|d| d.contains("never as safe to auto-delete")),
+        "tool description lost its safety warning"
+    );
+}
+
+#[test]
+fn test_m5_editing_and_removal_tool_schemas() {
+    let router = RagMcpServer::tool_router();
+    let tools = router.list_all();
+
+    let patch_tool = tools
+        .iter()
+        .find(|tool| tool.name == "apply_patch")
+        .expect("apply_patch not routed");
+    let patch_schema = serde_json::to_value(&*patch_tool.input_schema).unwrap();
+    let patch_properties = patch_schema["properties"]
+        .as_object()
+        .expect("apply_patch schema has no properties");
+    assert!(patch_properties.contains_key("patches"));
+    assert!(patch_properties.contains_key("dry_run"));
+    assert!(patch_properties.contains_key("project"));
+    assert_eq!(patch_schema["required"], serde_json::json!(["patches"]));
+    let item_schema = &patch_properties["patches"]["items"];
+    let resolved_item_schema = item_schema
+        .get("$ref")
+        .and_then(|reference| reference.as_str())
+        .and_then(|reference| reference.strip_prefix('#'))
+        .and_then(|pointer| patch_schema.pointer(pointer))
+        .unwrap_or(item_schema);
+    let item_properties = resolved_item_schema["properties"]
+        .as_object()
+        .expect("FilePatch schema has no properties");
+    for field in [
+        "file_path",
+        "content",
+        "start_line",
+        "end_line",
+        "expected_hash",
+        "delete",
+    ] {
+        assert!(
+            item_properties.contains_key(field),
+            "schema missing '{field}'"
+        );
+    }
+    assert_eq!(
+        resolved_item_schema["required"],
+        serde_json::json!(["file_path"])
+    );
+
+    let removal_tool = tools
+        .iter()
+        .find(|tool| tool.name == "validate_removal")
+        .expect("validate_removal not routed");
+    let removal_schema = serde_json::to_value(&*removal_tool.input_schema).unwrap();
+    let removal_properties = removal_schema["properties"]
+        .as_object()
+        .expect("validate_removal schema has no properties");
+    assert!(removal_properties.contains_key("symbol_id"));
+    assert!(removal_properties.contains_key("configurations"));
+    assert!(removal_properties.contains_key("project"));
+    assert_eq!(removal_schema["required"], serde_json::json!(["symbol_id"]));
+}
+
 #[tokio::test]
 async fn test_get_info() {
     let temp_dir = TempDir::new().unwrap();
@@ -358,6 +539,9 @@ async fn test_tool_get_statistics_with_data() {
     assert!(response.total_files > 0);
     assert!(response.total_chunks > 0);
     assert!(response.total_embeddings > 0);
+    // Indexing stores definitions in the relations store; `fn main` is one.
+    assert!(response.total_definitions > 0);
+    assert!(response.files_with_definitions > 0);
 }
 
 #[tokio::test]

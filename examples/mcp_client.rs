@@ -11,7 +11,7 @@
 //! Run with: cargo run --example mcp_client
 //! (The server will wait for MCP protocol messages on stdin)
 
-use project_rag::{mcp_server::RagMcpServer, Config, RagClient};
+use project_rag::{Config, RagClient, mcp_server::RagMcpServer};
 use std::sync::Arc;
 
 #[tokio::main]

@@ -4,6 +4,62 @@ use super::*;
 use crate::client::RagClient;
 use tempfile::TempDir;
 
+fn test_commit(hash: &str, author_date: i64, commit_date: i64) -> CommitInfo {
+    CommitInfo {
+        hash: hash.to_string(),
+        message: "subject".to_string(),
+        subject: "subject".to_string(),
+        author_name: "Author".to_string(),
+        author_email: "author@example.com".to_string(),
+        author_date,
+        commit_date,
+        files_changed: vec!["src/lib.rs".to_string()],
+        diff_content: String::new(),
+        parent_hashes: vec![],
+    }
+}
+
+#[test]
+fn invalid_git_metadata_is_rejected_before_indexing() {
+    assert!(validate_commit(&test_commit("project-copy-folder", 1, 1)).is_err());
+    assert!(
+        validate_commit(&test_commit(
+            "0123456789abcdef0123456789abcdef01234567",
+            0,
+            1,
+        ))
+        .is_err()
+    );
+    assert!(
+        validate_commit(&test_commit(
+            "0123456789abcdef0123456789abcdef01234567",
+            1,
+            0,
+        ))
+        .is_err()
+    );
+    assert!(
+        validate_commit(&test_commit(
+            "0123456789abcdef0123456789abcdef01234567",
+            1,
+            1,
+        ))
+        .is_ok()
+    );
+}
+
+#[test]
+fn git_paths_below_repo_root_map_to_project_relative_identity() {
+    let commit = test_commit("0123456789abcdef0123456789abcdef01234567", 1, 1);
+    let mut commit = commit;
+    commit.files_changed = vec![
+        "tools/project-rag/src/lib.rs".to_string(),
+        "other/outside.rs".to_string(),
+    ];
+    let mapped = map_commit_to_project(commit, "tools/project-rag").unwrap();
+    assert_eq!(mapped.files_changed, vec!["src/lib.rs"]);
+}
+
 // Helper to create test client
 async fn create_test_client() -> (RagClient, TempDir) {
     let temp_dir = TempDir::new().unwrap();

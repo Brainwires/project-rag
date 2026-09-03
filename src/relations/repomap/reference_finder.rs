@@ -10,7 +10,10 @@ use chrono::Utc;
 use regex::Regex;
 
 use crate::indexer::FileInfo;
-use crate::relations::types::{Definition, Reference, ReferenceKind};
+use crate::relations::types::{
+    Definition, DispatchKind, EvidenceKind, LocationRole, Reference, ReferenceCandidate,
+    ReferenceKind, ResolutionStatus, SourceLocation, SymbolKind,
+};
 
 /// Finds references to symbols using text-based identifier matching.
 pub struct ReferenceFinder {
@@ -40,8 +43,24 @@ impl ReferenceFinder {
             return Ok(references);
         }
 
-        // Process each line
-        for (line_num, line) in file_info.content.lines().enumerate() {
+        let extension = file_info.extension.as_deref().unwrap_or("");
+        let (language, language_name) =
+            match super::symbol_extractor::get_language_for_extension(extension) {
+                Some(value) => value,
+                None => return Ok(references),
+            };
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language)?;
+        let tree = parser
+            .parse(&file_info.content, None)
+            .ok_or_else(|| anyhow::anyhow!("tree-sitter returned no syntax tree"))?;
+        let root = tree.root_node();
+        let parser_name = format!("tree-sitter/{}", language_name.to_lowercase());
+
+        let mut absolute_offset = 0usize;
+        // Process each line, retaining byte offsets so syntax nodes can classify matches.
+        for (line_num, line_with_newline) in file_info.content.split_inclusive('\n').enumerate() {
+            let line = line_with_newline.trim_end_matches(['\r', '\n']);
             let line_number = line_num + 1; // 1-based
 
             // Find all identifier occurrences in this line
@@ -50,32 +69,134 @@ impl ReferenceFinder {
 
                 // Check if this identifier matches a known symbol
                 if let Some(definitions) = symbol_index.get(name) {
-                    // Skip if this is likely a definition site in the same file
-                    if self.is_definition_site(definitions, &file_info.relative_path, line_number) {
+                    // Definitions/declarations are emitted as explicit location rows by
+                    // indexing; do not duplicate their name token as a heuristic match.
+                    if self.is_definition_site(definitions, &file_info.relative_path, line_number)
+                        && definitions.iter().any(|def| {
+                            def.file_path() == file_info.relative_path
+                                && def.location.start_line == line_number
+                                && mat.start() >= def.location.start_col
+                                && mat.end() <= def.location.end_col
+                        })
+                    {
                         continue;
                     }
 
-                    // Determine reference kind based on context
-                    let reference_kind = self.determine_reference_kind(line, mat.start(), name);
+                    let absolute_start = absolute_offset + mat.start();
+                    let syntax_kind = root
+                        .descendant_for_byte_range(absolute_start, absolute_start + name.len())
+                        .map(|node| node.kind().to_string());
+                    let reference_kind = self.determine_reference_kind(
+                        line,
+                        mat.start(),
+                        name,
+                        syntax_kind.as_deref(),
+                    );
 
-                    // Get the best matching definition
-                    // For now, just use the first one (could be improved with scope analysis)
-                    if let Some(def) = definitions.first() {
-                        references.push(Reference {
-                            file_path: file_info.relative_path.clone(),
-                            root_path: Some(file_info.root_path.clone()),
-                            project: file_info.project.clone(),
-                            start_line: line_number,
-                            end_line: line_number,
-                            start_col: mat.start(),
-                            end_col: mat.end(),
-                            target_symbol_id: def.to_storage_id(),
-                            reference_kind,
-                            indexed_at: Utc::now().timestamp(),
-                        });
+                    let mut unique = std::collections::BTreeMap::new();
+                    for def in definitions
+                        .iter()
+                        .filter(|d| d.kind() != SymbolKind::Import)
+                    {
+                        unique.entry(def.to_storage_id()).or_insert(def);
                     }
+                    if unique.is_empty() {
+                        continue;
+                    }
+                    let candidates: Vec<ReferenceCandidate> = unique
+                        .keys()
+                        .map(|symbol_id| ReferenceCandidate {
+                            symbol_id: symbol_id.clone(),
+                            reason:
+                                "identifier name matches; binding was not semantically resolved"
+                                    .to_string(),
+                        })
+                        .collect();
+
+                    let qualified_use = qualified_use_at(line, mat.start(), name);
+                    let exact_qualified: Vec<_> = unique
+                        .values()
+                        .filter(|def| {
+                            qualified_use.contains("::")
+                                && def.symbol_id.qualified_name == qualified_use
+                        })
+                        .collect();
+                    let (target_symbol_id, resolution_status, evidence_kind) =
+                        if exact_qualified.len() == 1 {
+                            (
+                                exact_qualified[0].to_storage_id(),
+                                ResolutionStatus::Resolved,
+                                EvidenceKind::Syntactic,
+                            )
+                        } else if unique.len() > 1 {
+                            (
+                                String::new(),
+                                ResolutionStatus::Ambiguous,
+                                EvidenceKind::Heuristic,
+                            )
+                        } else {
+                            (
+                                String::new(),
+                                ResolutionStatus::Unresolved,
+                                EvidenceKind::Heuristic,
+                            )
+                        };
+                    let source_symbol_id = definitions
+                        .iter()
+                        .filter(|def| {
+                            def.file_path() == file_info.relative_path
+                                && matches!(
+                                    def.kind(),
+                                    SymbolKind::Function
+                                        | SymbolKind::Method
+                                        | SymbolKind::Constructor
+                                        | SymbolKind::Destructor
+                                )
+                                && line_number >= def.start_line()
+                                && line_number <= def.end_line
+                        })
+                        .min_by_key(|def| def.end_line.saturating_sub(def.start_line()))
+                        .map(Definition::to_storage_id);
+                    let location = SourceLocation {
+                        project_id: file_info.project.clone().unwrap_or_default(),
+                        file_path: file_info.relative_path.clone(),
+                        start_line: line_number,
+                        start_col: mat.start(),
+                        end_line: line_number,
+                        end_col: mat.end(),
+                        role: LocationRole::Reference,
+                    };
+                    references.push(Reference {
+                        file_path: file_info.relative_path.clone(),
+                        root_path: Some(file_info.root_path.clone()),
+                        project: file_info.project.clone(),
+                        start_line: line_number,
+                        end_line: line_number,
+                        start_col: mat.start(),
+                        end_col: mat.end(),
+                        location_id: location.to_storage_id(),
+                        source_symbol_id,
+                        target_symbol_id,
+                        target_name: name.to_string(),
+                        candidates,
+                        reference_kind,
+                        resolution_status,
+                        evidence_kind,
+                        dispatch_kind: if reference_kind.is_call()
+                            && resolution_status == ResolutionStatus::Resolved
+                        {
+                            DispatchKind::Direct
+                        } else {
+                            DispatchKind::Unknown
+                        },
+                        configuration_states: Vec::new(),
+                        language: language_name.clone(),
+                        parser: parser_name.clone(),
+                        indexed_at: Utc::now().timestamp(),
+                    });
                 }
             }
+            absolute_offset += line_with_newline.len();
         }
 
         Ok(references)
@@ -101,7 +222,25 @@ impl ReferenceFinder {
         line: &str,
         position: usize,
         name: &str,
+        syntax_kind: Option<&str>,
     ) -> ReferenceKind {
+        if let Some(kind) = syntax_kind {
+            if kind.contains("comment") {
+                let trimmed = line.trim_start();
+                return if trimmed.starts_with("///")
+                    || trimmed.starts_with("//!")
+                    || trimmed.starts_with("/**")
+                    || trimmed.starts_with("*!")
+                {
+                    ReferenceKind::Documentation
+                } else {
+                    ReferenceKind::Comment
+                };
+            }
+            if kind.contains("string") {
+                return ReferenceKind::String;
+            }
+        }
         // Get text before the identifier
         let before = &line[..position];
 
@@ -121,12 +260,24 @@ impl ReferenceFinder {
             || lower_line.contains("require(")
             || lower_line.contains("use ")
         {
-            return ReferenceKind::Import;
+            return if lower_line.contains("#include") {
+                ReferenceKind::Include
+            } else {
+                ReferenceKind::Import
+            };
         }
 
-        // Check for instantiation (before function call, since `new Foo()` looks like a call)
+        let member_access = before.trim_end().ends_with('.')
+            || before.trim_end().ends_with("->")
+            || before.trim_end().ends_with("::");
+
+        if before.trim_end().ends_with("delete") {
+            return ReferenceKind::Destroys;
+        }
+
+        // Check for construction before function call, since `new Foo()` looks like a call.
         if before.contains("new ") {
-            return ReferenceKind::Instantiation;
+            return ReferenceKind::ObjectConstruction;
         }
 
         // Check for inheritance patterns
@@ -136,7 +287,11 @@ impl ReferenceFinder {
 
         // Check for function/method call pattern (identifier followed by parenthesis)
         if after_name.trim_start().starts_with('(') {
-            return ReferenceKind::Call;
+            return if member_access {
+                ReferenceKind::MethodCall
+            } else {
+                ReferenceKind::Call
+            };
         }
 
         // Check for assignment (write)
@@ -144,7 +299,26 @@ impl ReferenceFinder {
             && !after_name.trim_start().starts_with("==")
             && !after_name.trim_start().starts_with("=>")
         {
-            return ReferenceKind::Write;
+            return if member_access {
+                ReferenceKind::MemberWrite
+            } else if after_name.contains('{') || after_name.contains("new ") {
+                ReferenceKind::ObjectAssignment
+            } else {
+                ReferenceKind::Write
+            };
+        }
+
+        if before.contains("unique_ptr<") || before.contains("Box<") {
+            return ReferenceKind::Owns;
+        }
+        if before.contains("shared_ptr<")
+            || before.trim_end().ends_with('&')
+            || after_name.trim_start().starts_with('&')
+        {
+            return ReferenceKind::References;
+        }
+        if before.trim_end().ends_with('*') || after_name.trim_start().starts_with('*') {
+            return ReferenceKind::PointsTo;
         }
 
         // Check for type reference patterns
@@ -153,8 +327,27 @@ impl ReferenceFinder {
         }
 
         // Default to read
-        ReferenceKind::Read
+        if member_access {
+            ReferenceKind::MemberRead
+        } else {
+            ReferenceKind::Read
+        }
     }
+}
+
+fn qualified_use_at(line: &str, position: usize, name: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut start = position;
+    while start > 0 {
+        let byte = bytes[start - 1];
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b':' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let prefix = &line[start..position];
+    format!("{}{}", prefix, name).trim_matches(':').to_string()
 }
 
 impl Default for ReferenceFinder {
@@ -185,6 +378,15 @@ mod tests {
     fn make_definition(name: &str, file_path: &str, start_line: usize) -> Definition {
         Definition {
             symbol_id: SymbolId::new(file_path, name, SymbolKind::Function, start_line, 0),
+            location: SourceLocation {
+                project_id: String::new(),
+                file_path: file_path.to_string(),
+                start_line,
+                start_col: 3,
+                end_line: start_line,
+                end_col: 3 + name.len(),
+                role: LocationRole::Definition,
+            },
             root_path: Some("/test".to_string()),
             project: None,
             end_line: start_line + 5,
@@ -193,6 +395,7 @@ mod tests {
             doc_comment: None,
             visibility: Visibility::Public,
             parent_id: None,
+            parser: "tree-sitter/rust".to_string(),
             indexed_at: 0,
         }
     }
@@ -256,8 +459,12 @@ fn greet(name: &str) {
         let references = finder.find_references(&file_info, &symbol_index).unwrap();
 
         // First occurrence is a write, second is a read
-        assert!(references.len() >= 1);
-        assert!(references.iter().any(|r| r.reference_kind == ReferenceKind::Write));
+        assert!(!references.is_empty());
+        assert!(
+            references
+                .iter()
+                .any(|r| r.reference_kind == ReferenceKind::Write)
+        );
     }
 
     #[test]
@@ -275,7 +482,11 @@ fn greet(name: &str) {
         let references = finder.find_references(&file_info, &symbol_index).unwrap();
 
         assert!(!references.is_empty());
-        assert!(references.iter().any(|r| r.reference_kind == ReferenceKind::Import));
+        assert!(
+            references
+                .iter()
+                .any(|r| r.reference_kind == ReferenceKind::Import)
+        );
     }
 
     #[test]
@@ -293,7 +504,40 @@ fn greet(name: &str) {
         let references = finder.find_references(&file_info, &symbol_index).unwrap();
 
         assert!(!references.is_empty());
-        assert!(references.iter().any(|r| r.reference_kind == ReferenceKind::Instantiation));
+        assert!(
+            references
+                .iter()
+                .any(|r| r.reference_kind == ReferenceKind::ObjectConstruction)
+        );
+    }
+
+    #[test]
+    fn classifies_member_dependencies_without_alias_inference() {
+        let source = "obj.value = other.value; obj.run(); Widget* pointer; Owner<Box<Item>> owned;";
+        let file_info = make_file_info(source, "src/main.cpp");
+        let mut symbol_index = HashMap::new();
+        for name in ["value", "run", "Widget", "Item"] {
+            symbol_index.insert(
+                name.to_string(),
+                vec![make_definition(name, "src/types.cpp", 1)],
+            );
+        }
+        let references = ReferenceFinder::new()
+            .find_references(&file_info, &symbol_index)
+            .unwrap();
+        assert!(references.iter().any(|reference| {
+            reference.target_name == "value"
+                && reference.reference_kind == ReferenceKind::MemberWrite
+        }));
+        assert!(references.iter().any(|reference| {
+            reference.target_name == "run" && reference.reference_kind == ReferenceKind::MethodCall
+        }));
+        assert!(references.iter().any(|reference| {
+            reference.target_name == "Widget" && reference.reference_kind == ReferenceKind::PointsTo
+        }));
+        assert!(references.iter().any(|reference| {
+            reference.target_name == "Item" && reference.reference_kind == ReferenceKind::Owns
+        }));
     }
 
     #[test]
@@ -307,6 +551,73 @@ fn greet(name: &str) {
         let references = finder.find_references(&file_info, &symbol_index).unwrap();
 
         assert!(references.is_empty());
+    }
+
+    #[test]
+    fn comments_documentation_and_strings_are_not_code_references() {
+        let source =
+            "/// greet documents the API\n// greet is mentioned\nlet text = \"greet\";\ngreet();\n";
+        let file_info = make_file_info(source, "src/main.rs");
+        let mut symbol_index = HashMap::new();
+        symbol_index.insert(
+            "greet".to_string(),
+            vec![make_definition("greet", "src/lib.rs", 1)],
+        );
+        let references = ReferenceFinder::new()
+            .find_references(&file_info, &symbol_index)
+            .unwrap();
+        let kinds: Vec<_> = references.iter().map(|r| r.reference_kind).collect();
+        assert!(kinds.contains(&ReferenceKind::Documentation));
+        assert!(kinds.contains(&ReferenceKind::Comment));
+        assert!(kinds.contains(&ReferenceKind::String));
+        assert!(kinds.contains(&ReferenceKind::Call));
+        assert_eq!(
+            references
+                .iter()
+                .filter(|r| r.reference_kind.is_code())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn common_name_candidates_remain_ambiguous() {
+        let file_info = make_file_info("Write();", "src/main.rs");
+        let mut symbol_index = HashMap::new();
+        symbol_index.insert(
+            "Write".to_string(),
+            vec![
+                make_definition("Write", "src/a.rs", 1),
+                make_definition("Write", "src/b.rs", 1),
+            ],
+        );
+        let references = ReferenceFinder::new()
+            .find_references(&file_info, &symbol_index)
+            .unwrap();
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].resolution_status, ResolutionStatus::Ambiguous);
+        assert_eq!(references[0].evidence_kind, EvidenceKind::Heuristic);
+        assert!(references[0].target_symbol_id.is_empty());
+        assert_eq!(references[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn unqualified_single_text_candidate_is_not_silently_resolved() {
+        let file_info = make_file_info("get();", "src/main.rs");
+        let mut symbol_index = HashMap::new();
+        symbol_index.insert(
+            "get".to_string(),
+            vec![make_definition("get", "src/lib.rs", 1)],
+        );
+        let references = ReferenceFinder::new()
+            .find_references(&file_info, &symbol_index)
+            .unwrap();
+        assert_eq!(
+            references[0].resolution_status,
+            ResolutionStatus::Unresolved
+        );
+        assert_eq!(references[0].evidence_kind, EvidenceKind::Heuristic);
+        assert!(references[0].target_symbol_id.is_empty());
     }
 
     #[test]
@@ -330,5 +641,52 @@ fn main() {
         let references = finder.find_references(&file_info, &symbol_index).unwrap();
 
         assert_eq!(references.len(), 3);
+    }
+
+    #[test]
+    #[ignore = "manual synthetic M4 non-call dependency extraction measurement"]
+    fn benchmark_m4_non_call_dependency_classification() {
+        let names = (0..250)
+            .map(|index| format!("Field{index}"))
+            .collect::<Vec<_>>();
+        let source = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| match index % 4 {
+                0 => format!("obj.{name} = other.{name};"),
+                1 => format!("owner.{name}.run();"),
+                2 => format!("std::unique_ptr<{name}> value_{index};"),
+                _ => format!("{name}* pointer_{index};"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let file_info = make_file_info(&source, "src/dependencies.cpp");
+        let symbol_index = names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    vec![make_definition(name, "src/types.cpp", 1)],
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let started = std::time::Instant::now();
+        let references = ReferenceFinder::new()
+            .find_references(&file_info, &symbol_index)
+            .unwrap();
+        let elapsed = started.elapsed();
+        println!(
+            "m4 non-call synthetic: symbols={} references={} elapsed_ms={}",
+            symbol_index.len(),
+            references.len(),
+            elapsed.as_millis()
+        );
+        assert!(references.len() >= names.len());
+        assert!(
+            references
+                .iter()
+                .all(|reference| !reference.reference_kind.is_call())
+        );
     }
 }

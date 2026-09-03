@@ -23,6 +23,7 @@
 //! let references = provider.extract_references(&file_info, &symbol_index)?;
 //! ```
 
+pub mod graph;
 pub mod repomap;
 pub mod storage;
 pub mod types;
@@ -33,8 +34,10 @@ pub mod stack_graphs;
 use anyhow::Result;
 
 pub use types::{
-    CallEdge, CallGraphNode, Definition, DefinitionResult, PrecisionLevel, Reference,
-    ReferenceKind, ReferenceResult, SymbolId, SymbolInfo, SymbolKind, Visibility,
+    CallEdge, CallGraphNode, Definition, DefinitionResult, DispatchKind, EvidenceKind, GraphEdge,
+    LinkageKind, LocationRole, PrecisionLevel, Reference, ReferenceCandidate, ReferenceKind,
+    ReferenceResult, ResolutionStatus, SkippedDefinition, SourceLocation, SymbolId, SymbolInfo,
+    SymbolKind, Visibility,
 };
 
 use crate::indexer::FileInfo;
@@ -50,6 +53,20 @@ pub trait RelationsProvider: Send + Sync {
     /// Returns a list of all symbol definitions (functions, classes, etc.)
     /// found in the given file.
     fn extract_definitions(&self, file_info: &FileInfo) -> Result<Vec<Definition>>;
+
+    /// Extract definitions, and also report the ones that were recognised but could
+    /// not be named.
+    ///
+    /// A definition node whose name cannot be extracted is omitted from the result.
+    /// This method reports those omissions so a caller can tell an incomplete listing
+    /// from a complete one; the default implementation reports none, which is correct
+    /// only for providers that cannot skip.
+    fn extract_definitions_reporting(
+        &self,
+        file_info: &FileInfo,
+    ) -> Result<(Vec<Definition>, Vec<SkippedDefinition>)> {
+        Ok((self.extract_definitions(file_info)?, Vec::new()))
+    }
 
     /// Extract references from a file.
     ///
@@ -139,6 +156,17 @@ impl RelationsProvider for HybridRelationsProvider {
         let language = file_info.language.as_deref().unwrap_or("Unknown");
         self.provider_for_language(language)
             .extract_definitions(file_info)
+    }
+
+    fn extract_definitions_reporting(
+        &self,
+        file_info: &FileInfo,
+    ) -> Result<(Vec<Definition>, Vec<SkippedDefinition>)> {
+        // Without this override the default trait impl answers with an empty
+        // skipped list, hiding every omission behind the hybrid dispatch.
+        let language = file_info.language.as_deref().unwrap_or("Unknown");
+        self.provider_for_language(language)
+            .extract_definitions_reporting(file_info)
     }
 
     fn extract_references(

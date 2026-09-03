@@ -1,16 +1,71 @@
 use super::RagClient;
+use crate::build_config::{BuildConfigCatalog, ConfigurationState, PreprocessorState};
 use crate::embedding::EmbeddingProvider;
-use crate::indexer::{CodeChunk, FileWalker};
+use crate::indexer::{CodeChunk, FileInfo, FileWalker};
+use crate::relations::RelationsProvider;
+use crate::relations::storage::RelationsStore;
 use crate::types::{ChunkMetadata, IndexResponse};
 use crate::vector_db::VectorDatabase;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rmcp::{Peer, RoleServer, model::ProgressNotificationParam, model::ProgressToken};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+fn generate_project_id() -> String {
+    use sha2::{Digest, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let seed = format!(
+        "{}:{}:{:?}",
+        std::process::id(),
+        nanos,
+        std::thread::current().id()
+    );
+    let digest = Sha256::digest(seed.as_bytes());
+    format!("project-{:x}", digest)[..24].to_string()
+}
+
+async fn ensure_project_id(
+    client: &RagClient,
+    root: &str,
+    configured: Option<String>,
+) -> Result<String> {
+    let mut cache = client.hash_cache.write().await;
+    let project_id = match (cache.project_id(root), configured) {
+        (Some(existing), Some(configured)) if existing != configured => anyhow::bail!(
+            "Indexed root '{}' is already bound to project_id '{}', not '{}'",
+            root,
+            existing,
+            configured
+        ),
+        (Some(existing), _) => existing.to_string(),
+        (None, Some(configured)) => configured,
+        (None, None) => generate_project_id(),
+    };
+
+    if cache
+        .project_ids
+        .iter()
+        .any(|(other_root, id)| other_root != root && id == &project_id)
+    {
+        anyhow::bail!(
+            "project_id '{}' is already assigned to another indexed root; each root requires a distinct id",
+            project_id
+        );
+    }
+
+    cache.set_project_id(root.to_string(), project_id.clone());
+    cache.save(&client.cache_path)?;
+    Ok(project_id)
+}
 
 /// Helper macro to check for cancellation and return early if cancelled
 macro_rules! check_cancelled {
@@ -20,6 +75,415 @@ macro_rules! check_cancelled {
             anyhow::bail!("Indexing was cancelled");
         }
     };
+}
+
+fn relevant_build_diagnostics(catalog: &BuildConfigCatalog, files: &[FileInfo]) -> Vec<String> {
+    let has_build_sensitive_file = files.iter().any(|file| {
+        file.extension.as_deref().is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" | "m" | "mm"
+            )
+        })
+    });
+    catalog
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            has_build_sensitive_file
+                || !(diagnostic.starts_with("No compile_commands.json found")
+                    || diagnostic.starts_with("No analyzed build configuration is available"))
+        })
+        .cloned()
+        .collect()
+}
+
+enum RelationUpdate {
+    Full,
+    Incremental {
+        changed_files: HashSet<String>,
+        removed_files: Vec<String>,
+    },
+}
+
+fn has_authoritative_relation_failure(errors: &[String]) -> bool {
+    errors.iter().any(|error| {
+        error.starts_with("Failed ")
+            || error.contains("extraction failed")
+            || error.contains("invalidation failed")
+    })
+}
+
+/// Build and publish one coherent relations generation for a project root.
+///
+/// Storage is idempotent per file, so calling this for modified files replaces
+/// their old symbols. Any authoritative read, extraction, invalidation, or write
+/// failure is reported through `errors` and prevents generation publication.
+async fn extract_and_store_relations(
+    client: &RagClient,
+    files: &[FileInfo],
+    root_path: &str,
+    errors: &mut Vec<String>,
+    update: RelationUpdate,
+) -> (usize, usize) {
+    let build_catalog =
+        match BuildConfigCatalog::discover(Path::new(root_path), &client.config.analysis) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                errors.push(format!("Build-configuration discovery failed: {:#}", error));
+                BuildConfigCatalog::default()
+            }
+        };
+    let build_diagnostics = relevant_build_diagnostics(&build_catalog, files);
+    for diagnostic in &build_diagnostics {
+        tracing::warn!("{}", diagnostic);
+        errors.push(diagnostic.clone());
+    }
+    {
+        let mut cache = client.hash_cache.write().await;
+        cache
+            .diagnostics
+            .retain(|diagnostic| !diagnostic.starts_with("[build-config] "));
+        cache.diagnostics.extend(
+            build_diagnostics
+                .iter()
+                .map(|diagnostic| format!("[build-config] {}", diagnostic)),
+        );
+    }
+    let provider = client.relations_provider.clone();
+    let (definition_files, retained_definitions, old_changed_definitions) = match &update {
+        RelationUpdate::Full => (files.to_vec(), Vec::new(), Vec::new()),
+        RelationUpdate::Incremental {
+            changed_files,
+            removed_files,
+        } => {
+            let reset_files = changed_files
+                .iter()
+                .cloned()
+                .chain(removed_files.iter().cloned())
+                .collect::<Vec<_>>();
+            let old = match client
+                .relations_store
+                .find_definitions_by_files_in_root(&reset_files, root_path)
+                .await
+            {
+                Ok(definitions) => definitions,
+                Err(error) => {
+                    errors.push(format!(
+                        "Failed to read prior changed definitions for invalidation: {error:#}"
+                    ));
+                    return (0, 0);
+                }
+            };
+            let retained = match client
+                .relations_store
+                .find_definitions_in_root(root_path)
+                .await
+            {
+                Ok(definitions) => definitions,
+                Err(error) => {
+                    errors.push(format!(
+                        "Failed to read retained definitions for invalidation: {error:#}"
+                    ));
+                    return (0, 0);
+                }
+            }
+            .into_iter()
+            .filter(|definition| {
+                !reset_files
+                    .iter()
+                    .any(|path| path == definition.file_path())
+            })
+            .collect::<Vec<_>>();
+            let changed = files
+                .iter()
+                .filter(|file| changed_files.contains(&file.relative_path))
+                .cloned()
+                .collect::<Vec<_>>();
+            (changed, retained, old)
+        }
+    };
+    let definition_results: Vec<_> = definition_files
+        .par_iter()
+        .map(|file| match provider.extract_definitions_reporting(file) {
+            Ok((definitions, skipped)) => {
+                let diagnostics = (!skipped.is_empty()).then(|| {
+                    format!(
+                        "Symbol extraction for '{}' omitted {} unnameable definition nodes",
+                        file.relative_path,
+                        skipped.len()
+                    )
+                });
+                (definitions, diagnostics)
+            }
+            Err(error) => (
+                Vec::new(),
+                Some(format!(
+                    "Definition extraction failed for '{}': {:#}",
+                    file.relative_path, error
+                )),
+            ),
+        })
+        .collect();
+    let mut new_definitions = Vec::new();
+    for (mut extracted, diagnostic) in definition_results {
+        new_definitions.append(&mut extracted);
+        if let Some(diagnostic) = diagnostic {
+            tracing::warn!("{}", diagnostic);
+            errors.push(diagnostic);
+        }
+    }
+
+    let mut definitions = retained_definitions;
+    definitions.extend(new_definitions.iter().cloned());
+
+    let reference_files = match &update {
+        RelationUpdate::Full => files.to_vec(),
+        RelationUpdate::Incremental {
+            changed_files,
+            removed_files: _,
+        } => {
+            let build_inputs_changed = changed_files.iter().any(|path| {
+                let lower = path.replace('\\', "/").to_ascii_lowercase();
+                lower.ends_with("compile_commands.json")
+                    || lower.ends_with("cmakelists.txt")
+                    || lower.ends_with(".cmake")
+            });
+            if build_inputs_changed {
+                files.to_vec()
+            } else {
+                let changed_names = old_changed_definitions
+                    .iter()
+                    .chain(&new_definitions)
+                    .map(|definition| definition.name().to_string())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let dependent_files = if changed_names.is_empty() {
+                    HashSet::new()
+                } else {
+                    match client
+                        .relations_store
+                        .find_references_by_names_in_root(&changed_names, root_path)
+                        .await
+                    {
+                        Ok(references) => references
+                            .into_iter()
+                            .map(|reference| reference.file_path)
+                            .collect::<HashSet<_>>(),
+                        Err(error) => {
+                            errors.push(format!(
+                                "Failed to read dependent references for invalidation: {error:#}"
+                            ));
+                            return (0, 0);
+                        }
+                    }
+                };
+                files
+                    .iter()
+                    .filter(|file| {
+                        changed_files.contains(&file.relative_path)
+                            || dependent_files.contains(&file.relative_path)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+        }
+    };
+    let impacted_reference_files = reference_files
+        .iter()
+        .map(|file| file.relative_path.clone())
+        .collect::<HashSet<_>>();
+    let states_by_file = reference_files
+        .iter()
+        .map(|file| {
+            (
+                file.relative_path.clone(),
+                build_catalog.states_for_file(&file.relative_path, &file.content),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut symbol_index: HashMap<String, Vec<crate::relations::Definition>> = HashMap::new();
+    for definition in &definitions {
+        symbol_index
+            .entry(definition.name().to_string())
+            .or_default()
+            .push(definition.clone());
+    }
+    let symbol_index = Arc::new(symbol_index);
+    let reference_results: Vec<_> = reference_files
+        .par_iter()
+        .map(
+            |file| match provider.extract_references(file, &symbol_index) {
+                Ok(references) => (references, None),
+                Err(error) => (
+                    Vec::new(),
+                    Some(format!(
+                        "Reference extraction failed for '{}': {:#}",
+                        file.relative_path, error
+                    )),
+                ),
+            },
+        )
+        .collect();
+    let mut references = Vec::new();
+    for (mut extracted, diagnostic) in reference_results {
+        references.append(&mut extracted);
+        if let Some(diagnostic) = diagnostic {
+            tracing::warn!("{}", diagnostic);
+            errors.push(diagnostic);
+        }
+    }
+    references.extend(
+        definitions
+            .iter()
+            .filter(|definition| impacted_reference_files.contains(definition.file_path()))
+            .map(crate::relations::Reference::from_definition),
+    );
+    for reference in &mut references {
+        reference.configuration_states = states_by_file
+            .get(&reference.file_path)
+            .and_then(|lines| lines.get(reference.start_line))
+            .cloned()
+            .unwrap_or_default();
+    }
+
+    // Forced includes are dependencies even though they have no source token in
+    // the translation unit. Keep them as explicit build-config provenance rows.
+    for file in &reference_files {
+        for configuration in build_catalog.configurations_for_file(&file.relative_path) {
+            for forced_include in &configuration.forced_includes {
+                let location = crate::relations::SourceLocation {
+                    project_id: file.project.clone().unwrap_or_default(),
+                    file_path: file.relative_path.clone(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 1,
+                    end_col: 0,
+                    role: crate::relations::LocationRole::Reference,
+                };
+                references.push(crate::relations::Reference {
+                    file_path: file.relative_path.clone(),
+                    root_path: Some(root_path.to_string()),
+                    project: file.project.clone(),
+                    start_line: 1,
+                    end_line: 1,
+                    start_col: 0,
+                    end_col: 0,
+                    location_id: format!(
+                        "{}:{}:{}",
+                        location.to_storage_id(),
+                        configuration.config_id,
+                        forced_include
+                    ),
+                    source_symbol_id: None,
+                    target_symbol_id: String::new(),
+                    target_name: forced_include.clone(),
+                    candidates: Vec::new(),
+                    reference_kind: crate::relations::ReferenceKind::Include,
+                    resolution_status: crate::relations::ResolutionStatus::Unresolved,
+                    evidence_kind: crate::relations::EvidenceKind::Syntactic,
+                    dispatch_kind: crate::relations::DispatchKind::Unknown,
+                    configuration_states: vec![ConfigurationState {
+                        config_id: configuration.config_id.clone(),
+                        state: PreprocessorState::Active,
+                    }],
+                    language: file
+                        .language
+                        .clone()
+                        .unwrap_or_else(|| "Unknown".to_string()),
+                    parser: "build-config/forced-include".to_string(),
+                    indexed_at: chrono::Utc::now().timestamp(),
+                });
+            }
+        }
+    }
+
+    let definitions_to_store = match &update {
+        RelationUpdate::Full => definitions,
+        RelationUpdate::Incremental { .. } => new_definitions,
+    };
+    match &update {
+        RelationUpdate::Full => {
+            if let Err(e) = client.relations_store.delete_by_root(root_path).await {
+                let message = format!("Failed to clear prior relations generation: {:#}", e);
+                tracing::warn!("{}", message);
+                errors.push(message);
+                return (0, 0);
+            }
+        }
+        RelationUpdate::Incremental {
+            changed_files,
+            removed_files,
+        } => {
+            let definition_reset = changed_files
+                .iter()
+                .cloned()
+                .chain(removed_files.iter().cloned())
+                .collect::<Vec<_>>();
+            let reference_reset = impacted_reference_files
+                .iter()
+                .cloned()
+                .chain(removed_files.iter().cloned())
+                .collect::<Vec<_>>();
+            if let Err(error) = client
+                .relations_store
+                .delete_definitions_by_files_in_root(&definition_reset, root_path)
+                .await
+            {
+                errors.push(format!(
+                    "Failed incremental definition invalidation: {error:#}"
+                ));
+                return (0, 0);
+            }
+            if let Err(error) = client
+                .relations_store
+                .delete_references_by_files_in_root(&reference_reset, root_path)
+                .await
+            {
+                errors.push(format!(
+                    "Failed incremental reference invalidation: {error:#}"
+                ));
+                return (0, 0);
+            }
+        }
+    }
+
+    let stored_definitions = match client
+        .relations_store
+        .store_definitions(definitions_to_store, root_path)
+        .await
+    {
+        Ok(stored) => {
+            tracing::info!("Stored {} incrementally invalidated definitions", stored);
+            stored
+        }
+        Err(e) => {
+            tracing::warn!("Failed to store definitions: {:#}", e);
+            errors.push(format!("Failed to store definitions: {:#}", e));
+            return (0, 0);
+        }
+    };
+
+    let stored_references = match client
+        .relations_store
+        .store_references(references, root_path)
+        .await
+    {
+        Ok(stored) => stored,
+        Err(e) => {
+            tracing::warn!("Failed to store references: {:#}", e);
+            errors.push(format!("Failed to store references: {:#}", e));
+            0
+        }
+    };
+    tracing::info!(
+        "Published relations generation with {} definitions and {} references",
+        stored_definitions,
+        stored_references
+    );
+    (stored_definitions, stored_references)
 }
 
 /// Result of embedding generation with cancellation support
@@ -88,11 +552,8 @@ async fn generate_embeddings_with_cancellation(
             let provider = client.embedding_provider.clone();
             let embed_future = tokio::task::spawn_blocking(move || provider.embed_batch(texts));
 
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                embed_future,
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), embed_future)
+                .await
             {
                 Ok(Ok(Ok(embeddings))) => {
                     batch_embeddings.extend(embeddings);
@@ -126,8 +587,8 @@ async fn generate_embeddings_with_cancellation(
 
         // Send progress during embedding
         if let (Some(peer), Some(token)) = (peer, progress_token) {
-            let progress =
-                progress_start + ((batch_idx + 1) as f64 / total_batches as f64) * (progress_end - progress_start);
+            let progress = progress_start
+                + ((batch_idx + 1) as f64 / total_batches as f64) * (progress_end - progress_start);
             let _ = peer
                 .notify_progress(ProgressNotificationParam {
                     progress_token: token.clone(),
@@ -164,6 +625,10 @@ pub async fn do_index(
     progress_token: Option<ProgressToken>,
     cancel_token: CancellationToken,
 ) -> Result<IndexResponse> {
+    // Direct callers must receive the same canonical root identity as the smart
+    // indexing wrapper. On Windows, TempDir and other APIs may spell one path
+    // with an 8.3 component while canonicalization returns a long `\\?\` path.
+    let path = RagClient::normalize_path(&path).context("Failed to walk directory")?;
     let start = Instant::now();
     let mut errors = Vec::new();
 
@@ -295,7 +760,10 @@ pub async fn do_index(
         .iter()
         .map(|c| c.metadata.clone())
         .collect();
-    let contents: Vec<String> = successful_chunks.iter().map(|c| c.content.clone()).collect();
+    let contents: Vec<String> = successful_chunks
+        .iter()
+        .map(|c| c.content.clone())
+        .collect();
 
     // Sanity check: ensure all arrays have the same length to prevent RecordBatch errors
     debug_assert_eq!(
@@ -318,6 +786,16 @@ pub async fn do_index(
             .store_embeddings(all_embeddings, metadata, contents, &path)
             .await
             .context("Failed to store embeddings")?;
+    }
+
+    // Persist symbol definitions (functions, classes, imports) alongside the
+    // embeddings so relations queries can be served from the database.
+    extract_and_store_relations(client, &files, &path, &mut errors, RelationUpdate::Full).await;
+    if has_authoritative_relation_failure(&errors) {
+        anyhow::bail!(
+            "Authoritative relation publication failed; index remains dirty: {}",
+            errors.join("; ")
+        );
     }
 
     // Send progress before saving cache
@@ -402,6 +880,10 @@ pub async fn do_incremental_update(
     progress_token: Option<ProgressToken>,
     cancel_token: CancellationToken,
 ) -> Result<IndexResponse> {
+    // Keep cache, chunk metadata, relation rows, and vector storage on exactly
+    // one canonical root spelling even when this lower-level API is called
+    // directly.
+    let path = RagClient::normalize_path(&path).context("Failed to walk directory")?;
     let start = Instant::now();
 
     // Send initial progress
@@ -465,6 +947,7 @@ pub async fn do_incremental_update(
     let mut files_added = 0;
     let mut files_updated = 0;
     let mut files_removed = 0;
+    let mut removed_file_paths = Vec::new();
     let mut chunks_modified = 0;
 
     // Send progress after file walk
@@ -486,22 +969,26 @@ pub async fn do_incremental_update(
     let mut new_hashes = HashMap::with_capacity(current_files.len());
     let mut files_to_index = Vec::with_capacity(current_files.len());
 
-    for file in current_files {
+    for file in &current_files {
         new_hashes.insert(file.relative_path.clone(), file.hash.clone());
 
         match existing_hashes.get(&file.relative_path) {
             None => {
                 // New file
                 files_added += 1;
-                files_to_index.push(file);
+                files_to_index.push(file.clone());
             }
             Some(old_hash) if old_hash != &file.hash => {
                 // Modified file - delete old embeddings first
-                if let Err(e) = client.vector_db.delete_by_file(&file.relative_path).await {
+                if let Err(e) = client
+                    .vector_db
+                    .delete_by_file_in_root(&file.relative_path, &path)
+                    .await
+                {
                     tracing::warn!("Failed to delete old embeddings: {}", e);
                 }
                 files_updated += 1;
-                files_to_index.push(file);
+                files_to_index.push(file.clone());
             }
             _ => {
                 // Unchanged file, skip
@@ -513,7 +1000,12 @@ pub async fn do_incremental_update(
     for old_file in existing_hashes.keys() {
         if !new_hashes.contains_key(old_file) {
             files_removed += 1;
-            if let Err(e) = client.vector_db.delete_by_file(old_file).await {
+            removed_file_paths.push(old_file.clone());
+            if let Err(e) = client
+                .vector_db
+                .delete_by_file_in_root(old_file, &path)
+                .await
+            {
                 tracing::warn!("Failed to delete embeddings for removed file: {}", e);
             }
         }
@@ -597,7 +1089,10 @@ pub async fn do_incremental_update(
             .iter()
             .map(|c| c.metadata.clone())
             .collect();
-        let contents: Vec<String> = successful_chunks.iter().map(|c| c.content.clone()).collect();
+        let contents: Vec<String> = successful_chunks
+            .iter()
+            .map(|c| c.content.clone())
+            .collect();
 
         if !all_embeddings.is_empty() {
             client
@@ -615,6 +1110,29 @@ pub async fn do_incremental_update(
     // Collect any embedding errors (logged but not fatal)
     for err in embed_errors {
         tracing::warn!("Embedding error during incremental update: {}", err);
+    }
+
+    let mut relation_errors = Vec::new();
+    let changed_relation_files = files_to_index
+        .iter()
+        .map(|file| file.relative_path.clone())
+        .collect::<HashSet<_>>();
+    extract_and_store_relations(
+        client,
+        &current_files,
+        &path,
+        &mut relation_errors,
+        RelationUpdate::Incremental {
+            changed_files: changed_relation_files,
+            removed_files: removed_file_paths,
+        },
+    )
+    .await;
+    if has_authoritative_relation_failure(&relation_errors) {
+        anyhow::bail!(
+            "Authoritative incremental relation publication failed; index remains dirty: {}",
+            relation_errors.join("; ")
+        );
     }
 
     // Send progress before saving cache
@@ -676,7 +1194,7 @@ pub async fn do_incremental_update(
         chunks_created: chunks_modified,
         embeddings_generated,
         duration_ms: start.elapsed().as_millis() as u64,
-        errors: vec![],
+        errors: relation_errors,
         files_updated,
         files_removed,
     })
@@ -703,7 +1221,10 @@ pub async fn do_index_smart(
     match lock_result {
         IndexLockResult::WaitForResult(mut receiver) => {
             // Another task in THIS PROCESS is indexing, wait for its result via broadcast
-            tracing::info!("Waiting for existing indexing operation in this process to complete for: {}", path);
+            tracing::info!(
+                "Waiting for existing indexing operation in this process to complete for: {}",
+                path
+            );
 
             // Send progress notification if we have a peer
             if let (Some(peer), Some(token)) = (&peer, &progress_token) {
@@ -712,7 +1233,9 @@ pub async fn do_index_smart(
                         progress_token: token.clone(),
                         progress: 0.0,
                         total: Some(100.0),
-                        message: Some("Waiting for existing indexing operation to complete...".into()),
+                        message: Some(
+                            "Waiting for existing indexing operation to complete...".into(),
+                        ),
                     })
                     .await;
             }
@@ -811,6 +1334,7 @@ pub async fn do_index_smart(
                 peer,
                 progress_token,
                 cancel_token,
+                false,
             )
             .await;
 
@@ -894,6 +1418,15 @@ async fn validate_dirty_flag(
         .await
         .unwrap_or(0);
 
+    // A v5 dirty flag means no coherent generation was published. Counts that
+    // merely look close cannot prove that vector and relation tables agree, so
+    // recovery always rebuilds when any prior data exists.
+    if dirty_info_data.is_some() && (cached_files_count > 0 || indexed_count > 0) {
+        return Ok(DirtyFlagValidation::TrulyCorrupted {
+            reason: "an indexing transaction ended before generation publication".to_string(),
+        });
+    }
+
     // If we have cached file hashes but no embeddings, index is truly corrupted
     if cached_files_count > 0 && indexed_count == 0 {
         return Ok(DirtyFlagValidation::TrulyCorrupted {
@@ -937,18 +1470,17 @@ async fn validate_dirty_flag(
             "Cached {} files but only {} files indexed ({}%)",
             cached_files_count,
             indexed_files_count,
-            if cached_files_count > 0 {
-                indexed_files_count * 100 / cached_files_count
-            } else {
-                0
-            }
+            indexed_files_count
+                .saturating_mul(100)
+                .checked_div(cached_files_count)
+                .unwrap_or(0)
         ),
     })
 }
 
 /// Inner implementation of smart indexing (called when we have the lock)
 #[allow(clippy::too_many_arguments)]
-async fn do_index_smart_inner(
+pub(crate) async fn do_index_smart_inner(
     client: &RagClient,
     path: String,
     project: Option<String>,
@@ -958,9 +1490,11 @@ async fn do_index_smart_inner(
     peer: Option<Peer<RoleServer>>,
     progress_token: Option<ProgressToken>,
     cancel_token: CancellationToken,
+    accept_owned_dirty: bool,
 ) -> Result<IndexResponse> {
     // Normalize path to canonical form for consistent cache lookups
     let normalized_path = RagClient::normalize_path(&path)?;
+    let project_id = ensure_project_id(client, &normalized_path, project).await?;
 
     // Check if index is dirty (previous indexing was interrupted)
     let is_dirty = {
@@ -970,7 +1504,7 @@ async fn do_index_smart_inner(
 
     // Handle dirty index with validation
     let mut force_full_reindex = false;
-    if is_dirty {
+    if is_dirty && !accept_owned_dirty {
         tracing::info!(
             "Index for '{}' is marked as dirty. Validating dirty flag...",
             normalized_path
@@ -994,7 +1528,10 @@ async fn do_index_smart_inner(
                             progress_token: token.clone(),
                             progress: 0.0,
                             total: Some(100.0),
-                            message: Some(format!("Corrupted index detected ({}), clearing...", reason)),
+                            message: Some(format!(
+                                "Corrupted index detected ({}), clearing...",
+                                reason
+                            )),
                         })
                         .await;
                 }
@@ -1044,7 +1581,10 @@ async fn do_index_smart_inner(
                 let mut cache = client.hash_cache.write().await;
                 cache.clear_dirty(&normalized_path);
                 if let Err(e) = cache.save(&client.cache_path) {
-                    tracing::warn!("Failed to save cache after clearing stale dirty flag: {}", e);
+                    tracing::warn!(
+                        "Failed to save cache after clearing stale dirty flag: {}",
+                        e
+                    );
                 }
                 drop(cache);
                 // Proceed with incremental update
@@ -1067,7 +1607,9 @@ async fn do_index_smart_inner(
                             progress_token: token.clone(),
                             progress: 0.0,
                             total: Some(100.0),
-                            message: Some("Index appears complete, clearing stale dirty flag...".into()),
+                            message: Some(
+                                "Index appears complete, clearing stale dirty flag...".into(),
+                            ),
                         })
                         .await;
                 }
@@ -1112,7 +1654,7 @@ async fn do_index_smart_inner(
         do_incremental_update(
             client,
             normalized_path.clone(),
-            project,
+            Some(project_id),
             include_patterns,
             exclude_patterns,
             max_file_size,
@@ -1131,7 +1673,7 @@ async fn do_index_smart_inner(
         do_index(
             client,
             normalized_path.clone(),
-            project,
+            Some(project_id),
             include_patterns,
             exclude_patterns,
             max_file_size,
@@ -1148,11 +1690,22 @@ async fn do_index_smart_inner(
         Ok(_) => {
             let mut cache = client.hash_cache.write().await;
             cache.clear_dirty(&normalized_path);
+            let generation = cache.publish_generation(&normalized_path);
             if let Err(e) = cache.save(&client.cache_path) {
-                tracing::warn!("Failed to clear dirty flag after successful indexing: {}", e);
+                tracing::warn!(
+                    "Failed to clear dirty flag after successful indexing: {}",
+                    e
+                );
                 // Don't fail the whole operation for this
             }
+            drop(cache);
+            client.analysis_cache.write().await.clear();
             tracing::debug!("Cleared dirty flag for: {}", normalized_path);
+            tracing::info!(
+                "Published coherent index generation {} for '{}'",
+                generation,
+                normalized_path
+            );
         }
         Err(e) => {
             tracing::warn!(
@@ -1177,10 +1730,25 @@ async fn clear_path_data(client: &RagClient, normalized_path: &str) -> Result<()
         .unwrap_or_default();
     drop(cache);
 
-    // Delete embeddings for each file
+    // Delete embeddings and stored relations for each file
     for file_path in file_paths {
-        if let Err(e) = client.vector_db.delete_by_file(&file_path).await {
-            tracing::warn!("Failed to delete embeddings for file '{}': {}", file_path, e);
+        if let Err(e) = client
+            .vector_db
+            .delete_by_file_in_root(&file_path, normalized_path)
+            .await
+        {
+            tracing::warn!(
+                "Failed to delete embeddings for file '{}': {}",
+                file_path,
+                e
+            );
+        }
+        if let Err(e) = client
+            .relations_store
+            .delete_by_file_in_root(&file_path, normalized_path)
+            .await
+        {
+            tracing::warn!("Failed to delete relations for file '{}': {}", file_path, e);
         }
     }
 

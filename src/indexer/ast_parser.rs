@@ -33,7 +33,7 @@ impl AstParser {
             "java" => (tree_sitter_java::LANGUAGE.into(), "Java"),
             "swift" => (tree_sitter_swift::LANGUAGE.into(), "Swift"),
             "c" | "h" => (tree_sitter_c::LANGUAGE.into(), "C"),
-            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => {
+            "cpp" | "cc" | "cxx" | "cu" | "hpp" | "hxx" | "hh" | "cuh" => {
                 (tree_sitter_cpp::LANGUAGE.into(), "C++")
             }
             "cs" => (tree_sitter_c_sharp::LANGUAGE.into(), "C#"),
@@ -344,6 +344,28 @@ namespace MyNamespace {
 
         assert!(!nodes.is_empty());
         assert!(parser.language_name() == "C++");
+    }
+
+    #[test]
+    fn test_cuda_parsing() {
+        let source = r#"
+template <typename T>
+__global__ void scale_kernel(T * data, T scale) {
+    data[threadIdx.x] *= scale;
+}
+
+__device__ int lane_id() {
+    return threadIdx.x;
+}
+"#;
+
+        for extension in ["cu", "cuh"] {
+            let mut parser = AstParser::new(extension).unwrap();
+            let nodes = parser.parse(source).unwrap();
+
+            assert!(!nodes.is_empty(), "{}", extension);
+            assert_eq!(parser.language_name(), "C++");
+        }
     }
 
     #[test]

@@ -24,8 +24,12 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing.
+    // Must write to stderr: stdout carries the JSON-RPC stream in stdio MCP mode,
+    // and log lines interleaved there corrupt it.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
 
     // Parse CLI arguments
     let cli = Cli::parse();
@@ -72,9 +76,10 @@ fn show_version_info() {
 
     #[cfg(not(feature = "qdrant-backend"))]
     {
-        use project_rag::vector_db::lance_client::LanceVectorDB;
-        let default_path = LanceVectorDB::default_lancedb_path();
-        println!("  Default Path:    {}", default_path);
+        let configured_path =
+            std::env::var("PROJECT_RAG_LANCEDB_PATH").unwrap_or_else(|_| "<not set>".to_string());
+        println!("  Configured Path: {}", configured_path);
+        println!("  Path Source:     PROJECT_RAG_LANCEDB_PATH (required)");
         println!("  Type:            Embedded (no external server required)");
     }
 

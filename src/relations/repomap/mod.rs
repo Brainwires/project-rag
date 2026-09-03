@@ -17,6 +17,7 @@
 //! - Include false positives for common names
 //! - Not resolve which overload is being called
 
+pub mod import_extractor;
 pub mod reference_finder;
 pub mod symbol_extractor;
 
@@ -28,7 +29,7 @@ use crate::indexer::FileInfo;
 use crate::relations::{Definition, PrecisionLevel, Reference, RelationsProvider};
 
 pub use reference_finder::ReferenceFinder;
-pub use symbol_extractor::SymbolExtractor;
+pub use symbol_extractor::{SymbolExtractor, language_name_for_extension};
 
 /// RepoMap-style relations provider using AST-based extraction.
 pub struct RepoMapProvider {
@@ -57,6 +58,14 @@ impl Default for RepoMapProvider {
 impl RelationsProvider for RepoMapProvider {
     fn extract_definitions(&self, file_info: &FileInfo) -> Result<Vec<Definition>> {
         self.symbol_extractor.extract_definitions(file_info)
+    }
+
+    fn extract_definitions_reporting(
+        &self,
+        file_info: &FileInfo,
+    ) -> Result<(Vec<Definition>, Vec<crate::relations::SkippedDefinition>)> {
+        self.symbol_extractor
+            .extract_definitions_reporting(file_info)
     }
 
     fn extract_references(

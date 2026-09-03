@@ -24,10 +24,10 @@ fn format_as_markdown(text: &str) -> String {
         // Skip empty lines
         if trimmed.is_empty() {
             if in_table {
-                markdown.push_str("\n");
+                markdown.push('\n');
                 in_table = false;
             }
-            markdown.push_str("\n");
+            markdown.push('\n');
             continue;
         }
 
