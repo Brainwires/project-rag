@@ -17,8 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # Pinned to the crate's declared MSRV (Cargo.toml rust-version). The pinned
+      # lancedb 0.23 / lance 1.0.1 dependency no longer compiles on current stable
+      # (rustc 1.99: "queries overflow the depth limit" in lance's async code).
+      - name: Install Rust 1.88 (crate MSRV)
+        uses: dtolnay/rust-toolchain@1.88
         with:
           components: clippy
 
