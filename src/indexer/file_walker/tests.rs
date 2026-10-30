@@ -396,3 +396,42 @@ fn test_walk_respects_gitignore() {
     assert!(!filenames.contains(&"ignored.txt"));
     assert!(filenames.contains(&".gitignore"));
 }
+
+#[test]
+fn test_walk_skips_secret_files_by_default() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join(".ssh")).unwrap();
+    fs::create_dir_all(root.join(".aws")).unwrap();
+    fs::create_dir_all(root.join("config")).unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+    fs::write(root.join("src/environment.rs"), "pub fn env() {}").unwrap();
+    fs::write(root.join(".env"), "SECRET=1").unwrap();
+    fs::write(root.join(".env.local"), "SECRET=2").unwrap();
+    fs::write(root.join("server.pem"), "-----BEGIN CERTIFICATE-----").unwrap();
+    fs::write(root.join("config/tls.key"), "-----BEGIN PRIVATE KEY-----").unwrap();
+    fs::write(
+        root.join(".ssh/id_rsa"),
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".aws/credentials"),
+        "[default]\naws_secret_access_key = x",
+    )
+    .unwrap();
+    fs::write(root.join("config/.npmrc"), "//registry/:_authToken=abc").unwrap();
+    fs::write(root.join(".netrc"), "machine x login y password z").unwrap();
+
+    // No user patterns at all: the built-in excludes must still apply
+    let walker = FileWalker::new(root, 1024);
+    let mut files: Vec<String> = walker
+        .walk()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.relative_path)
+        .collect();
+    files.sort();
+    assert_eq!(files, vec!["src/environment.rs", "src/main.rs"]);
+}

@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// Built-in exclusions for secret-bearing files (.env, private keys, ...)
+pub mod default_excludes;
+
 pub struct FileWalker {
     pub(crate) root: PathBuf,
     pub(crate) project: Option<String>,
@@ -101,6 +104,16 @@ impl FileWalker {
             // Explicitly skip .git directory contents
             if path.components().any(|c| c.as_os_str() == ".git") {
                 tracing::debug!("Skipping .git directory file: {:?}", path);
+                continue;
+            }
+
+            // Never index files that commonly hold secrets, whatever the user patterns say
+            let relative = path.strip_prefix(&self.root).unwrap_or(path);
+            if default_excludes::is_default_excluded(relative) {
+                tracing::debug!(
+                    "Skipping secret-bearing file (built-in exclude): {:?}",
+                    path
+                );
                 continue;
             }
 
