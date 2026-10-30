@@ -455,10 +455,19 @@ impl VectorDatabase for QdrantVectorDB {
         Ok(results)
     }
 
-    async fn delete_by_file(&self, file_path: &str) -> Result<usize> {
-        tracing::debug!("Deleting embeddings for file: {}", file_path);
+    async fn delete_by_file(&self, root_path: &str, file_path: &str) -> Result<usize> {
+        tracing::debug!(
+            "Deleting embeddings for file: {} under root: {}",
+            file_path,
+            root_path
+        );
 
-        let filter = Filter::must([Condition::matches("file_path", file_path.to_string())]);
+        // Scope to the root as well: file_path is root-relative and may exist in several
+        // indexed projects.
+        let filter = Filter::must([
+            Condition::matches("file_path", file_path.to_string()),
+            Condition::matches("root_path", root_path.to_string()),
+        ]);
 
         self.client
             .delete_points(DeletePointsBuilder::new(COLLECTION_NAME).points(filter))

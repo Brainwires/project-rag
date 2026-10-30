@@ -64,9 +64,9 @@ impl CommitChunker {
             content.push_str(&commit.diff_content);
         }
 
-        // Truncate if too long
+        // Truncate if too long (on a char boundary: diffs are frequently non-ASCII)
         if content.len() > self.max_content_length {
-            content.truncate(self.max_content_length);
+            crate::text_utils::truncate_string(&mut content, self.max_content_length);
             content.push_str("\n\n[... content truncated for embedding ...]");
         }
 
@@ -156,6 +156,24 @@ mod tests {
 
         assert!(chunk.content.len() <= 150); // 100 + truncation message
         assert!(chunk.content.contains("[... content truncated"));
+    }
+
+    #[test]
+    fn test_content_truncation_multibyte() {
+        // With a diff made of two-byte characters, some of these limits land in the middle
+        // of a character. `String::truncate` used to panic on those.
+        for max_length in 100..=104 {
+            let chunker = CommitChunker::with_max_length(max_length);
+            let mut commit = create_test_commit();
+            commit.diff_content = "é".repeat(5000);
+
+            let chunk = chunker
+                .commit_to_chunk(&commit, "/repo/path", None)
+                .expect("Should convert commit");
+
+            assert!(chunk.content.contains("[... content truncated"));
+            assert!(chunk.content.len() <= max_length + 50);
+        }
     }
 
     #[test]

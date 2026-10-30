@@ -31,6 +31,7 @@ This MCP server enables AI assistants to efficiently search and understand large
 - **Language Detection**: Automatic detection of 40+ file types (programming languages, documentation formats, and config files)
 - **Advanced Filtering**: Search by file type, language, or path patterns
 - **Respects .gitignore**: Automatically excludes ignored files during indexing
+- **Never indexes secrets**: `.env` files, private keys, certificates and `.aws/`/`.ssh/` contents are always excluded
 - **Code Navigation**: Find definitions, references, and call graphs (lightweight LSP-like features)
 - **Adaptive Search Thresholds**: Automatically lowers similarity threshold when no results found (0.7 → 0.6 → 0.5 → 0.4 → 0.3)
 - **Slash Commands**: 9 convenient slash commands via MCP Prompts
@@ -92,7 +93,7 @@ With special handling for rich content:
 - Handles multi-column layouts intelligently
 - Chunks like any other text file (50 lines per chunk by default)
 
-### Configuration Files (8 formats)
+### Configuration Files (7 formats)
 For complete project understanding:
 - **JSON** (`.json`)
 - **YAML** (`.yaml`, `.yml`)
@@ -101,7 +102,10 @@ For complete project understanding:
 - **INI** (`.ini`)
 - **Config files** (`.conf`, `.config`, `.cfg`)
 - **Properties** (`.properties`)
-- **Environment** (`.env`)
+
+Files that commonly hold secrets are never indexed, regardless of your include/exclude
+patterns: `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*.p12`, `*.pfx`,
+`.npmrc`, `.netrc`, and anything under `.aws/` or `.ssh/`.
 
 ### Example Use Cases
 ```bash
@@ -109,7 +113,7 @@ For complete project understanding:
 query_codebase("API authentication flow")  # Finds content in .pdf, .md, .rst files
 
 # Search configuration files
-query_codebase("database connection string")  # Finds .yaml, .toml, .env, .conf files
+query_codebase("database connection string")  # Finds .yaml, .toml, .conf files
 
 # Find code implementations
 search_by_filters(query="JWT validation", file_extensions=["rs", "go"])

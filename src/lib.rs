@@ -151,6 +151,9 @@ pub mod paths;
 /// Code relationships: definitions, references, call graphs
 pub mod relations;
 
+/// UTF-8 safe string truncation helpers
+pub mod text_utils;
+
 /// Request/response types with validation
 pub mod types;
 
