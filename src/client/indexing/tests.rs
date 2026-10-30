@@ -698,7 +698,7 @@ async fn test_do_index_with_include_patterns() {
         &client,
         data_dir.to_string_lossy().to_string(),
         None,
-        vec!["rs".to_string()], // Only include .rs files
+        vec!["**/*.rs".to_string()], // Only include .rs files
         vec![],
         1024 * 1024,
         None,
