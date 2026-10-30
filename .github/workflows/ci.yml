@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Build, test, clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # fastembed downloads ONNX models (~90-440 MB each) into ./.fastembed_cache
+      # the first time a model is used. Several unit tests instantiate models,
+      # so cache the directory between runs to avoid re-downloading.
+      - name: Cache fastembed models
+        uses: actions/cache@v4
+        with:
+          path: .fastembed_cache
+          key: fastembed-models-${{ runner.os }}-v1
+
+      - name: Build (all targets)
+        run: cargo build --all-targets
+
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Clippy
+        run: cargo clippy --all-targets
