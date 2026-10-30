@@ -8,13 +8,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # The lance/arrow/tantivy/ort dependency tree exhausts the hosted runner's memory
-  # when built with full debuginfo and unbounded parallelism (the job was SIGKILLed,
-  # exit 143, while compiling). Line-table debuginfo and fewer jobs keep it in budget.
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  CARGO_PROFILE_TEST_DEBUG: line-tables-only
-  CARGO_BUILD_JOBS: 2
-  CARGO_INCREMENTAL: 0
   # The final crate builds several large targets concurrently (lib, lib tests, bin,
   # examples, bench); with full debuginfo rustc exceeded the runner's memory and the
   # job was killed (exit 143). No debuginfo / no incremental keeps it well within limits.
@@ -29,14 +22,6 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free disk space and add swap
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo swapoff -a || true
-          sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile
-          sudo mkswap /swapfile && sudo swapon /swapfile
-          free -h && df -h /
 
       # Pinned to the crate's declared MSRV (Cargo.toml rust-version). The pinned
       # lancedb 0.23 / lance 1.0.1 dependency no longer compiles on current stable
