@@ -25,6 +25,30 @@ pub struct FileWalker {
     cancelled: Option<Arc<AtomicBool>>,
 }
 
+/// Expand a user-supplied pattern into the glob(s) it should match against the
+/// root-relative path.
+///
+/// - A pattern containing glob metacharacters (`*`, `?`, `[`, `{`) is used verbatim,
+///   e.g. `**/*.rs` or `src/**/generated_*.rs`.
+/// - A plain name without `/` (e.g. `target`, `node_modules`, `.env`) is treated as a
+///   path component: it matches that file or directory at any depth, plus everything
+///   below it (`**/target` and `**/target/**`). This keeps the bare-name exclude lists
+///   from `config.example.toml` and `default_exclude_patterns()` working.
+/// - A plain path containing `/` (e.g. `src/generated`) is treated as a prefix relative
+///   to the root (`src/generated` and `src/generated/**`).
+///
+/// Arbitrary substring patterns such as `.rs` are no longer supported; use `**/*.rs`.
+fn expand_pattern(pattern: &str) -> Vec<String> {
+    if pattern.contains(['*', '?', '[', '{']) {
+        return vec![pattern.to_string()];
+    }
+    if pattern.contains('/') {
+        let prefix = pattern.trim_end_matches('/');
+        return vec![prefix.to_string(), format!("{}/**", prefix)];
+    }
+    vec![format!("**/{}", pattern), format!("**/{}/**", pattern)]
+}
+
 /// Compile a list of glob patterns into a GlobSet. Patterns that fail to compile are
 /// skipped with a warning rather than aborting the whole walk. Returns None when empty.
 fn build_glob_set(patterns: &[String]) -> Option<GlobSet> {
@@ -33,11 +57,13 @@ fn build_glob_set(patterns: &[String]) -> Option<GlobSet> {
     }
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        match Glob::new(pattern) {
-            Ok(glob) => {
-                builder.add(glob);
+        for expanded in expand_pattern(pattern) {
+            match Glob::new(&expanded) {
+                Ok(glob) => {
+                    builder.add(glob);
+                }
+                Err(e) => tracing::warn!("Ignoring invalid glob pattern '{}': {}", pattern, e),
             }
-            Err(e) => tracing::warn!("Ignoring invalid glob pattern '{}': {}", pattern, e),
         }
     }
     match builder.build() {
@@ -231,6 +257,8 @@ impl FileWalker {
     ///
     /// Globs are matched against the path relative to the walk root, so patterns like
     /// `**/vendor/**` or `src/**/*.rs` behave as expected regardless of where the root sits.
+    /// Bare names (`target`) and plain prefixes (`src/generated`) are expanded by
+    /// [`expand_pattern`] so the historical exclude lists keep working.
     pub(crate) fn matches_patterns(&self, path: &Path) -> bool {
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
 

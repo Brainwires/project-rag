@@ -173,6 +173,31 @@ fn test_walk_with_include_and_exclude_patterns() {
 }
 
 #[test]
+fn test_walk_with_bare_name_exclude() {
+    // Bare directory names (the historical config format) must still exclude the
+    // directory at any depth.
+    let temp_dir = TempDir::new().unwrap();
+    fs::create_dir_all(temp_dir.path().join("src")).unwrap();
+    fs::create_dir_all(temp_dir.path().join("target/debug")).unwrap();
+    fs::create_dir_all(temp_dir.path().join("a/target")).unwrap();
+    fs::write(temp_dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+    fs::write(temp_dir.path().join("target/debug/main"), "built").unwrap();
+    fs::write(temp_dir.path().join("a/target/x"), "nested").unwrap();
+    fs::write(temp_dir.path().join("src/targeted.rs"), "not a dir").unwrap();
+
+    let walker =
+        FileWalker::new(temp_dir.path(), 1024).with_patterns(vec![], vec!["target".to_string()]);
+    let mut files: Vec<String> = walker
+        .walk()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.relative_path)
+        .collect();
+    files.sort();
+    assert_eq!(files, vec!["src/main.rs", "src/targeted.rs"]);
+}
+
+#[test]
 fn test_walk_file_info_fields() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test.rs");
@@ -296,6 +321,80 @@ fn test_matches_patterns_include_and_exclude() {
     assert!(walker.matches_patterns(Path::new("/tmp/src/main.rs")));
     assert!(!walker.matches_patterns(Path::new("/tmp/src/test.rs")));
     assert!(!walker.matches_patterns(Path::new("/tmp/src/main.txt")));
+}
+
+#[test]
+fn test_expand_pattern() {
+    // Glob patterns pass through untouched
+    assert_eq!(expand_pattern("**/*.rs"), vec!["**/*.rs"]);
+    assert_eq!(expand_pattern("src/**/gen_*.rs"), vec!["src/**/gen_*.rs"]);
+    assert_eq!(expand_pattern("*.{rs,toml}"), vec!["*.{rs,toml}"]);
+    // Bare names become path components at any depth
+    assert_eq!(expand_pattern("target"), vec!["**/target", "**/target/**"]);
+    assert_eq!(expand_pattern(".env"), vec!["**/.env", "**/.env/**"]);
+    // Plain paths become root-relative prefixes
+    assert_eq!(
+        expand_pattern("src/generated"),
+        vec!["src/generated", "src/generated/**"]
+    );
+    assert_eq!(
+        expand_pattern("src/generated/"),
+        vec!["src/generated", "src/generated/**"]
+    );
+}
+
+#[test]
+fn test_matches_patterns_bare_name_exclude() {
+    let walker = FileWalker::new("/tmp", 1024).with_patterns(vec![], vec!["target".to_string()]);
+    assert!(!walker.matches_patterns(Path::new("/tmp/target/debug/main")));
+    assert!(!walker.matches_patterns(Path::new("/tmp/a/target/x")));
+    assert!(!walker.matches_patterns(Path::new("/tmp/target")));
+    assert!(walker.matches_patterns(Path::new("/tmp/src/main.rs")));
+    // Component semantics: "target" is not a substring match
+    assert!(walker.matches_patterns(Path::new("/tmp/src/targeted.rs")));
+    assert!(walker.matches_patterns(Path::new("/tmp/retarget/main.rs")));
+}
+
+#[test]
+fn test_matches_patterns_bare_name_matches_files_too() {
+    let walker = FileWalker::new("/tmp", 1024).with_patterns(vec![], vec![".env".to_string()]);
+    assert!(!walker.matches_patterns(Path::new("/tmp/.env")));
+    assert!(!walker.matches_patterns(Path::new("/tmp/config/.env")));
+    assert!(walker.matches_patterns(Path::new("/tmp/.env.example")));
+    assert!(walker.matches_patterns(Path::new("/tmp/src/environment.rs")));
+}
+
+#[test]
+fn test_matches_patterns_path_prefix_exclude() {
+    let walker =
+        FileWalker::new("/tmp", 1024).with_patterns(vec![], vec!["src/generated".to_string()]);
+    assert!(!walker.matches_patterns(Path::new("/tmp/src/generated")));
+    assert!(!walker.matches_patterns(Path::new("/tmp/src/generated/api.rs")));
+    assert!(!walker.matches_patterns(Path::new("/tmp/src/generated/deep/api.rs")));
+    assert!(walker.matches_patterns(Path::new("/tmp/src/generated_api.rs")));
+    // Prefixes are anchored at the walk root
+    assert!(walker.matches_patterns(Path::new("/tmp/other/src/generated/api.rs")));
+}
+
+#[test]
+fn test_matches_patterns_path_prefix_include() {
+    let walker = FileWalker::new("/tmp", 1024).with_patterns(vec!["src/".to_string()], vec![]);
+    assert!(walker.matches_patterns(Path::new("/tmp/src/main.rs")));
+    assert!(walker.matches_patterns(Path::new("/tmp/src/a/b.rs")));
+    assert!(!walker.matches_patterns(Path::new("/tmp/tests/main.rs")));
+}
+
+#[test]
+fn test_matches_patterns_substring_no_longer_supported() {
+    // ".rs" used to be a substring match; it is now a bare name and only matches a
+    // path component literally called ".rs". Use "**/*.rs" instead.
+    let walker = FileWalker::new("/tmp", 1024).with_patterns(vec![".rs".to_string()], vec![]);
+    assert!(!walker.matches_patterns(Path::new("/tmp/test.rs")));
+
+    let walker = FileWalker::new("/tmp", 1024).with_patterns(vec!["**/*.rs".to_string()], vec![]);
+    assert!(walker.matches_patterns(Path::new("/tmp/test.rs")));
+    assert!(walker.matches_patterns(Path::new("/tmp/src/deep/test.rs")));
+    assert!(!walker.matches_patterns(Path::new("/tmp/test.txt")));
 }
 
 #[test]
