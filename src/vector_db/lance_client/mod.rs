@@ -53,9 +53,9 @@ impl LanceVectorDB {
             .await
             .context("Failed to connect to LanceDB")?;
 
-        // Initialize empty per-project BM25 index map
-        // BM25 indexes are created on-demand per root path
-        let bm25_indexes = Arc::new(RwLock::new(HashMap::new()));
+        // Open the per-project BM25 indexes that already exist on disk, so keyword search
+        // keeps working after a restart. New indexes are still created on demand per root.
+        let bm25_indexes = Arc::new(RwLock::new(Self::discover_bm25_indexes(db_path)));
 
         Ok(Self {
             connection,
@@ -85,6 +85,59 @@ impl LanceVectorDB {
     fn bm25_path_for_root(&self, root_path: &str) -> String {
         let hash = Self::hash_root_path(root_path);
         format!("{}/bm25_{}", self.db_path, hash)
+    }
+
+    /// Open every per-project BM25 index already present under `db_path`.
+    ///
+    /// Indexes live in directories named `bm25_<root-hash>` (see `bm25_path_for_root`).
+    /// Without this, the in-memory map starts empty after a restart and hybrid search
+    /// silently degrades to vector-only until each project is re-indexed.
+    fn discover_bm25_indexes(db_path: &str) -> HashMap<String, BM25Search> {
+        let mut indexes = HashMap::new();
+
+        let entries = match std::fs::read_dir(db_path) {
+            Ok(entries) => entries,
+            // Fresh database: the directory may not exist yet
+            Err(_) => return indexes,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(hash) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("bm25_"))
+            else {
+                continue;
+            };
+            if !path.join("meta.json").exists() {
+                continue;
+            }
+
+            match BM25Search::new(&path) {
+                Ok(index) => {
+                    tracing::info!("Loaded existing BM25 index for root hash {}", hash);
+                    indexes.insert(hash.to_string(), index);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to open existing BM25 index at {:?}: {}", path, e);
+                }
+            }
+        }
+
+        indexes
+    }
+
+    /// Render a string as a quoted literal for a LanceDB (SQL-style) filter expression.
+    ///
+    /// Single quotes are doubled, so a project name or file path containing `'` cannot
+    /// terminate the literal and alter the filter. Every filter string built in this file
+    /// must go through here.
+    fn sql_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
     }
 
     /// Get or create a BM25 index for a specific root path
@@ -130,8 +183,16 @@ impl LanceVectorDB {
     /// The chunk's stable identity, and the fusion key shared by the vector table's `id`
     /// column and the BM25 index. Both arms MUST derive it here; deriving it in two places
     /// is how they silently drifted apart and killed hybrid search.
+    ///
+    /// `file_path` is root-relative, so the root is included: otherwise `src/main.rs:1`
+    /// in two indexed projects would share an id and one would shadow the other.
     fn chunk_id(meta: &ChunkMetadata) -> String {
-        format!("{}:{}", meta.file_path, meta.start_line)
+        format!(
+            "{}:{}:{}",
+            meta.root_path.as_deref().unwrap_or(""),
+            meta.file_path,
+            meta.start_line
+        )
     }
 
     /// Create schema for the embeddings table
@@ -406,7 +467,7 @@ impl VectorDatabase for LanceVectorDB {
 
             let stream = if let Some(ref project_name) = project {
                 query
-                    .only_if(format!("project = '{}'", project_name))
+                    .only_if(format!("project = {}", Self::sql_quote(project_name)))
                     .execute()
                     .await
                     .context("Failed to execute search")?
@@ -514,16 +575,14 @@ impl VectorDatabase for LanceVectorDB {
             let extra_batches: Vec<RecordBatch> = if missing.is_empty() {
                 Vec::new()
             } else {
-                let quoted: Vec<String> = missing
-                    .iter()
-                    .map(|id| format!("'{}'", id.replace('\'', "''")))
-                    .collect();
-                match table
-                    .query()
-                    .only_if(format!("id IN ({})", quoted.join(", ")))
-                    .execute()
-                    .await
-                {
+                let quoted: Vec<String> = missing.iter().map(|id| Self::sql_quote(id)).collect();
+                // Keep the project filter the vector arm already applied, so keyword-only
+                // hits from other projects are not pulled in.
+                let mut filter = format!("id IN ({})", quoted.join(", "));
+                if let Some(ref project_name) = project {
+                    filter.push_str(&format!(" AND project = {}", Self::sql_quote(project_name)));
+                }
+                match table.query().only_if(filter).execute().await {
                     Ok(stream) => stream.try_collect().await.unwrap_or_else(|e| {
                         tracing::warn!("Failed to collect keyword-only rows: {}", e);
                         Vec::new()
@@ -660,7 +719,7 @@ impl VectorDatabase for LanceVectorDB {
 
             let stream = if let Some(ref project_name) = project {
                 query
-                    .only_if(format!("project = '{}'", project_name))
+                    .only_if(format!("project = {}", Self::sql_quote(project_name)))
                     .execute()
                     .await
                     .context("Failed to execute search")?
@@ -836,17 +895,21 @@ impl VectorDatabase for LanceVectorDB {
         Ok(results)
     }
 
-    async fn delete_by_file(&self, file_path: &str) -> Result<usize> {
-        // Delete from BM25 index first (using file_path field)
-        // Delete from all per-project BM25 indexes
+    async fn delete_by_file(&self, root_path: &str, file_path: &str) -> Result<usize> {
+        // `file_path` is relative to `root_path`, and several indexed projects can contain
+        // the same relative path (src/main.rs, README.md, ...). Every delete is therefore
+        // scoped to the root: only this root's BM25 index, and only rows whose root_path
+        // column matches.
+        //
         // Must be done in a scope to drop lock before await
         {
+            let root_hash = Self::hash_root_path(root_path);
             let bm25_indexes = self
                 .bm25_indexes
                 .read()
                 .map_err(|e| anyhow::anyhow!("Failed to acquire BM25 read lock: {}", e))?;
 
-            for (root_hash, bm25) in bm25_indexes.iter() {
+            if let Some(bm25) = bm25_indexes.get(&root_hash) {
                 bm25.delete_by_file_path(file_path)
                     .context("Failed to delete from BM25 index")?;
                 tracing::debug!(
@@ -860,14 +923,22 @@ impl VectorDatabase for LanceVectorDB {
         let table = self.get_table().await?;
 
         // LanceDB uses SQL-like delete
-        let filter = format!("file_path = '{}'", file_path);
+        let filter = format!(
+            "file_path = {} AND root_path = {}",
+            Self::sql_quote(file_path),
+            Self::sql_quote(root_path)
+        );
 
         table
             .delete(&filter)
             .await
             .context("Failed to delete records")?;
 
-        tracing::info!("Deleted embeddings for file: {}", file_path);
+        tracing::info!(
+            "Deleted embeddings for file: {} under root: {}",
+            file_path,
+            root_path
+        );
 
         // LanceDB doesn't return count directly, return 0 as placeholder
         Ok(0)
@@ -955,7 +1026,7 @@ impl VectorDatabase for LanceVectorDB {
         let table = self.get_table().await?;
 
         // Use SQL-like filter to count rows with matching root_path
-        let filter = format!("root_path = '{}'", root_path);
+        let filter = format!("root_path = {}", Self::sql_quote(root_path));
         let count = table
             .count_rows(Some(filter))
             .await
@@ -968,7 +1039,7 @@ impl VectorDatabase for LanceVectorDB {
         let table = self.get_table().await?;
 
         // Query file_path column filtered by root_path
-        let filter = format!("root_path = '{}'", root_path);
+        let filter = format!("root_path = {}", Self::sql_quote(root_path));
         let stream = table
             .query()
             .only_if(filter)

@@ -17,6 +17,18 @@ mod tests {
         }
     }
 
+    /// Metadata that carries its root path, as chunks produced by the indexer always do.
+    fn create_rooted_metadata(
+        root_path: &str,
+        file_path: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> ChunkMetadata {
+        let mut meta = create_test_metadata(file_path, start_line, end_line);
+        meta.root_path = Some(root_path.to_string());
+        meta
+    }
+
     #[tokio::test]
     async fn test_new_creates_instance() {
         let temp_dir = TempDir::new().unwrap();
@@ -498,8 +510,8 @@ mod tests {
         // Store embeddings
         let embeddings = vec![vec![0.1; 384], vec![0.2; 384]];
         let metadata = vec![
-            create_test_metadata("test1.rs", 1, 10),
-            create_test_metadata("test2.rs", 20, 30),
+            create_rooted_metadata("/test/root", "test1.rs", 1, 10),
+            create_rooted_metadata("/test/root", "test2.rs", 20, 30),
         ];
         let contents = vec!["fn main() {}".to_string(), "fn test() {}".to_string()];
 
@@ -508,7 +520,7 @@ mod tests {
             .unwrap();
 
         // Delete one file
-        let result = db.delete_by_file("test1.rs").await;
+        let result = db.delete_by_file("/test/root", "test1.rs").await;
         assert!(result.is_ok());
 
         // Verify deletion
@@ -774,6 +786,172 @@ mod tests {
         assert!(
             bm25_indexes.contains_key(&hash2),
             "Should have index for project2"
+        );
+    }
+
+    /// Regression: chunks are stored with root-relative paths, so `src/main.rs` exists in
+    /// every indexed project. Deleting it for one root must not touch the others -- in
+    /// either the vector table or the per-project BM25 indexes.
+    #[tokio::test]
+    async fn test_delete_by_file_is_scoped_to_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("lancedb")
+            .to_string_lossy()
+            .to_string();
+        let db = LanceVectorDB::with_path(&db_path).await.unwrap();
+        db.initialize(384).await.unwrap();
+
+        db.store_embeddings(
+            vec![vec![0.1; 384]],
+            vec![create_rooted_metadata("/root/a", "src/main.rs", 1, 10)],
+            vec!["fn alphaonly() {}".to_string()],
+            "/root/a",
+        )
+        .await
+        .unwrap();
+        db.store_embeddings(
+            vec![vec![0.2; 384]],
+            vec![create_rooted_metadata("/root/b", "src/main.rs", 1, 10)],
+            vec!["fn betaonly() {}".to_string()],
+            "/root/b",
+        )
+        .await
+        .unwrap();
+
+        db.delete_by_file("/root/a", "src/main.rs").await.unwrap();
+
+        // Vector table: only root b's row remains
+        assert_eq!(db.count_by_root_path("/root/a").await.unwrap(), 0);
+        assert_eq!(db.count_by_root_path("/root/b").await.unwrap(), 1);
+        let results = db
+            .search(vec![0.15; 384], "main", 10, 0.0, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].root_path.as_deref(), Some("/root/b"));
+
+        // BM25: root a's index lost the document, root b's still has it
+        let bm25_indexes = db.bm25_indexes.read().unwrap();
+        let bm25_a = bm25_indexes
+            .get(&LanceVectorDB::hash_root_path("/root/a"))
+            .unwrap();
+        let bm25_b = bm25_indexes
+            .get(&LanceVectorDB::hash_root_path("/root/b"))
+            .unwrap();
+        assert!(bm25_a.search("alphaonly", 10).unwrap().is_empty());
+        assert_eq!(bm25_b.search("betaonly", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_sql_quote_escapes_single_quotes() {
+        assert_eq!(LanceVectorDB::sql_quote("plain"), "'plain'");
+        assert_eq!(LanceVectorDB::sql_quote("it's"), "'it''s'");
+        assert_eq!(
+            LanceVectorDB::sql_quote("x' OR file_path != '"),
+            "'x'' OR file_path != '''"
+        );
+    }
+
+    /// Project names and paths are spliced into LanceDB filter strings; a `'` in either
+    /// used to produce a malformed (or altered) filter.
+    #[tokio::test]
+    async fn test_filters_handle_single_quotes() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("lancedb")
+            .to_string_lossy()
+            .to_string();
+        let db = LanceVectorDB::with_path(&db_path).await.unwrap();
+        db.initialize(384).await.unwrap();
+
+        let root = "/root/it's";
+        let file = "src/o'brien.rs";
+        let project = "bob's project";
+        let mut meta = create_rooted_metadata(root, file, 1, 10);
+        meta.project = Some(project.to_string());
+        db.store_embeddings(
+            vec![vec![0.1; 384]],
+            vec![meta],
+            vec!["fn quoted() {}".to_string()],
+            root,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(db.count_by_root_path(root).await.unwrap(), 1);
+        assert_eq!(
+            db.get_indexed_files(root).await.unwrap(),
+            vec![file.to_string()]
+        );
+
+        for hybrid in [false, true] {
+            let results = db
+                .search(
+                    vec![0.1; 384],
+                    "quoted",
+                    10,
+                    0.0,
+                    Some(project.to_string()),
+                    None,
+                    hybrid,
+                )
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1, "hybrid={}", hybrid);
+            assert_eq!(results[0].file_path, file);
+        }
+
+        db.delete_by_file(root, file).await.unwrap();
+        assert_eq!(db.count_by_root_path(root).await.unwrap(), 0);
+    }
+
+    /// Regression: the BM25 map used to start empty on every connect, so after a restart
+    /// hybrid search silently became vector-only until a project was re-indexed.
+    #[tokio::test]
+    async fn test_bm25_indexes_reloaded_on_reconnect() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("lancedb")
+            .to_string_lossy()
+            .to_string();
+
+        {
+            let db = LanceVectorDB::with_path(&db_path).await.unwrap();
+            db.initialize(384).await.unwrap();
+            db.store_embeddings(
+                vec![vec![0.1; 384]],
+                vec![create_rooted_metadata("/test/root", "test.rs", 1, 10)],
+                vec!["fn reloadmarker() {}".to_string()],
+                "/test/root",
+            )
+            .await
+            .unwrap();
+        }
+
+        // Simulate a restart: a brand-new instance on the same path
+        let db = LanceVectorDB::with_path(&db_path).await.unwrap();
+        {
+            let bm25_indexes = db.bm25_indexes.read().unwrap();
+            assert_eq!(
+                bm25_indexes.len(),
+                1,
+                "existing BM25 index should be loaded"
+            );
+            assert!(bm25_indexes.contains_key(&LanceVectorDB::hash_root_path("/test/root")));
+        }
+
+        let results = db
+            .search(vec![0.1; 384], "reloadmarker", 10, 0.0, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].keyword_score.is_some(),
+            "BM25 index must be searchable after reconnect"
         );
     }
 }

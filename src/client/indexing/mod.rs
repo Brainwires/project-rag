@@ -497,7 +497,11 @@ pub async fn do_incremental_update(
             }
             Some(old_hash) if old_hash != &file.hash => {
                 // Modified file - delete old embeddings first
-                if let Err(e) = client.vector_db.delete_by_file(&file.relative_path).await {
+                if let Err(e) = client
+                    .vector_db
+                    .delete_by_file(&path, &file.relative_path)
+                    .await
+                {
                     tracing::warn!("Failed to delete old embeddings: {}", e);
                 }
                 files_updated += 1;
@@ -513,7 +517,7 @@ pub async fn do_incremental_update(
     for old_file in existing_hashes.keys() {
         if !new_hashes.contains_key(old_file) {
             files_removed += 1;
-            if let Err(e) = client.vector_db.delete_by_file(old_file).await {
+            if let Err(e) = client.vector_db.delete_by_file(&path, old_file).await {
                 tracing::warn!("Failed to delete embeddings for removed file: {}", e);
             }
         }
@@ -1179,8 +1183,16 @@ async fn clear_path_data(client: &RagClient, normalized_path: &str) -> Result<()
 
     // Delete embeddings for each file
     for file_path in file_paths {
-        if let Err(e) = client.vector_db.delete_by_file(&file_path).await {
-            tracing::warn!("Failed to delete embeddings for file '{}': {}", file_path, e);
+        if let Err(e) = client
+            .vector_db
+            .delete_by_file(normalized_path, &file_path)
+            .await
+        {
+            tracing::warn!(
+                "Failed to delete embeddings for file '{}': {}",
+                file_path,
+                e
+            );
         }
     }
 

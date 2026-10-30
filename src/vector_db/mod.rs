@@ -57,7 +57,11 @@ pub trait VectorDatabase: Send + Sync {
     ) -> Result<Vec<SearchResult>>;
 
     /// Delete embeddings for a specific file
-    async fn delete_by_file(&self, file_path: &str) -> Result<usize>;
+    ///
+    /// `file_path` is relative to `root_path` (the indexed project root), exactly as
+    /// stored in chunk metadata. The delete is scoped to that root so a file with the
+    /// same relative path in another indexed project is left untouched.
+    async fn delete_by_file(&self, root_path: &str, file_path: &str) -> Result<usize>;
 
     /// Clear all embeddings
     async fn clear(&self) -> Result<()>;
