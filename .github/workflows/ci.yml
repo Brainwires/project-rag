@@ -34,9 +34,10 @@ jobs:
           path: .fastembed_cache
           key: fastembed-models-${{ runner.os }}-v1
 
-      # lance-encoding's build script runs protoc (via prost-build).
+      # lance-encoding's build script runs protoc (via prost-build) and imports the
+      # well-known types (google/protobuf/empty.proto), which ship in libprotobuf-dev.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
 
       - name: Build (all targets)
         run: cargo build --all-targets
