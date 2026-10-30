@@ -100,6 +100,7 @@ fn benchmark_indexing(c: &mut Criterion) {
                                 1_048_576,
                                 None,
                                 None,
+                                None,
                             )
                             .await
                             .unwrap()
