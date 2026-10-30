@@ -21,7 +21,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      # Full history: client::git_indexing tests index the commits of this checkout
+      # and need more than the single commit a shallow clone provides.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Pinned to the crate's declared MSRV (Cargo.toml rust-version). The pinned
       # lancedb 0.23 / lance 1.0.1 dependency no longer compiles on current stable
