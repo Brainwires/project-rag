@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The final crate builds several large targets concurrently (lib, lib tests, bin,
+  # examples, bench); with full debuginfo rustc exceeded the runner's memory and the
+  # job was killed (exit 143). No debuginfo / no incremental keeps it well within limits.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: Build, test, clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # Full history: client::git_indexing tests index the commits of this checkout
+      # and need more than the single commit a shallow clone provides.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Pinned to the crate's declared MSRV (Cargo.toml rust-version). The pinned
+      # lancedb 0.23 / lance 1.0.1 dependency no longer compiles on current stable
+      # (rustc 1.99: "queries overflow the depth limit" in lance's async code).
+      - name: Install Rust 1.88 (crate MSRV)
+        uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # fastembed downloads ONNX models (~90-440 MB each) into ./.fastembed_cache
+      # the first time a model is used. Several unit tests instantiate models,
+      # so cache the directory between runs to avoid re-downloading.
+      - name: Cache fastembed models
+        uses: actions/cache@v4
+        with:
+          path: .fastembed_cache
+          key: fastembed-models-${{ runner.os }}-v1
+
+      # lance-encoding's build script runs protoc (via prost-build) and imports the
+      # well-known types (google/protobuf/empty.proto), which ship in libprotobuf-dev.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      # Build the library first so the dependency graph and the lib itself are compiled
+      # before the remaining targets are built in parallel.
+      - name: Build (lib)
+        run: cargo build --lib
+
+      - name: Build (all targets)
+        run: cargo build --all-targets
+
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Clippy
+        run: cargo clippy --all-targets
