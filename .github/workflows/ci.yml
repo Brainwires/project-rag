@@ -34,6 +34,10 @@ jobs:
           path: .fastembed_cache
           key: fastembed-models-${{ runner.os }}-v1
 
+      # lance-encoding's build script runs protoc (via prost-build).
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
       - name: Build (all targets)
         run: cargo build --all-targets
 
