@@ -425,10 +425,10 @@ fn extract_signature(node: Node, source: &str, _language: &str) -> String {
     let end = node.end_byte().min(source.len());
     let text = &source[start..end];
 
-    // Get first line or first 200 chars, whichever is shorter
+    // Get first line or first 200 bytes (cut on a char boundary), whichever is shorter
     let first_line = text.lines().next().unwrap_or("");
     if first_line.len() > 200 {
-        format!("{}...", &first_line[..200])
+        format!("{}...", crate::text_utils::truncate_str(first_line, 200))
     } else {
         first_line.to_string()
     }
@@ -549,6 +549,27 @@ impl Person {
         assert_eq!(greet.kind(), SymbolKind::Function);
         assert_eq!(greet.visibility, Visibility::Public);
         assert!(greet.doc_comment.is_some());
+    }
+
+    #[test]
+    fn test_signature_truncation_respects_char_boundaries() {
+        // The first line is longer than 200 bytes and byte 200 falls inside a two-byte
+        // character ("fn long_name(x: &str) -> &str { /* " is 35 bytes, then 'é's).
+        // `&first_line[..200]` used to panic here.
+        let source = format!(
+            "fn long_name(x: &str) -> &str {{ /* {} */ x }}\n",
+            "é".repeat(120)
+        );
+        let file_info = make_file_info(&source, "rs");
+        let extractor = SymbolExtractor::new();
+        let definitions = extractor.extract_definitions(&file_info).unwrap();
+
+        let def = definitions
+            .iter()
+            .find(|d| d.name() == "long_name")
+            .expect("Should find long_name function");
+        assert!(def.signature.ends_with("..."));
+        assert!(def.signature.len() <= 200 + "...".len());
     }
 
     #[test]
